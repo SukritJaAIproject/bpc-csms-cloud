@@ -23,10 +23,12 @@ RUN sed -i 's/\r$//' start.sh \
  && chown -R csms:csms /app
 USER csms
 
-# PORT: the public web port (Render sets it, default 10000). OCPP for the built-in simulators stays inside the container.
+# PORT: the one public port (Render sets it, default 10000): web console, app, pay page and OCPP (/ocpp/<id>).
+# CSMS_OCPP_PORT=9000 would add the classic separate OCPP port (bound to CSMS_OCPP_BIND).
 ENV PORT=10000 \
     CSMS_USER=admin \
     CSMS_TRUST_PROXY=1 \
+    CSMS_OCPP_PORT=0 \
     CSMS_OCPP_BIND=127.0.0.1 \
     CSMS_SIMULATORS="BPC-THIMPHU BPC-PARO BPC-PUNAKHA"
 EXPOSE 10000

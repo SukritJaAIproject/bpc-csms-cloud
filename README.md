@@ -42,13 +42,15 @@ Point the charger (or the Virtual Charger) at `wss://<service>.onrender.com/ocpp
 | `CSMS_PUBLIC_URL` | Render's address | Public address used in QR stickers, the app poster and payment return URLs |
 | `CSMS_SIMULATORS` | `BPC-THIMPHU BPC-PARO BPC-PUNAKHA` | Built-in simulated chargers (space-separated IDs, empty = none) |
 | `CSMS_SIM_SPEED` | `20` | Simulator energy speed-up |
+| `CSMS_OCPP_PORT` | `0` | Extra OCPP-only port (e.g. `9000` for `docker run -p 9000:9000`); `0` = OCPP only on the web port |
 | `CSMS_TRUST_PROXY` | `1` | Client IP from `X-Forwarded-For` (login lock-out and rate limits per client behind Render's proxy) |
 | `TZ` | `Asia/Thimphu` | Time zone for timestamps, daily logs and the morning session expiry |
 
 ## Free-tier notes
 
-* A free Render service sleeps after 15 minutes without traffic and needs about a minute to wake up. Connected chargers
-  (and the built-in simulators) send OCPP messages, which keeps it awake.
+* A free Render service sleeps after 15 minutes without traffic from outside and needs about a minute to wake up.
+  Connected chargers send OCPP messages through Render, which keeps it awake; the built-in simulators run inside the
+  container (they do not keep it awake) and start again with the service when it wakes up.
 * 512 MB RAM / 0.1 CPU and an ephemeral disk: fine for pilots, demos and training. For production use a paid instance,
   an Atlas Flex/M10+ cluster with backups, and a custom domain.
 

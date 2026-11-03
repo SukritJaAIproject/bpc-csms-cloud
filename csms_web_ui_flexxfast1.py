@@ -18313,18 +18313,23 @@ async def main(ocpp_port: int, web_port: int, tls_cert: str = None, tls_key: str
     # Start OCPP WebSocket server with ping settings
     # Note: Server-side ping is independent from CP's WebSocketPingInterval
     # การเปิด ping ฝั่งเซิร์ฟเวอร์ทำให้ตรวจจับตู้ที่หลุดแบบไม่ปิด connection อย่างถูกต้องได้
-    ocpp_server = await websockets.serve(
-        on_ocpp_connect,
-        os.environ.get('CSMS_OCPP_BIND', '').strip() or '0.0.0.0',   # [CLOUD] 127.0.0.1 in the container
-        ocpp_port,
-        subprotocols=['ocpp1.6'],
-        # เปิด server-side ping เพื่อตรวจจับตู้ที่หลุดแบบกะทันหัน (ไฟดับ/เน็ตหลุด/ถอดสาย)
-        # ถ้าตู้ไม่ตอบ pong ภายใน ping_timeout เซิร์ฟเวอร์จะปิด connection -> เข้า finally
-        # -> ตั้ง connected=False และลบออกจาก charge_points -> CSMS ขึ้น Offline ทันที
-        ping_interval=30,   # ส่ง ping ทุก 30 วินาที
-        ping_timeout=60     # ไม่ได้รับ pong ภายใน 60 วินาที ถือว่าตู้หลุด
-    )
-    logger.info(f"OCPP server started on ws://0.0.0.0:{ocpp_port}")
+    # [CLOUD2] OCPP port optional: --port 0 = OCPP only on the web port (/ocpp/<id>)
+    ocpp_server = None
+    if ocpp_port:
+        ocpp_server = await websockets.serve(
+            on_ocpp_connect,
+            os.environ.get('CSMS_OCPP_BIND', '').strip() or '0.0.0.0',   # [CLOUD] 127.0.0.1 in the container
+            ocpp_port,
+            subprotocols=['ocpp1.6'],
+            # เปิด server-side ping เพื่อตรวจจับตู้ที่หลุดแบบกะทันหัน (ไฟดับ/เน็ตหลุด/ถอดสาย)
+            # ถ้าตู้ไม่ตอบ pong ภายใน ping_timeout เซิร์ฟเวอร์จะปิด connection -> เข้า finally
+            # -> ตั้ง connected=False และลบออกจาก charge_points -> CSMS ขึ้น Offline ทันที
+            ping_interval=30,   # ส่ง ping ทุก 30 วินาที
+            ping_timeout=60     # ไม่ได้รับ pong ภายใน 60 วินาที ถือว่าตู้หลุด
+        )
+        logger.info(f"OCPP server started on ws://0.0.0.0:{ocpp_port}")
+    else:
+        logger.info("OCPP only on the web port: ws(s)://<host>/ocpp/<CP_ID> (--port 0)")
     
     # Setup web app (security headers + auth middleware: ต้อง login ก่อนเข้าใช้งาน)
     app = web.Application(middlewares=[security_headers_middleware, auth_middleware])
