@@ -1,0 +1,9 @@
+# runtime data and secrets - never commit
+*.json
+*.jsonl
+*.log
+logs/
+tile_cache/
+diagnostics_received/
+__pycache__/
+.env

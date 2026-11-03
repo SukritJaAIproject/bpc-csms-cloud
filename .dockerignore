@@ -1,0 +1,9 @@
+.git
+*.json
+*.jsonl
+*.log
+logs/
+tile_cache/
+diagnostics_received/
+__pycache__/
+.env

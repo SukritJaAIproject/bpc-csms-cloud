@@ -1,0 +1,15 @@
+# Render Blueprint (optional): New > Blueprint picks this up. The service can also be created by hand:
+# New > Web Service > this repository, Docker, region Singapore, instance type Free, the two secret variables below.
+services:
+  - type: web
+    name: bpc-csms
+    runtime: docker
+    plan: free
+    region: singapore
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: CSMS_PASS            # operator console password - choose a strong one
+        sync: false
+      - key: CSMS_MONGODB_URI     # MongoDB Atlas connection string (database user + password)
+        sync: false
