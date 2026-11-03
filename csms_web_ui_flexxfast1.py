@@ -1852,6 +1852,7 @@ class CentralSystem(cp):
         self.data.model = charge_point_model
         self.data.serial_number = kwargs.get('charge_point_serial_number', '')
         self.data.firmware_version = kwargs.get('firmware_version', '')
+        demo_geo_for_simulator(self.id, self.data.firmware_version)   # [DEMO-GEO] Virtual Charger demo fleet on the map
         
         # Get registration status from database
         reg_status = app_state.get_cp_registration_status(self.id)
@@ -5872,6 +5873,85 @@ HTML_TEMPLATE = '''
             color: var(--text-dim);
             padding: 0.75rem 0;
         }
+
+        /* [MOBILE] phones and small tablets - every rule sits in a max-width query, the PC layout is untouched */
+        @media (max-width: 900px) {
+            .header { flex-direction: column; align-items: stretch; gap: 0.55rem; padding: 0.7rem 1rem; }
+            .header .status { align-self: flex-start; flex-wrap: wrap; row-gap: 0.4rem; max-width: 100%; }
+        }
+        @media (max-width: 640px) {
+            .header { padding: 0.6rem 0.75rem 0.65rem; gap: 0.5rem; }
+            .brand { gap: 0.6rem; }
+            .brand > div { min-width: 0; }
+            .brand-logo { height: 38px; border-radius: 10px; padding: 2px; flex: 0 0 auto; }
+            .brand h1 { font-size: 0.98rem; line-height: 1.2; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+            .brand-sub { font-size: 0.66rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+            .header .status { align-self: stretch; display: flex; flex-wrap: wrap; align-items: center; column-gap: 0.45rem; row-gap: 0.45rem;
+                              padding: 0.45rem 0.55rem; border-radius: 14px; font-size: 0.8rem; }
+            #wsStatusText { flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+            .header .status .lang-switch { margin-left: 0; }
+            .header .status > button, .header .status > a { flex: 1 1 40%; margin-left: 0 !important; text-align: center; white-space: nowrap;
+                              padding: 0.42rem 0.5rem !important; font-size: 0.76rem !important; }
+
+            .tabs { flex-wrap: nowrap; overflow-x: auto; overflow-y: hidden; padding: 0.5rem 0.6rem 0; gap: 0.25rem;
+                    scrollbar-width: none; -webkit-overflow-scrolling: touch; scroll-padding: 0 0.6rem; }
+            .tabs::-webkit-scrollbar { display: none; }
+            .tab { flex: 0 0 auto; white-space: nowrap; padding: 0.5rem 0.8rem; font-size: 0.8rem; }
+
+            .view { padding: 0 0.6rem 0.75rem; }
+            .view-stations.active, .view-payments.active, .view-customers.active, .view-map.active { height: auto; min-height: 0; }
+            .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.45rem; }
+            .kpis > .kpi:last-child:nth-child(odd) { grid-column: 1 / -1; }
+            .kpi { padding: 0.5rem 0.7rem; border-radius: 12px; }
+            .kpi-value { font-size: 1.35rem; }
+            .pay-kpis .kpi-value { font-size: 1.2rem; }
+
+            .toolbar { padding: 0.5rem; gap: 0.4rem; border-radius: 12px; }
+            .toolbar .tb-inp.search, .toolbar input[type=search] { flex: 1 1 100%; min-width: 0; width: 100%; }
+            .tb-spacer { display: none; }
+            .toolbar .chips { flex: 1 1 100%; }
+            .toolbar > .tb-btn, .toolbar > .tb-sel, .toolbar > .seg { flex: 1 1 auto; }
+            .toolbar > .tb-btn { text-align: center; }
+            .toolbar > .muted { flex: 1 1 100%; order: 10; text-align: right; }
+
+            .fleet { max-height: none; border-radius: 14px; }
+            .fleet-grid { grid-template-columns: 1fr; padding: 0.5rem; }
+            .pay-list { min-height: 0; }
+            .pay-panel { max-height: none; padding: 0.7rem; }
+            .pay-settings-grid { grid-template-columns: 1fr; }
+            .pay-grid2 { grid-template-columns: 1fr; }
+            .pay-form-row > label { flex: 1 1 45%; min-width: 0; }
+            .pay-form-row > label .tb-inp, .pay-form-row > label .tb-sel { width: 100%; }
+            .pay-form-row > .tb-btn { flex: 1 1 auto; }
+            .cu-more .cols { grid-template-columns: 1fr; }
+
+            .map-wrap { display: flex; flex-direction: column; gap: 0.6rem; }
+            .map-main { order: -1; height: 56vh; min-height: 300px; flex: 0 0 auto; }
+            .map-side { max-height: 46vh; }
+
+            .container { padding: 0.6rem; gap: 0.6rem; }
+            .panel { border-radius: 14px; }
+            .panel-header { flex-wrap: wrap; gap: 0.45rem; padding: 0.7rem 0.85rem; }
+            .panel-content { padding: 0.75rem; }
+            .view-log .panel-header { flex-direction: column; align-items: stretch; }
+            .view-log .panel-header > span:last-child { width: 100%; }
+            .view-log .panel-header .tb-sel, .view-log .panel-header .tb-inp { flex: 1 1 40%; min-width: 0; }
+            .view-log .panel-header .tb-btn { flex: 1 1 auto; }
+
+            .drawer, .drawer-backdrop { top: 0; }
+            .drawer, .drawer.wide { width: 100vw; }
+            .drawer-head { padding: 0.7rem 0.75rem; }
+            .drawer-body { padding: 0.75rem; }
+            .drawer-wide { display: none; }
+
+            .sw-widget { left: auto; right: 0.75rem; bottom: calc(0.75rem + env(safe-area-inset-bottom, 0px)); width: calc(100vw - 1.5rem); }
+            .sw-widget.collapsed { width: auto; }
+            .sw-widget.collapsed .sw-header { padding: 0.55rem 0.75rem; }
+            .sw-widget.collapsed .sw-header > span:first-child > span[data-i18n] { font-size: 0; }
+            .sw-widget.collapsed .sw-header > span:first-child > span[data-i18n]::before { content: '⏱️'; font-size: 1.15rem; }
+            .toast-container { left: 0.75rem; right: 0.75rem; bottom: calc(4.2rem + env(safe-area-inset-bottom, 0px)); }
+            .toast { min-width: 0; padding: 0.7rem 0.9rem; font-size: 0.85rem; }
+        }
     </style>
 </head>
 <body>
@@ -8680,6 +8760,7 @@ HTML_TEMPLATE = '''
             try { new ResizeObserver(measureChrome).observe(document.querySelector('.header')); } catch (e) {}
             const p = readFleetPrefs();
             if (p.view === 'grid' || p.view === 'table') fleetView = p.view;
+            else if (window.matchMedia && window.matchMedia('(max-width: 640px)').matches) fleetView = 'grid';   // [MOBILE]
             if (typeof p.sort === 'string') fleetSort = p.sort;
             setFleetView(fleetView);
             const sel = document.getElementById('fleetSortSel');
@@ -12920,6 +13001,23 @@ async function switchCsmsVersion() {
         refreshDefaultConfig();  // Load default configs on page load
         refreshLogDates();  // Load log dates on page load
         try { swInit(); } catch (e) { console.error('Stopwatch init failed', e); }  // ⏱️ ตัวจับเวลา
+        // [MOBILE] one-row tab bar on phones: scroll the active tab into view
+        (function () {
+            const phone = () => window.matchMedia && window.matchMedia('(max-width: 640px)').matches;
+            const reveal = (smooth) => {
+                const bar = document.getElementById('mainTabs');
+                const tab = bar && bar.querySelector('.tab.active');
+                if (!bar || !tab || !phone()) return;
+                const left = tab.offsetLeft - (bar.clientWidth - tab.offsetWidth) / 2;
+                bar.scrollTo({left: Math.max(0, left), behavior: smooth ? 'smooth' : 'auto'});
+            };
+            const original = window.showTab;
+            if (typeof original === 'function') {
+                window.showTab = function () { const r = original.apply(this, arguments); reveal(true); return r; };
+            }
+            window.addEventListener('load', () => reveal(false));
+            setTimeout(() => reveal(false), 300);
+        })();
     </script>
 </body>
 </html>
@@ -15879,6 +15977,28 @@ APP_DEMO_TOWNS = {
     'TRASHIYANGTSE': (27.6116, 91.4980, 'Trashiyangtse', 'Trashiyangtse town'),
     'GASA': (27.9037, 89.7280, 'Gasa', 'Gasa town'),
 }
+
+
+# [DEMO-GEO] simulated BPC-<town> chargers get the demo map position of their town (never overwrites a position)
+def demo_geo_for_simulator(cp_id: str, firmware: str) -> bool:
+    try:
+        if not str(firmware or '').upper().startswith('SIM-'):
+            return False
+        si = globals().get('station_info')
+        if si is None:
+            return False
+        cp = str(cp_id or '')
+        town = (cp.upper().split('-', 1)[1] if '-' in cp else cp.upper()).replace(' ', '')
+        if town not in APP_DEMO_TOWNS or (si.data.get(cp) or {}).get('lat'):
+            return False
+        lat, lon, name, addr = APP_DEMO_TOWNS[town]
+        si.data[cp] = dict(si.data.get(cp) or {}, name=f'BPC {name}', address=addr, lat=lat, lon=lon)
+        si.save()
+        logger.info(f"📍 {cp}: simulated charger placed at the demo position of {name}")
+        return True
+    except Exception as e:
+        logger.warning(f"demo position for {cp_id} failed: {e}")
+        return False
 
 
 def _app_b64url(data: bytes) -> str:
