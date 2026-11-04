@@ -175,6 +175,13 @@ def describe_connect_error(exc: BaseException, url: str) -> str:
         return f"host name in {url} not found - check the IP address"
     if name in ("TimeoutError", "timeout") or "timed out" in low or "timeout" in low:
         return f"no answer from {url} (timeout) - check the IP address and the Windows Firewall on the CSMS PC"
+    status = getattr(getattr(exc, "response", None), "status_code", None) or getattr(exc, "status_code", None)   # [VC-SEC]
+    for code, why in ((401, "the CSMS refused the charger password (HTTP 401) - check the password and the security profile in the Connection box (CSMS: Registration tab -> Charger access)"),
+                      (403, "the CSMS blocked this charger (HTTP 403) - ask the CSMS operator to allow it (Registration tab -> Charger access)"),
+                      (404, "the CSMS does not know this charger id (HTTP 404) - add it in the CSMS (Registration tab -> Charger access) or check the URL path (/ocpp)"),
+                      (429, "too many wrong passwords - the CSMS refuses this charger for a while (HTTP 429)")):
+        if status == code or f"http {code}" in low:
+            return why
     if name in ("InvalidStatus", "InvalidStatusCode", "InvalidHandshake") or "http 4" in low or "http 5" in low:
         return f"{url} answered but refused the WebSocket handshake ({text}) - check the URL path (/ocpp)"
     if "no route to host" in low or "unreachable" in low or "10065" in text or "10051" in text:
@@ -186,15 +193,66 @@ def describe_connect_error(exc: BaseException, url: str) -> str:
     return f"{name}: {text}"
 
 
-def save_charger_config(url: str, cp_id: str, speed: float, auto_plug: bool = True) -> Optional[str]:
-    """Persist the connection settings next to the program. Returns an error text or None."""
+def save_charger_config(url: str, cp_id: str, speed: float, auto_plug: bool = True, password: Optional[str] = None,
+                        security_profile: Optional[int] = None) -> Optional[str]:
+    """Persist the connection settings next to the program. Returns an error text or None.
+    [VC-SEC] password / security_profile None = keep what the file has."""
     cfg_file = APP_DIR / CONFIG_FILE_NAME
     try:
-        cfg_file.write_text(json.dumps({"url": url, "id": cp_id, "speed": speed, "auto_plug": bool(auto_plug)}, indent=2),
-                            encoding="utf-8")
+        old = json.loads(cfg_file.read_text(encoding="utf-8")) if cfg_file.exists() else {}
+    except (OSError, ValueError):
+        old = {}
+    if not isinstance(old, dict):
+        old = {}
+    data = {"url": url, "id": cp_id, "speed": speed, "auto_plug": bool(auto_plug)}
+    pw = old.get("password", "") if password is None else password
+    prof = old.get("security_profile", 0) if security_profile is None else security_profile
+    if pw:
+        data["password"] = pw
+    if as_int(prof, 0):
+        data["security_profile"] = as_int(prof, 0)
+    try:
+        cfg_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
         return None
     except OSError as exc:
         return f"could not save {cfg_file}: {exc}"
+
+
+FLEET_KEYS_FILE = "vc_fleet_keys.json"   # [VC-SEC] passwords of the demo fleet stations on this PC
+
+
+def load_fleet_keys() -> dict:
+    try:
+        data = json.loads((APP_DIR / FLEET_KEYS_FILE).read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_fleet_keys(keys: dict) -> None:
+    try:
+        (APP_DIR / FLEET_KEYS_FILE).write_text(json.dumps(keys, indent=2), encoding="utf-8")
+    except OSError as exc:
+        LOG.warning("could not save %s: %s", FLEET_KEYS_FILE, exc)
+
+
+def basic_auth_header(user: str, password: str) -> str:
+    return "Basic " + base64.b64encode(f"{user}:{password}".encode("utf-8")).decode("ascii")
+
+
+def ws_header_kwargs(headers: dict) -> dict:
+    """websockets >= 14 takes additional_headers, older versions extra_headers."""
+    try:
+        major = int(str(getattr(websockets, "__version__", "0")).split(".")[0])
+    except ValueError:
+        major = 0
+    return {"additional_headers": headers} if major >= 14 else {"extra_headers": headers}
+
+
+def mask_secret(detail: Any) -> Any:
+    if isinstance(detail, dict) and str(detail.get("key", "")) in ("AuthorizationKey", "BasicAuthPassword") and detail.get("value"):
+        return dict(detail, value="***")
+    return detail
 
 
 # ---------------------------------------------------------------------------
@@ -399,6 +457,7 @@ def default_config(number_of_connectors: int, cp_id: str, url: str) -> dict[str,
         "BlinkRepeat": rw("3"),
         "CentralSystemURL": rw(url),
         "ChargeBoxId": rw(cp_id),
+        "SecurityProfile": rw("0"),       # [VC-SEC] 0 none, 1 Basic Auth, 2 Basic Auth + TLS (AuthorizationKey is write-only)
         "PaymentIdTagPrefix": ro("PAY-"),
         "AutoChargeIdTagPrefix": ro("AUTO-"),
     }
@@ -455,9 +514,21 @@ class Connector:
         }
 
     def power_limit_w(self) -> float:
+        """[VC-LM] OCPP 1.6 3.13: ChargePointMaxProfile caps everything; a TxProfile of the running transaction replaces
+        the TxDefaultProfile; inside one purpose the highest stackLevel counts."""
         limit = self.max_power_w
+        by: dict[str, list] = {}
         for prof in list(self.profiles.values()):
+            by.setdefault(prof.get("chargingProfilePurpose") or "TxDefaultProfile", []).append(prof)
+        for prof in by.get("ChargePointMaxProfile", []):
             w = profile_limit_w(prof)
+            if w is not None:
+                limit = min(limit, w)
+        tid = self.txn.get("id") if self.txn else None
+        tx = [p for p in by.get("TxProfile", []) if self.txn and p.get("transactionId") in (None, tid)]
+        pool = tx or by.get("TxDefaultProfile", [])
+        if pool:
+            w = profile_limit_w(max(pool, key=lambda p: as_int(p.get("stackLevel"), 0)))
             if w is not None:
                 limit = min(limit, w)
         return limit
@@ -497,6 +568,17 @@ class VirtualCharger:
         self.speed = max(0.1, float(args.speed))
         self.auto_plug = bool(getattr(args, "auto_plug", True))   # simulated driver connects the cable after a remote start
         self.battery_kwh = 80.0
+        self.auth_key: str = str(getattr(args, "password", "") or "")        # [VC-SEC] AuthorizationKey = Basic Auth password
+        self.security_profile: int = max(0, min(2, as_int(getattr(args, "security_profile", None), 1 if self.auth_key else 0)))
+        self.profile_fallback: Optional[int] = None                          # previous profile while a new one is tried
+        if getattr(args, "fleet_member", False):
+            saved_key = load_fleet_keys().get(self.cp_id) or {}
+            if saved_key.get("key"):
+                self.auth_key = str(saved_key["key"])
+                self.security_profile = max(0, min(2, as_int(saved_key.get("profile"), 1)))
+        if self.security_profile and not self.auth_key:
+            self.security_profile = 0
+        self.cfg["SecurityProfile"]["value"] = str(self.security_profile)
 
         self.ws = None
         self.online = False
@@ -517,6 +599,8 @@ class VirtualCharger:
         self.events: list[dict] = []          # OCPP traffic + simulator events for the panel
         self.diag_status = "Idle"
         self.fw_status = "Idle"
+        self.firmware_version = FIRMWARE_VERSION      # [VC-FW] changes after a firmware update
+        self.fw_installed_pending = False
         self.reboot_requested = False
         self.started = time.time()
         self._lock = asyncio.Lock()
@@ -530,6 +614,7 @@ class VirtualCharger:
         return as_int(self.cfg_get(key), default)
 
     def log_event(self, kind: str, action: str, detail: Any = "") -> None:
+        detail = mask_secret(detail)                                          # [VC-SEC]
         text = detail if isinstance(detail, str) else json.dumps(detail, ensure_ascii=False, default=str)
         entry = {"time": datetime.now().strftime("%H:%M:%S"), "kind": kind, "action": action, "detail": text[:600]}
         self.events.append(entry)
@@ -555,8 +640,9 @@ class VirtualCharger:
     def state(self) -> dict:
         return {
             "cpId": self.cp_id, "url": self.url, "payUrl": self.pay_page_url(), "vendor": self.vendor, "model": self.model,
-            "firmware": FIRMWARE_VERSION, "online": self.online, "networkEnabled": self.network_enabled,
+            "firmware": self.firmware_version, "online": self.online, "networkEnabled": self.network_enabled,
             "lastError": self.last_error, "speed": self.speed, "autoPlug": self.auto_plug, "configFile": CONFIG_FILE_NAME,
+            "securityProfile": self.security_profile, "passwordSet": bool(self.auth_key),   # [VC-SEC]
             "autoUrl": self.auto_url, "discovered": self.discovered,
             "registration": self.registration, "heartbeatInterval": self.heartbeat_interval,
             "lastHeartbeat": self.last_heartbeat, "uptime": int(time.time() - self.started),
@@ -653,7 +739,8 @@ class VirtualCharger:
                             "web": f"{'https' if as_bool(i.get('tls', False)) else 'http'}://{i['address']}:{i.get('web_port', '')}/"}
                            for i in found]
         for entry in self.discovered:
-            add(entry["url"])
+            if entry["local"] or not getattr(self.args, "fleet_member", False):   # [VC-FLEET] fleet: this PC's CSMS only
+                add(entry["url"])
         if not cands:                                     # nothing answered: look at the usual ports on this PC
             for port in await scan_localhost_ports():
                 add(f"ws://127.0.0.1:{port}{DEFAULT_OCPP_PATH}")
@@ -668,7 +755,9 @@ class VirtualCharger:
                 continue
             epoch = self._config_epoch
             if self.auto_url:
-                self.last_error = self.last_error or "looking for a Flexxfast CSMS on this PC / in this LAN ..."
+                self.last_error = self.last_error or ("looking for the Flexxfast CSMS on this PC ..."      # [VC-FLEET]
+                                                      if getattr(self.args, "fleet_member", False)
+                                                      else "looking for a Flexxfast CSMS on this PC / in this LAN ...")
             candidates = await self.resolve_candidates()
             had_session = False
             for base in candidates:
@@ -678,6 +767,12 @@ class VirtualCharger:
                 url = f"{base}/{self.cp_id}"
                 self.log_event("SYS", "Connecting", url)
                 connect_kwargs: dict[str, Any] = {}
+                if self.security_profile >= 2 and not base.lower().startswith("wss://"):     # [VC-SEC]
+                    self.last_error = "security profile 2 needs a wss:// (TLS) CSMS address - change the address or use profile 1"
+                    self.log_event("SYS", "Security", self.last_error)
+                    continue
+                if self.security_profile >= 1 and self.auth_key:
+                    connect_kwargs.update(ws_header_kwargs({"Authorization": basic_auth_header(self.cp_id, self.auth_key)}))
                 if base.lower().startswith("wss://"):
                     import ssl
                     connect_kwargs["ssl"] = ssl._create_unverified_context()    # simulator: accept self-signed CSMS certs
@@ -695,7 +790,9 @@ class VirtualCharger:
                         self.last_error = ""
                         self.last_good_url = base
                         self.cfg.setdefault("CentralSystemURL", {"value": base, "readonly": False})["value"] = base
-                        self.log_event("SYS", "Connected", url)
+                        self.log_event("SYS", "Connected", url + (f" (security profile {self.security_profile})" if self.security_profile else ""))
+                        if self.profile_fallback is not None:                        # [VC-SEC] new profile works
+                            self.profile_fallback = None
                         session = asyncio.create_task(self.session_tasks())
                         try:
                             async for raw in ws:
@@ -709,6 +806,11 @@ class VirtualCharger:
                 except Exception as exc:  # noqa: BLE001
                     self.last_error = describe_connect_error(exc, url)
                     self.log_event("SYS", "Disconnected", f"{type(exc).__name__}: {exc}")
+                    if self.profile_fallback is not None and "401" in str(exc):          # [VC-SEC] back to the old profile
+                        self.log_event("SYS", "Security", f"profile {self.security_profile} refused by the CSMS - back to profile {self.profile_fallback}")
+                        self.security_profile, self.profile_fallback = self.profile_fallback, None
+                        self.cfg["SecurityProfile"]["value"] = str(self.security_profile)
+                        self.save_security()
                 finally:
                     self.ws = None
                     self.online = False
@@ -721,6 +823,9 @@ class VirtualCharger:
             if self.auto_url and not had_session and epoch == self._config_epoch and self.network_enabled:
                 self.last_error = ("no Flexxfast CSMS found yet (tried " + ", ".join(candidates) +
                                    ") - start the CSMS on this PC or in this LAN, or type its address in the Connection box")
+                if getattr(self.args, "fleet_member", False):    # [VC-FLEET]
+                    self.last_error = ("Flexxfast CSMS is not running on this PC yet - start it (desktop icon "
+                                       "\"Flexxfast CSMS\"); the demo fleet connects by itself")
             if self.reboot_requested:
                 self.reboot_requested = False
                 self.log_event("SYS", "Rebooting", "simulated reboot (3 s)")
@@ -756,7 +861,7 @@ class VirtualCharger:
 
     async def boot_notification(self) -> bool:
         payload = {"chargePointVendor": self.vendor, "chargePointModel": self.model,
-                   "chargePointSerialNumber": self.serial, "firmwareVersion": FIRMWARE_VERSION,
+                   "chargePointSerialNumber": self.serial, "firmwareVersion": self.firmware_version,
                    "meterType": "SIM-DC-METER", "meterSerialNumber": "SIMMTR001"}
         result = await self.send_call("BootNotification", payload)
         if not result:
@@ -771,6 +876,10 @@ class VirtualCharger:
             if prev != "Accepted":
                 await self.send_all_status()
                 await self.flush_queue()
+            if self.fw_installed_pending:                  # [VC-FW] started with the new firmware
+                self.fw_installed_pending = False
+                self.fw_status = "Installed"
+                await self.send_call("FirmwareStatusNotification", {"status": "Installed"})
         return True
 
     async def heartbeat(self) -> None:
@@ -997,8 +1106,49 @@ class VirtualCharger:
             result["unknownKey"] = unknown
         return result
 
+    def save_security(self) -> None:                                           # [VC-SEC]
+        if getattr(self.args, "fleet_member", False):
+            keys = load_fleet_keys()
+            keys[self.cp_id] = {"key": self.auth_key, "profile": self.security_profile}
+            save_fleet_keys(keys)
+        else:
+            save_charger_config(AUTO if self.auto_url else self.url, self.cp_id, self.speed, self.auto_plug,
+                                self.auth_key, self.security_profile)
+
+    async def reconnect_soon(self, reason: str) -> None:
+        await asyncio.sleep(1.0)
+        self.last_error = reason + " - reconnecting"
+        if self.ws is not None:
+            await self.ws.close(code=1001, reason=reason[:60])
+
+    def change_security(self, key: str, value: str):
+        """OCPP 1.6 security whitepaper: AuthorizationKey (write-only) and SecurityProfile (no downgrade)."""
+        if key == "AuthorizationKey":
+            if not (16 <= len(value) <= 40) or any(ord(ch) < 33 or ord(ch) > 126 for ch in value):
+                return {"status": "Rejected"}
+            self.auth_key = value
+            self.save_security()
+            self.log_event("SYS", "Security", "new AuthorizationKey stored (used from the next connection)")
+            return {"status": "Accepted"}
+        p = as_int(value, -1)
+        if p < 0 or p > 3 or p == 3 or p < self.security_profile:
+            return {"status": "Rejected"}
+        if p >= 1 and not self.auth_key:
+            return {"status": "Rejected"}
+        if p == 2 and not (self.url or "").lower().startswith("wss://"):
+            return {"status": "Rejected"}
+        if p == self.security_profile:
+            return {"status": "Accepted"}
+        self.profile_fallback, self.security_profile = self.security_profile, p
+        self.cfg["SecurityProfile"]["value"] = str(p)
+        self.save_security()
+        self.log_event("SYS", "Security", f"security profile {self.profile_fallback} -> {p}: reconnecting")
+        return {"status": "Accepted"}, self.reconnect_soon("security profile changed")
+
     async def on_change_configuration(self, p: dict):
         key, value = str(p.get("key", "")), str(p.get("value", ""))
+        if key in ("AuthorizationKey", "SecurityProfile"):                       # [VC-SEC]
+            return self.change_security(key, value)
         if key not in self.cfg:
             return {"status": "NotSupported"}
         if self.cfg[key]["readonly"]:
@@ -1037,7 +1187,7 @@ class VirtualCharger:
         if message == "Ping":
             return {"status": "Accepted", "data": "Pong"}
         if message == "GetVersion":
-            return {"status": "Accepted", "data": json.dumps({"firmware": FIRMWARE_VERSION, "ocpp": "1.6J", "model": self.model})}
+            return {"status": "Accepted", "data": json.dumps({"firmware": self.firmware_version, "ocpp": "1.6J", "model": self.model})}
         if message == "Accepted":
             return {"status": "Accepted"}
         if message == "Rejected":
@@ -1184,7 +1334,7 @@ class VirtualCharger:
         await self.send_call("DiagnosticsStatusNotification", {"status": "Uploading"})
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr("simulator_info.txt", f"Flexxfast virtual charger {self.cp_id}\nfirmware {FIRMWARE_VERSION}\n"
+            zf.writestr("simulator_info.txt", f"Flexxfast virtual charger {self.cp_id}\nfirmware {self.firmware_version}\n"
                                               f"generated {iso()}\nconnectors {len(self.connectors)}\n")
             zf.writestr("ocpp_events.log", "\n".join(f"{e['time']} {e['kind']} {e['action']} {e['detail']}" for e in self.events[-300:]))
             zf.writestr("config.json", json.dumps({k: v["value"] for k, v in self.cfg.items()}, indent=2))
@@ -1202,13 +1352,53 @@ class VirtualCharger:
         await self.send_call("DiagnosticsStatusNotification", {"status": status})
 
     async def on_update_firmware(self, p: dict):
-        return {}, self.fake_firmware_update()
+        return {}, self.firmware_update(str(p.get("location", "")), str(p.get("retrieveDate", "")),
+                                        as_int(p.get("retries"), 1), as_int(p.get("retryInterval"), 30))
 
-    async def fake_firmware_update(self) -> None:
-        for status in ("Downloading", "Downloaded", "Installing", "Installed"):
-            self.fw_status = status
-            await self.send_call("FirmwareStatusNotification", {"status": status})
-            await asyncio.sleep(2)
+    async def send_fw_status(self, status: str) -> None:
+        self.fw_status = status
+        await self.send_call("FirmwareStatusNotification", {"status": status})
+
+    async def firmware_update(self, location: str, retrieve: str, retries: int, interval: int) -> None:
+        """[VC-FW] download the file for real, 'install' it (version from the file name) and restart."""
+        try:
+            when = datetime.fromisoformat(retrieve.replace("Z", "+00:00"))
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            wait = (when - datetime.now(timezone.utc)).total_seconds()
+            if wait > 0:
+                self.log_event("SYS", "Firmware", f"download at {retrieve} (in {int(wait)} s)")
+                await asyncio.sleep(min(wait, 6 * 3600))
+        except ValueError:
+            pass
+        data = None
+        for attempt in range(max(1, retries)):
+            await self.send_fw_status("Downloading")
+            try:
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=600, sock_connect=20)) as session:
+                    async with session.get(location) as resp:
+                        if resp.status == 200:
+                            data = await resp.read()
+                            self.log_event("SYS", "Firmware", f"downloaded {len(data):,} bytes from {location}")
+                            break
+                        self.log_event("ERR", "Firmware", f"GET {location} -> HTTP {resp.status}")
+            except Exception as exc:  # noqa: BLE001
+                self.log_event("ERR", "Firmware", f"{type(exc).__name__}: {exc}")
+            if attempt + 1 < max(1, retries):
+                await asyncio.sleep(max(1, min(interval, 300)))
+        if data is None:
+            await self.send_fw_status("DownloadFailed")
+            return
+        await self.send_fw_status("Downloaded")
+        await asyncio.sleep(1)
+        await self.send_fw_status("Installing")
+        await asyncio.sleep(2)
+        name = location.split("?")[0].rstrip("/").rsplit("/", 1)[-1]
+        m = re.search(r"(\d+(?:\.\d+){1,3})", name)
+        self.firmware_version = "SIM-" + (m.group(1) if m else datetime.now().strftime("%Y.%m.%d"))
+        self.fw_installed_pending = True
+        self.log_event("SYS", "Firmware", f"installed {name} -> {self.firmware_version}, restarting")
+        await self.reboot("FirmwareUpdate")
 
     # ------------------------------------------------------------ status notifications
     async def send_status(self, cid: int, status: str, error_code: str = "NoError", vendor_error: str = "") -> None:
@@ -1357,6 +1547,8 @@ class VirtualCharger:
         if txn.get("payment"):
             await self.payment_settled(conn, txn, reason)
         conn.txn = None
+        for _pid in [k for k, p in conn.profiles.items() if p.get("chargingProfilePurpose") == "TxProfile"]:
+            del conn.profiles[_pid]                       # [VC-LM] a TxProfile ends with its transaction
         conn.finished = conn.plugged
         conn.message = f"Stopped ({reason}) - {txn['energy_wh'] / 1000:.3f} kWh"
         if conn.pending_inoperative:
@@ -1526,12 +1718,40 @@ class VirtualCharger:
                 changed = auto != self.auto_url or (not auto and url != self.url) or cp_id != self.cp_id
                 if "auto_plug" in p:
                     self.auto_plug = as_bool(p.get("auto_plug"))
+                sec_changed = False                                                    # [VC-SEC]
+                new_pw = str(p.get("password") or "").strip()
+                if new_pw:
+                    if new_pw == "-":
+                        new_pw = ""
+                    elif not (16 <= len(new_pw) <= 40) or any(ord(ch) < 33 or ord(ch) > 126 for ch in new_pw):
+                        return {"ok": False, "error": "the charger password needs 16 to 40 characters (no spaces)"}
+                    if new_pw != self.auth_key:
+                        self.auth_key = new_pw
+                        sec_changed = True
+                if "security_profile" in p:
+                    prof = max(0, min(2, as_int(p.get("security_profile"), self.security_profile)))
+                    if prof >= 1 and not self.auth_key:
+                        return {"ok": False, "error": "security profile 1 / 2 needs a charger password"}
+                    if prof != self.security_profile:
+                        self.security_profile, self.profile_fallback = prof, None
+                        self.cfg["SecurityProfile"]["value"] = str(prof)
+                        sec_changed = True
+                elif not self.auth_key and self.security_profile:
+                    self.security_profile = 0
+                    self.cfg["SecurityProfile"]["value"] = "0"
+                    sec_changed = True
+                if sec_changed:
+                    changed = True
+                    if getattr(self.args, "fleet_member", False):
+                        self.save_security()
                 self.auto_url, self.speed, self.cp_id = auto, speed, cp_id
                 if not auto:
                     self.url = url
                 self.cfg.setdefault("ChargeBoxId", {"value": cp_id, "readonly": False})["value"] = cp_id
                 self.cfg.setdefault("CentralSystemURL", {"value": "", "readonly": False})["value"] = AUTO if auto else url
-                err = save_charger_config(AUTO if auto else url, cp_id, speed, self.auto_plug)
+                err = (save_charger_config(AUTO if auto else url, cp_id, speed, self.auto_plug, self.auth_key, self.security_profile)
+                       if not getattr(self.args, "fleet_member", False)
+                       else "demo fleet station - not saved")    # [VC-FLEET] charger_config.json is the single charger's
                 self.log_event("SYS", "Settings", f"url={AUTO if auto else url} id={cp_id} speed=x{speed:g} auto_plug={self.auto_plug}" + (f" ({err})" if err else " (saved)"))
                 if changed:
                     self._config_epoch += 1
@@ -1915,7 +2135,7 @@ box-shadow:var(--shadow-xl);border:1px solid var(--line);border-left:4px solid v
 .toast.ok{background:linear-gradient(135deg,rgba(16,185,129,.07) 0%,#fff 100%)}.toast.bad{border-left-color:var(--bad);background:linear-gradient(135deg,rgba(239,68,68,.07) 0%,#fff 100%)}
 @keyframes toastIn{from{transform:translateX(100%) scale(.9);opacity:0}to{transform:none;opacity:1}}
 .hint{color:var(--muted);font-size:12px;margin-top:12px;line-height:1.55}.hint code,.card code{background:#f1f5f9;padding:1px 5px;border-radius:5px;font-family:ui-monospace,Consolas,monospace;font-size:11.5px}
-.sub{color:var(--muted);font-size:12px}.sm{padding:5px 10px;font-size:12px;border-radius:10px}.err{color:#b45309;font-weight:600}.okt{color:#047857;font-weight:600}
+.secret{-webkit-text-security:disc}.sub{color:var(--muted);font-size:12px}.sm{padding:5px 10px;font-size:12px;border-radius:10px}.err{color:#b45309;font-weight:600}.okt{color:#047857;font-weight:600}
 label.f{display:inline-flex;flex-direction:column;gap:4px;color:var(--muted);font-size:11px;font-weight:700}label.f input{width:auto}
 .payrow{align-items:center;gap:12px;background:#f0fdf4;border:1px dashed #86efac;border-radius:12px;padding:8px 10px}
 .payqr img{width:84px;height:84px;background:#fff;border-radius:8px;display:block;border:1px solid var(--line)}.payrow .sub{font-size:11.5px;line-height:1.5}.payrow a{color:var(--accent2);font-weight:600}
@@ -1938,6 +2158,8 @@ label.f{display:inline-flex;flex-direction:column;gap:4px;color:var(--muted);fon
 <div class="row"><label class="f">CSMS address (empty = automatic)<input id="cUrl" placeholder="auto - finds the CSMS by itself" style="width:290px"></label>
 <label class="f">Charge point ID<input id="cId" style="width:170px"></label><label class="f">Speed ×<input id="cSpeed" type="number" min="0.1" step="1" style="width:70px"></label>
 <label class="f">Simulated driver<label class="chk" title="After a Remote Start (app / pay page) the simulator connects the cable by itself and removes it when the session ends - a real charger waits for the driver"><input type="checkbox" id="cAutoPlug"> auto plug-in on remote start</label></label>
+<label class="f">Security profile<select id="cProf" style="width:170px" title="OCPP security profile: 1 = the charger signs in with its password (HTTP Basic Auth), 2 = password over TLS (wss://)"><option value="0">0 - no password</option><option value="1">1 - password</option><option value="2">2 - password + TLS</option></select></label>
+<label class="f">Charger password (Basic Auth)<input id="cPw" class="secret" autocomplete="off" data-lpignore="true" placeholder="not set" style="width:210px" title="16-40 characters = OCPP AuthorizationKey; type - to remove it"></label>
 <button class="b-primary" onclick="applyConn()">💾 Apply &amp; reconnect</button><button onclick="act('reconnect')">🔄 Reconnect now</button><button onclick="setAuto()">✨ Back to automatic</button></div>
 <div class="hint">Automatic = the simulator looks for the CSMS running on this PC (same folder / ports 9000-9009) or in the same LAN (UDP broadcast) and connects by itself - nothing to type.
 To use a specific CSMS, type its IP (e.g. <b>192.168.1.10</b>) - <code>ws://…:9000/ocpp</code> is added for you - or the full <code>ws://ip:port/ocpp</code> - a CSMS in the cloud: <code>wss://name.onrender.com/ocpp</code>. Settings are saved in <code>charger_config.json</code> next to the program.</div></section></div>
@@ -1949,14 +2171,14 @@ let state=null;const $=id=>document.getElementById(id);const esc=s=>String(s??''
 function toast(m,ok){const t=$('toast');t.textContent=m;t.className='toast '+(ok?'ok':'bad');t.style.display='block';clearTimeout(t._h);t._h=setTimeout(()=>t.style.display='none',3500)}
 async function post(name,params){const r=await fetch('/api/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.assign({action:name},params||{}))});return await r.json()}
 async function act(name,params){try{const j=await post(name,params);if(!j.ok)toast(j.error||'failed',false);else toast(name+' ✓',true);refresh()}catch(e){toast(String(e),false)}}
-const dirty=new Set();['cUrl','cId','cSpeed'].forEach(id=>$(id).addEventListener('input',()=>dirty.add(id)));
+const dirty=new Set();['cUrl','cId','cSpeed','cPw'].forEach(id=>$(id).addEventListener('input',()=>dirty.add(id)));$('cProf').addEventListener('change',()=>dirty.add('cProf'));
 $('cAutoPlug').addEventListener('change',()=>{dirty.add('cAutoPlug');applyConn()});
 $('cUrl').addEventListener('keydown',e=>{if(e.key==='Enter')applyConn()});$('cId').addEventListener('keydown',e=>{if(e.key==='Enter')applyConn()});
 function fillConn(s){$('cmode').textContent=s.autoUrl?'automatic':'manual';$('cmode').className='pill '+(s.online?'Accepted':'Pending');
-$('cstatus').innerHTML=s.online?`<span class="okt">🟢 connected to <b>${esc(s.url)}/${esc(s.cpId)}</b></span>`:`<span class="err">🔴 ${esc(s.networkEnabled?(s.lastError||'connecting ...'):'network cut (press Restore network)')}</span>`;
+$('cstatus').innerHTML=s.online?`<span class="okt">🟢 connected to <b>${esc(s.url)}/${esc(s.cpId)}</b>${s.securityProfile?' · 🔒 security profile '+s.securityProfile:''}</span>`:`<span class="err">🔴 ${esc(s.networkEnabled?(s.lastError||'connecting ...'):'network cut (press Restore network)')}</span>`;
 const f=s.discovered||[];$('found').innerHTML=f.length?'<span class="sub">CSMS found:</span> '+f.map(d=>`<button class="b-ok sm" title="Web UI: ${esc(d.web)}" onclick="useUrl(${esc(JSON.stringify(d.url))})">${esc(d.host||d.url)}${d.local?' (this PC)':''} · OCPP ${esc(d.version)} · ${esc(d.url)}</button>`).join(' '):'';
-if(!dirty.has('cUrl'))$('cUrl').value=s.autoUrl?'':s.url;if(!dirty.has('cId'))$('cId').value=s.cpId;if(!dirty.has('cSpeed'))$('cSpeed').value=s.speed;if(!dirty.has('cAutoPlug'))$('cAutoPlug').checked=!!s.autoPlug}
-async function applyConn(){try{const j=await post('set_connection',{url:$('cUrl').value,id:$('cId').value,speed:$('cSpeed').value,auto_plug:$('cAutoPlug').checked});if(j.ok){dirty.clear();toast(j.saved?'settings applied and saved ✓':'applied, but not saved: '+(j.error||''),!!j.saved)}else toast(j.error||'failed',false);refresh()}catch(e){toast(String(e),false)}}
+if(!dirty.has('cUrl'))$('cUrl').value=s.autoUrl?'':s.url;if(!dirty.has('cId'))$('cId').value=s.cpId;if(!dirty.has('cSpeed'))$('cSpeed').value=s.speed;if(!dirty.has('cAutoPlug'))$('cAutoPlug').checked=!!s.autoPlug;if(!dirty.has('cProf'))$('cProf').value=String(s.securityProfile||0);$('cPw').placeholder=s.passwordSet?'set - type to change (- removes it)':'not set'}
+async function applyConn(){try{const j=await post('set_connection',{url:$('cUrl').value,id:$('cId').value,speed:$('cSpeed').value,auto_plug:$('cAutoPlug').checked,security_profile:$('cProf').value,password:$('cPw').value});if(j.ok){dirty.clear();$('cPw').value='';toast(j.saved?'settings applied and saved ✓':'applied, but not saved: '+(j.error||''),!!j.saved)}else toast(j.error||'failed',false);refresh()}catch(e){toast(String(e),false)}}
 function useUrl(u){$('cUrl').value=u;dirty.add('cUrl');applyConn()}
 function setAuto(){$('cUrl').value='';dirty.add('cUrl');applyConn()}
 function tagOf(n){return ($('tag'+n)?$('tag'+n).value.trim():'')||'TEST001'}
@@ -2064,7 +2286,160 @@ async def start_panel(charger: VirtualCharger, host: str, first_port: int) -> in
     raise RuntimeError("no free port for the panel")
 
 
+# [VC-FLEET] demo fleet: several simulated BPC stations in one program ------------------------------------------------
+FLEET_TOWNS = ["THIMPHU", "PARO", "PUNAKHA", "WANGDUE", "PHUENTSHOLING", "GELEPHU", "BUMTHANG", "TRONGSA", "MONGAR",
+               "TRASHIGANG", "SAMDRUPJONGKHAR", "HAA", "DAGANA", "TSIRANG", "SARPANG", "ZHEMGANG", "LHUENTSE",
+               "PEMAGATSHEL", "TRASHIYANGTSE", "GASA"]
+FLEET_MAX = 50
+
+FLEET_HTML = r"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#0a7a3c"><title>Demo fleet · Virtual Charger · BPC</title><link rel="icon" type="image/png" href="/favicon.ico">
+<style>
+:root{--text:#1e293b;--muted:#64748b;--line:#e2e8f0;--accent-g:linear-gradient(135deg,#22a94f 0%,#0a7a3c 100%);--ok-l:#d1fae5;--warn-l:#fef3c7;--bad-l:#fee2e2;--blue-l:#dbeafe;--purple-l:#ede9fe}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;background:linear-gradient(135deg,#1b8a44 0%,#063d1f 100%);color:var(--text);font-family:Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;font-size:14px}
+header{display:flex;flex-wrap:wrap;gap:12px 20px;align-items:center;justify-content:space-between;padding:14px 28px;background:rgba(255,255,255,.1);
+backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);border-bottom:1px solid rgba(255,255,255,.2);box-shadow:0 4px 30px rgba(0,0,0,.1)}
+.brand{display:flex;align-items:center;gap:14px;min-width:0}.brand img{height:52px;width:auto;background:#fff;border-radius:12px;padding:3px;box-shadow:0 2px 8px rgba(0,0,0,.2)}
+h1{font-size:20px;line-height:1.2;margin:0;color:#fff;text-shadow:0 2px 4px rgba(0,0,0,.1)}.sub{color:rgba(255,255,255,.85);font-size:12px;font-weight:600;letter-spacing:.3px;margin-top:3px}
+.sum{color:#fff;font-weight:600;background:rgba(255,255,255,.2);padding:8px 16px;border-radius:50px;display:flex;gap:8px;align-items:center}
+.dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:#ef4444;box-shadow:0 0 8px #ef4444;vertical-align:middle}
+.dot.on{background:#4ade80;box-shadow:0 0 10px #4ade80}
+main{max-width:1200px;margin:0 auto;padding:20px 28px}
+.card{background:rgba(255,255,255,.96);border-radius:16px;box-shadow:0 20px 25px -5px rgb(0 0 0/.12);border:1px solid rgba(255,255,255,.8);overflow:hidden}
+.card h2{margin:0;padding:12px 18px;font-size:15px;font-weight:700;background:linear-gradient(135deg,#f8fafc 0%,#e2e8f0 100%);border-bottom:1px solid var(--line)}
+.wrap{overflow-x:auto}table{width:100%;border-collapse:collapse}th,td{padding:9px 14px;border-bottom:1px solid var(--line);text-align:left;font-size:13px;vertical-align:middle}
+tr:last-child td{border-bottom:0}th{color:var(--muted);font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.4px}
+.pill,.chip{display:inline-block;padding:3px 10px;border-radius:50px;font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.3px;background:#e2e8f0;color:#475569;margin:1px 2px;white-space:nowrap}
+.Accepted,.Available{background:var(--ok-l);color:#047857}.Pending,.Preparing,.SuspendedEV,.SuspendedEVSE{background:var(--warn-l);color:#b45309}
+.Rejected,.Faulted{background:var(--bad-l);color:#b91c1c}.Charging,.Finishing{background:var(--blue-l);color:#1d4ed8}.Reserved{background:var(--purple-l);color:#6d28d9}
+a.btn{display:inline-block;padding:6px 12px;border-radius:10px;border:1px solid var(--line);background:linear-gradient(135deg,#f8fafc 0%,#e2e8f0 100%);color:var(--text);
+text-decoration:none;font-weight:600;font-size:12px;white-space:nowrap}a.btn:hover{background:var(--accent-g);color:#fff;border-color:transparent}
+.sid{white-space:nowrap}.err{color:#b45309;font-size:11px;margin-top:2px}.csms{color:var(--muted);font-size:12px;word-break:break-all}
+.note{color:#fff;opacity:.92;font-size:12.5px;line-height:1.6;margin:14px 4px}
+@media (max-width:700px){header{padding:12px 14px}.brand img{height:42px}h1{font-size:17px}main{padding:12px}.csms{display:none}}
+</style></head><body>
+<header><div class="brand"><img src="/logo.png" alt="BPC"><div><h1>Virtual Charger · Demo fleet</h1>
+<div class="sub">Bhutan Power Corporation Limited · <span id="n">…</span> simulated OCPP 1.6 stations</div></div></div>
+<div class="sum"><span id="dot" class="dot"></span><span id="online">connecting</span></div></header>
+<main><div class="card"><h2>Stations</h2><div class="wrap"><table><thead><tr><th>Station</th><th>Connection</th><th>Registration</th><th>Connectors</th>
+<th class="csms">CSMS</th><th></th></tr></thead><tbody id="rows"></tbody></table></div></div>
+<p class="note">The fleet connects by itself to the <b>Flexxfast CSMS on this PC</b> (start it first). In the CSMS: <b>Stations</b> tab →
+<b>Accept all pending</b>. The stations appear on the <b>Map</b> at their towns. Each station has its own front panel (plug in, tap card,
+pay QR, faults). Close the Virtual Charger window to stop the fleet.</p></main>
+<script>
+'use strict';
+const $=id=>document.getElementById(id);const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function row(s){const panel=location.protocol+'//'+location.hostname+':'+s.port+'/';
+return '<tr><td class="sid"><b>'+esc(s.id)+'</b></td><td><span class="dot'+(s.online?' on':'')+'"></span> '+(s.online?'online':'offline')+
+(s.online||!s.lastError?'':'<div class="err">'+esc(s.lastError)+'</div>')+'</td><td><span class="pill '+esc(s.registration)+'">'+esc(s.registration)+'</span></td><td>'+
+(s.connectors||[]).map(c=>'<span class="chip '+esc(c.status)+'">C'+esc(c.id)+' '+esc(c.status)+'</span>').join('')+'</td><td class="csms">'+esc(s.url||'searching …')+
+'</td><td><a class="btn" href="'+esc(panel)+'" target="_blank">Open panel</a></td></tr>'}
+async function refresh(){try{const j=await (await fetch('/api/fleet',{cache:'no-store'})).json();const f=j.fleet||[];const on=f.filter(s=>s.online).length;
+$('n').textContent=f.length;$('online').textContent=on+' / '+f.length+' online';$('dot').className='dot'+(on?' on':'');$('rows').innerHTML=f.map(row).join('')}catch(e){}}
+refresh();setInterval(refresh,2000);
+</script></body></html>"""
+
+
+def fleet_ids(n: int) -> list:
+    """BPC-<town> for the dzongkhag towns (the CSMS places simulated BPC-<town> stations on the map), then BPC-STATION-nn."""
+    n = max(1, min(FLEET_MAX, int(n)))
+    return [f"BPC-{FLEET_TOWNS[i]}" if i < len(FLEET_TOWNS) else f"BPC-STATION-{i + 1:02d}" for i in range(n)]
+
+
+def fleet_running(port: int) -> bool:
+    """A demo fleet already serves its overview page on this port (second start of the shortcut)."""
+    import urllib.request
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(f"http://127.0.0.1:{port}/api/fleet", timeout=1.5) as resp:
+            data = json.loads(resp.read().decode("utf-8") or "null")
+            return resp.status == 200 and isinstance(data, dict) and "fleet" in data
+    except Exception:  # noqa: BLE001
+        return False
+
+
+async def start_fleet_index(chargers: list, ports: list, host: str, first_port: int) -> int:
+    """Overview page of the fleet: every station with its connection, registration, connectors and a panel link."""
+    app = web.Application()
+    logo_png = base64.b64decode(BPC_LOGO_B64)
+
+    async def index(_req):
+        return web.Response(text=FLEET_HTML, content_type="text/html")
+
+    async def api(_req):
+        rows = []
+        for ch, port in zip(chargers, ports):
+            st = ch.state()
+            rows.append({"id": st["cpId"], "online": st["online"], "registration": st["registration"], "url": st["url"],
+                         "auto": st["autoUrl"], "lastError": st["lastError"], "port": port,
+                         "connectors": [{"id": c["id"], "status": c["status"]} for c in st["connectors"]]})
+        return web.json_response({"fleet": rows, "count": len(rows)})
+
+    async def logo(_req):
+        return web.Response(body=logo_png, content_type="image/png", headers={"Cache-Control": "max-age=86400"})
+
+    app.router.add_get("/", index)
+    app.router.add_get("/api/fleet", api)
+    app.router.add_get("/logo.png", logo)
+    app.router.add_get("/favicon.ico", logo)
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    for port in range(first_port, first_port + 40):
+        if port in ports:
+            continue
+        try:
+            await web.TCPSite(runner, host, port).start()
+            return port
+        except OSError:
+            continue
+    raise OSError("no free port for the demo fleet overview page")
+
+
+async def _fleet_member(charger, delay: float) -> None:
+    await asyncio.sleep(delay)                           # stagger the first connections a little
+    await asyncio.gather(charger.connection_loop(), charger.simulation_loop())
+
+
+async def run_fleet(args) -> None:
+    ids = fleet_ids(args.fleet)
+    base = args.panel_port if "panel_port" in getattr(args, "given", set()) else 8101
+    index_first = max(1, base - 1)
+    if fleet_running(index_first):
+        url = f"http://localhost:{index_first}/"
+        LOG.info("A demo fleet is already running: %s", url)
+        if not args.no_browser:
+            webbrowser.open(url)
+        await asyncio.sleep(3)
+        return
+    chargers, ports = [], []
+    next_port = base
+    for cp_id in ids:
+        member = argparse.Namespace(**vars(args))
+        member.id = cp_id
+        member.fleet_member = True
+        charger = VirtualCharger(member)
+        port = await start_panel(charger, args.panel_host, next_port)
+        chargers.append(charger)
+        ports.append(port)
+        next_port = port + 1
+    index_port = await start_fleet_index(chargers, ports, args.panel_host, index_first)
+    LOG.info("=" * 64)
+    LOG.info("  Demo fleet: %d simulated BPC stations (%s ... %s) -> %s", len(chargers), ids[0], ids[-1],
+             chargers[0].url or "the Flexxfast CSMS on this PC (found automatically)")
+    LOG.info("  Overview:   http://localhost:%s/   (front panels on ports %s-%s)", index_port, ports[0], ports[-1])
+    LOG.info("  In the CSMS: Stations tab -> Accept all pending. Close this window to stop the fleet.")
+    LOG.info("=" * 64)
+    if not args.no_browser:
+        asyncio.get_running_loop().call_later(1.0, lambda: webbrowser.open(f"http://localhost:{index_port}/"))
+    await asyncio.gather(*(_fleet_member(ch, i * 0.3) for i, ch in enumerate(chargers)))
+
+
 async def main(args) -> None:
+    if getattr(args, "fleet", 0):                        # [VC-FLEET] --fleet N: N stations in this one program
+        await run_fleet(args)
+        return
     charger = VirtualCharger(args)
     port = await start_panel(charger, args.panel_host, args.panel_port)
     if not args.no_browser:
@@ -2101,6 +2476,10 @@ def apply_saved_config(args, skip: set) -> None:
             pass
     if "auto_plug" not in skip and "auto_plug" in saved:
         args.auto_plug = as_bool(saved.get("auto_plug"))
+    if "password" not in skip and saved.get("password"):                          # [VC-SEC]
+        args.password = str(saved.get("password"))
+    if "security_profile" not in skip and "security_profile" in saved:
+        args.security_profile = as_int(saved.get("security_profile"), 0)
     if saved:
         print(f"Settings from {cfg_file.name}: CSMS={args.url}  id={args.id or default_cp_id()}  speed=x{args.speed:g}  "
               f"auto-plug={'on' if getattr(args, 'auto_plug', True) else 'off'}  (change them on the panel page)")
@@ -2120,6 +2499,10 @@ def cli():
     ap.add_argument("--auto-plug", dest="auto_plug", default=True, type=lambda v: str(v).lower() not in ("0", "false", "no", "off"),
                     metavar="on|off", help="simulated driver connects the cable after a Remote Start and removes it after the "
                     "session (default on; a real charger waits for the driver)")
+    ap.add_argument("--password", default=os.environ.get("CP_PASSWORD", ""),                    # [VC-SEC]
+                    help="charger password = OCPP AuthorizationKey for HTTP Basic Auth (security profile 1 / 2)")
+    ap.add_argument("--security-profile", dest="security_profile", type=int, default=None, choices=(0, 1, 2),
+                    help="OCPP security profile (default: 1 when a password is given, else 0; 2 needs a wss:// CSMS)")
     ap.add_argument("--vendor", default="Flexxfast")
     ap.add_argument("--model", default="DC-Link-120")
     ap.add_argument("--panel-host", default="0.0.0.0")
@@ -2127,9 +2510,17 @@ def cli():
     ap.add_argument("--log", default="mock_cp.log")
     ap.add_argument("--no-prompt", action="store_true", help="(kept for compatibility - nothing is asked any more)")
     ap.add_argument("--no-browser", action="store_true", help="do not open the front panel in the browser automatically")
+    ap.add_argument("--fleet", type=int, default=0, metavar="N",
+                    help="demo fleet: N simulated BPC stations (BPC-THIMPHU, BPC-PARO, ...) in this one program, "
+                         "connected to the Flexxfast CSMS on this PC (or --url); front panels on ports 8101+, "
+                         "overview page on 8100")
     args = ap.parse_args()
     given = {a[2:].split("=")[0].replace("-", "_") for a in sys.argv[1:] if a.startswith("--")}
-    apply_saved_config(args, skip={k for k in ("url", "id", "speed", "auto_plug") if k in given})
+    args.given = given                                   # [VC-FLEET] which options were typed (fleet panel ports)
+    if getattr(args, "fleet", 0) and "log" not in given:
+        args.log = "mock_cp_fleet.log"                   # [VC-FLEET] the single Virtual Charger keeps mock_cp.log
+    if not getattr(args, "fleet", 0):                    # [VC-FLEET] the fleet does not use the single charger's settings
+        apply_saved_config(args, skip={k for k in ("url", "id", "speed", "auto_plug", "password", "security_profile") if k in given})
     if not args.id:
         args.id = default_cp_id()
     return args

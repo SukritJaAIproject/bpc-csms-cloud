@@ -32,6 +32,44 @@ from dataclasses import dataclass, field, asdict
 from decimal import Decimal
 import weakref
 
+# [OPS] v1.11 Bhutan Time: every time the CSMS writes or shows (message log + daily log files, station times, payments,
+# receipts, payment-gateway time stamps, exports) is Bhutan Time (UTC+06:00), whatever the computer or the cloud server is
+# set to. Times without a zone are Bhutan Time; datetime.now() / fromtimestamp() / timestamp() follow that rule.
+CSMS_TZ = timezone(timedelta(hours=6), 'BTT')
+
+
+class _CsmsDatetime(datetime):
+    """datetime whose 'local time' is Bhutan Time."""
+
+    @classmethod
+    def now(cls, tz=None):
+        if tz is not None:
+            return super().now(tz)
+        return super().now(CSMS_TZ).replace(tzinfo=None)
+
+    @classmethod
+    def today(cls):
+        return cls.now()
+
+    @classmethod
+    def fromtimestamp(cls, t, tz=None):
+        if tz is not None:
+            return super().fromtimestamp(t, tz)
+        return super().fromtimestamp(t, CSMS_TZ).replace(tzinfo=None)
+
+    def timestamp(self):
+        if self.tzinfo is None:
+            return self.replace(tzinfo=CSMS_TZ).timestamp()
+        return super().timestamp()
+
+    def astimezone(self, tz=None):
+        if self.tzinfo is None:
+            return self.replace(tzinfo=CSMS_TZ).astimezone(tz or CSMS_TZ)
+        return super().astimezone(tz or CSMS_TZ)
+
+
+datetime = _CsmsDatetime
+
 # ---------------------------------------------------------------------------
 # Packaged (.exe) support — PyInstaller sets sys.frozen.  Data files (RFID cards,
 # registrations, logs, diagnostics) always live next to the program.
@@ -46,6 +84,23 @@ if FROZEN:
         except (AttributeError, ValueError):
             pass
 CONFIG_FILE = APP_DIR / 'csms_config.json'   # {"username", "password", "web_port", "ocpp_port"}
+
+
+
+def rfid_expiry_utc(value):
+    """[OPS] v1.11 expiry of an RFID card -> aware UTC datetime (a value without a zone is Bhutan Time), None if empty / bad."""
+    if not value:
+        return None
+    try:
+        d = datetime.fromisoformat(str(value).strip().replace('Z', '+00:00'))
+    except ValueError:
+        try:
+            d = datetime.strptime(str(value).strip()[:10], '%Y-%m-%d').replace(hour=23, minute=59, second=59)
+        except ValueError:
+            return None
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=CSMS_TZ)
+    return d.astimezone(timezone.utc)
 
 
 def convert_decimals(obj: Any) -> Any:
@@ -96,6 +151,16 @@ logging.basicConfig(
     datefmt='%H:%M:%S'
 )
 logger = logging.getLogger('CSMS')
+import time as _btt_time   # [OPS] v1.11 the console log in Bhutan Time too
+logging.Formatter.converter = staticmethod(lambda secs=None: _btt_time.gmtime((_btt_time.time() if secs is None else secs) + 6 * 3600))
+try:                                       # [OPS] v1.11.1 the web access log lines in Bhutan Time too
+    from aiohttp import web_log as _btt_web_log
+
+    def _btt_access_time(request, response, time):
+        return (datetime.now(CSMS_TZ) - timedelta(seconds=time)).strftime('[%d/%b/%Y:%H:%M:%S %z]')
+    _btt_web_log.AccessLogger._format_t = staticmethod(_btt_access_time)
+except Exception:                          # aiohttp missing or changed: its own format stays
+    pass
 
 # [PAYMENT] Pay-by-QR ของตู้ (CP.py + helpf/payment_session.py): ตู้ส่ง DataTransfer
 # vendorId "Flexxfast" messageId "PaymentReceived" (หลังลูกค้าจ่ายเงิน ก่อน Authorize)
@@ -446,7 +511,7 @@ import sys as _db_sys
 
 DB_SETTINGS_FILE = str((APP_DIR / 'database.json') if 'APP_DIR' in globals() else 'database.json')
 DB_DEFAULTS = {'type': 'json', 'uri': '', 'db_name': 'bpc_csms', 'log_to_db': True, 'log_retention_days': 30, 'keep_json_backup': True}
-DB_COLLECTIONS = ('payments', 'customers', 'tokens', 'settings', 'stations', 'rfid_cards', 'transactions', 'ocpp_logs')
+DB_COLLECTIONS = ('payments', 'customers', 'tokens', 'settings', 'stations', 'rfid_cards', 'transactions', 'ocpp_logs', 'ops_users', 'ops_settings', 'ops_audit', 'ops_status', 'ops_sessions', 'ops_alerts', 'ops_notify', 'ops_tickets', 'ops_pm', 'ops_charger_access', 'ops_charger_unknown', 'ops_security', 'ops_free_active', 'ops_free_cards', 'ops_free_log', 'ops_lm_sites', 'ops_lm_log', 'ops_open_tx', 'ops_fw_files', 'ops_fw_jobs', 'ops_diag_jobs')
 DB_LOG_BATCH = 500                      # log inserts per bulk write
 DB_QUEUE_MAX = 60000                    # queued operations before the oldest log inserts are dropped
 DB_TXN_METER_INTERVAL = 30.0            # seconds between transaction-document updates from MeterValues
@@ -469,6 +534,8 @@ def db_load_settings() -> dict:
     if env_uri:
         data['uri'] = env_uri
         data['type'] = 'mongodb'
+    if os.environ.get('CSMS_MONGODB_DB', '').strip():   # [OPS] v1.9 e.g. bpc_csms_staging
+        data['db_name'] = os.environ['CSMS_MONGODB_DB'].strip()
     try:
         data['log_retention_days'] = max(1, min(3650, int(data.get('log_retention_days') or 30)))
     except (TypeError, ValueError):
@@ -805,10 +872,9 @@ class MongoStore:
         doc = _db_safe_keys(_db_clean(entry))
         try:
             doc['ts'] = datetime.fromisoformat(str(entry.get('full_timestamp') or '').replace('Z', '+00:00'))
-            if doc['ts'].tzinfo is not None:
-                doc['ts'] = doc['ts'].astimezone().replace(tzinfo=None)
+            doc['ts'] = doc['ts'].astimezone(timezone.utc)   # [OPS] v1.11 stored in UTC
         except (TypeError, ValueError):
-            doc['ts'] = datetime.now()
+            doc['ts'] = datetime.now(timezone.utc)
         self.writer.put('ocpp_logs', InsertOne(doc))
 
     def logs_for_date(self, date_str: str, cp_id: str = None, limit: int = 50000) -> list:
@@ -1039,6 +1105,9 @@ def db_sync_everything(force_files: bool = False):
             if store is not None:
                 store.save(force_files=force_files)
                 done.append(name)
+        for store in (g.get('OPS_STORES') or []):   # [OPS] users, settings, alerts, tickets ...
+            store.save(force_files=force_files)
+            done.append('ops_' + store.name)
         st = g.get('app_state')
         if st is not None and hasattr(st, '_save_rfid_cards'):
             st._save_rfid_cards(force_files=force_files)
@@ -1298,8 +1367,7 @@ class AppState:
                 logger.error(f"db: saving CP registrations failed: {e}")
         if DB is None or force_files or db_keep_files():
             try:
-                with open('cp_registrations.json', 'w') as f:
-                    json.dump(self.cp_registrations, f, indent=2)
+                _ops_write_json_safe('cp_registrations.json', self.cp_registrations)   # [OPS] v1.10 whole file or nothing
             except Exception as e:
                 logger.error(f"Failed to save CP registrations: {e}")
     
@@ -1374,8 +1442,7 @@ class AppState:
                 logger.error(f"db: saving config overrides failed: {e}")
         if DB is None or force_files or db_keep_files():
             try:
-                with open('config_overrides.json', 'w') as f:
-                    json.dump(overrides, f, indent=2)
+                _ops_write_json_safe('config_overrides.json', overrides)   # [OPS] v1.10 whole file or nothing
             except Exception as e:
                 logger.error(f"Failed to save config overrides: {e}")
     
@@ -1406,8 +1473,7 @@ class AppState:
                 logger.error(f"db: saving RFID cards failed: {e}")
         if DB is None or force_files or db_keep_files():
             try:
-                with open('rfid_cards.json', 'w') as f:
-                    json.dump(self.rfid_cards, f, indent=2)
+                _ops_write_json_safe('rfid_cards.json', self.rfid_cards)   # [OPS] v1.10 whole file or nothing
             except Exception as e:
                 logger.error(f"Failed to save RFID cards: {e}")
     
@@ -1456,20 +1522,16 @@ class AppState:
             self._save_rfid_cards()
             
             # Check expiry
-            if card.get('expiry_date'):
-                try:
-                    expiry = datetime.fromisoformat(card['expiry_date'].replace('Z', '+00:00'))
-                    if expiry < datetime.now(timezone.utc):
-                        return {
-                            'status': AuthorizationStatus.expired,
-                            'expiryDate': card['expiry_date']
-                        }
-                except:
-                    pass
-            
+            expiry_utc = rfid_expiry_utc(card.get('expiry_date'))   # [OPS] v1.11 a date without a zone is Bhutan Time
+            if expiry_utc is not None and expiry_utc < datetime.now(timezone.utc):
+                return {
+                    'status': AuthorizationStatus.expired,
+                    'expiryDate': expiry_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+                }
+
             result = {'status': card['status']}
-            if card.get('expiry_date'):
-                result['expiryDate'] = card['expiry_date']
+            if expiry_utc is not None:
+                result['expiryDate'] = expiry_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
             if card.get('parent_id'):
                 result['parentIdTag'] = card['parent_id']
             return result
@@ -1844,6 +1906,7 @@ class CentralSystem(cp):
     async def route_message(self, raw_msg):
         # every message from the CP counts as "seen" (shown as "last seen" in the station table)
         self.data.last_seen = datetime.now().isoformat(timespec='seconds')
+        ops_emit('message', cp_id=self.id)   # [OPS] last sign of life
         return await super().route_message(raw_msg)
 
     @on(Action.boot_notification)
@@ -1892,6 +1955,9 @@ class CentralSystem(cp):
         
         await self._notify_update()
         
+        ops_emit('boot', cp_id=self.id, vendor=charge_point_vendor, model=charge_point_model,   # [OPS]
+                 serial=self.data.serial_number, firmware=self.data.firmware_version, interval=interval,
+                 registration=reg_status)
         return call_result.BootNotification(
             current_time=datetime.now(timezone.utc).isoformat(),
             interval=interval,
@@ -1901,6 +1967,7 @@ class CentralSystem(cp):
     @on(Action.heartbeat)
     async def on_heartbeat(self):
         self.data.last_heartbeat = datetime.now().strftime('%H:%M:%S')
+        ops_emit('heartbeat', cp_id=self.id)   # [OPS]
         app_state.add_log('⬅️ IN', self.id, 'Heartbeat')
         await self._notify_update()
         return call_result.Heartbeat(
@@ -1912,6 +1979,8 @@ class CentralSystem(cp):
         self.data.status[connector_id] = status
         vendor_error = kwargs.get('vendor_error_code') or ''
         self.data.error_codes[connector_id] = (error_code or 'NoError') + (f' ({vendor_error})' if vendor_error and error_code != 'NoError' else '')
+        ops_emit('status', cp_id=self.id, connector=connector_id, status=status, error_code=error_code,   # [OPS]
+                 vendor_error=vendor_error, info=kwargs.get('info') or '')
         if status not in ('Charging', 'SuspendedEV', 'SuspendedEVSE', 'Finishing') and connector_id in self.data.meter:
             self.data.meter[connector_id]['power_w'] = 0.0          # no session on this connector -> no power
         app_state.add_log('⬅️ IN', self.id, 'StatusNotification', {
@@ -1925,7 +1994,7 @@ class CentralSystem(cp):
     @on(Action.authorize)
     async def on_authorize(self, id_tag: str, **kwargs):
         # Use RFID card database for authorization
-        id_tag_info = app_state.authorize_rfid(id_tag)
+        id_tag_info = ops_free_authorize(self.id, None, id_tag) or app_state.authorize_rfid(id_tag)   # [OPS] v1.7 free charging
         
         app_state.add_log('⬅️ IN', self.id, 'Authorize', {
             'idTag': id_tag,
@@ -1945,7 +2014,8 @@ class CentralSystem(cp):
             logger.info(f"StartTransaction C{connector_id} idTag={_rs_key}: "
                         f"Accepted (CSMS-initiated RemoteStart)")
         else:
-            id_tag_info = app_state.authorize_rfid(id_tag)
+            id_tag_info = (ops_free_authorize(self.id, connector_id, id_tag, start=True)   # [OPS] v1.7 free charging
+                           or app_state.authorize_rfid(id_tag))
         
         txn_id = app_state.next_transaction_id()
 
@@ -1970,6 +2040,9 @@ class CentralSystem(cp):
         if str(id_tag_info.get('status', '')).split('.')[-1].lower() == 'accepted':
             await pay_on_start_transaction(self.id, connector_id, id_tag, txn_id, meter_start, timestamp)
         db_on_transaction_start(self.id, connector_id, id_tag, txn_id, meter_start, timestamp)   # [DB]
+        ops_emit('tx_start', cp_id=self.id, connector=connector_id, txn_id=txn_id, id_tag=id_tag,   # [OPS]
+                 meter_start=meter_start, timestamp=timestamp,
+                 accepted=str(id_tag_info.get('status', '')).split('.')[-1].lower() == 'accepted')
 
         app_state.add_log('⬅️ IN', self.id, 'StartTransaction', {
             'connector': connector_id,
@@ -2083,6 +2156,8 @@ class CentralSystem(cp):
     async def on_stop_transaction(self, meter_stop: int, timestamp: str, transaction_id: int, **kwargs):
         reason = kwargs.get('reason', 'Local')
         transaction_data = kwargs.get('transaction_data', [])
+        ops_ct_rehydrate(self, transaction_id)   # [OPS] v1.10 session that began before a reconnect / restart
+        _ops_txn = dict(self.data.transactions.get(transaction_id) or {})   # [OPS] facts of the session before it is removed
 
         energy = 0
         if transaction_id in self.data.transactions:
@@ -2096,6 +2171,8 @@ class CentralSystem(cp):
         # [PAYMENT] settle the prepaid session of this transaction (used / remaining / refund due)
         await pay_on_stop_transaction(self.id, transaction_id, meter_stop, reason, energy)
         db_on_transaction_stop(self.id, transaction_id, meter_stop, reason, energy, timestamp)   # [DB]
+        ops_emit('tx_stop', cp_id=self.id, txn_id=transaction_id, meter_stop=meter_stop, reason=reason,   # [OPS]
+                 energy_wh=energy, timestamp=timestamp, txn=_ops_txn, id_tag=kwargs.get('id_tag') or _ops_txn.get('id_tag', ''))
 
         # Parse transaction_data for meter values with context + timestamp
         txn_meter_values = []
@@ -2230,6 +2307,8 @@ class CentralSystem(cp):
         _pay_txn = transaction_id if transaction_id is not None else next((tid for tid, t in self.data.transactions.items() if t.get('connector_id') == connector_id), None)
         await pay_on_meter_values(self.id, connector_id, _pay_txn, snap.get('energy_wh'), snap.get('power_w'))
         db_on_transaction_meter(self.id, _pay_txn, snap.get('energy_wh'), snap.get('power_w'), snap.get('soc'))   # [DB]
+        ops_emit('meter', cp_id=self.id, connector=connector_id, txn_id=_pay_txn, energy_wh=snap.get('energy_wh'),   # [OPS]
+                 power_w=snap.get('power_w'), soc=snap.get('soc'))
 
         # Reconcile transaction tracking with the CP's ground truth. On reconnect a
         # fresh CentralSystem is created with an empty transactions dict while the CP
@@ -2257,6 +2336,7 @@ class CentralSystem(cp):
                 'start_time': timestamp or '',
                 'reconstructed': True,  # not started via this CSMS session
             }
+            ops_ct_rehydrate(self, transaction_id, connector_id)   # [OPS] v1.10 the facts kept when the session started
             meter_changed = True
         if meter_changed:
             await self._notify_update()
@@ -2758,6 +2838,7 @@ async def on_ocpp_connect(websocket):
         cs.data.remote_address = ''
     app_state.charge_points[cp_id] = cs
     app_state.cp_data[cp_id] = cs.data
+    ops_emit('connect', cp_id=cp_id, remote=cs.data.remote_address)   # [OPS]
 
     await app_state.broadcast('cp_connected', {'id': cp_id})
     await app_state.broadcast('cp_update', cs.data.to_dict())
@@ -2765,7 +2846,10 @@ async def on_ocpp_connect(websocket):
     try:
         await cs.start()
     except Exception as e:
-        logger.error(f"CP {cp_id} error: {e}")
+        if 'websocket closed (CLOS' in str(e) or type(e).__name__ == 'ConnectionClosedOK':   # [OPS] v1.6
+            logger.info(f"CP {cp_id} closed the connection: {e}")
+        else:
+            logger.error(f"CP {cp_id} error: {e}")
     finally:
         cs.data.connected = False
         cs.data.disconnected_at = datetime.now().isoformat(timespec='seconds')
@@ -2774,6 +2858,7 @@ async def on_ocpp_connect(websocket):
         if app_state.charge_points.get(cp_id) is cs:
             del app_state.charge_points[cp_id]
             await app_state.broadcast('cp_disconnected', cs.data.to_dict())
+            ops_emit('disconnect', cp_id=cp_id)   # [OPS]
             logger.info(f"CP disconnected: {cp_id}")
         else:
             # the CP reconnected before this old socket finished: keep the new session untouched
@@ -3151,7 +3236,7 @@ async def auth_middleware(request, handler):
 
     token = request.cookies.get(SESSION_COOKIE)
     if _session_valid(token):
-        return await handler(request)
+        return await ops_guard(request, handler, token)   # [OPS] role permissions + audit log
 
     # ยังไม่ได้ login / session หมดอายุ
     if request.path.startswith('/api/') or request.path == '/ws':
@@ -3198,6 +3283,7 @@ async def handle_login(request):
     locked, secs_left = _ip_locked(ip)
     if locked:
         mins = max(1, secs_left // 60)
+        ops_audit('?', 'login blocked', ip=ip, status=429, detail={'minutes': mins})
         lock_html = ('<div class="error" data-i18n="🔒 Too many failed attempts. Try again in ~{mins} min." '
                      + 'data-i18n-vars=\'{"mins": ' + str(mins) + '}\'>'
                      + f'🔒 Too many failed attempts. Try again in ~{mins} min.</div>')
@@ -3208,29 +3294,24 @@ async def handle_login(request):
     username = (data.get('username') or '').strip()
     password = data.get('password') or ''
 
-    # 2) ยังไม่ได้ตั้งค่า credential (env ว่าง) ห้าม login เด็ดขาด
-    if not AUTH['username'] or not AUTH['password']:
-        logger.warning("ปฏิเสธการ login: ยังไม่ได้ตั้งค่า CSMS_USER/CSMS_PASS (activate .venv ก่อน)")
-        await asyncio.sleep(FAIL_DELAY_SECONDS)
-        return web.Response(text=LOGIN_TEMPLATE.replace('<!--ERROR-->', error_html),
-                            content_type='text/html', status=401)
-
-    # 3) เทียบแบบ constant-time กันการเดารหัสจากเวลา
-    ok = (secrets.compare_digest(username, AUTH['username'])
-          and secrets.compare_digest(password, AUTH['password']))
+    # 2)+3) [OPS] the built-in administrator (CSMS_USER / CSMS_PASS, constant-time) or an account from the Users tab
+    ok, ops_who = ops_check_login(username, password, ip)
 
     if ok:
         LOGIN_ATTEMPTS.pop(ip, None)               # สำเร็จ -> ล้างประวัติผิด
         token = secrets.token_urlsafe(32)
         ACTIVE_SESSIONS[token] = datetime.now()    # เก็บเวลา login -> ใช้คิดหมดอายุ 1 วัน
-        logger.info(f"✅ login สำเร็จจาก {ip}")
-        resp = web.HTTPFound('/')
+        ops_session_start(token, ops_who, ip)      # [OPS] who is behind this session
+        ops_audit(ops_who, 'login', role=(ops_user_record(ops_who) or {}).get('role', ''), ip=ip, status=200)
+        logger.info(f"✅ login สำเร็จจาก {ip} ({ops_who})")
+        resp = web.HTTPFound(ops_landing(ops_who))
         resp.set_cookie(SESSION_COOKIE, token, httponly=True,
                         max_age=SESSION_MAX_AGE, samesite='Lax',
                         secure=COOKIE_SECURE, path='/')
         return resp
 
     # 4) ผิด -> บันทึก + หน่วงเวลา
+    ops_audit(username[:64] or '?', 'login failed', ip=ip, status=401, detail={'reason': ops_who})
     _register_fail(ip)
     await asyncio.sleep(FAIL_DELAY_SECONDS)
     return web.Response(text=LOGIN_TEMPLATE.replace('<!--ERROR-->', error_html),
@@ -3241,6 +3322,9 @@ async def handle_logout(request):
     """ออกจากระบบ: ลบ session แล้วกลับไปหน้า login"""
     token = request.cookies.get(SESSION_COOKIE)
     if token:
+        _ops_s = OPS_SESSIONS.pop(token, None)                         # [OPS] audit the sign-out
+        if _ops_s and token in ACTIVE_SESSIONS:
+            ops_audit(_ops_s.get('user', '?'), 'logout', ip=_client_ip(request), status=200)
         ACTIVE_SESSIONS.pop(token, None)
     resp = web.HTTPFound('/login')
     resp.del_cookie(SESSION_COOKIE, path='/')
@@ -4447,7 +4531,7 @@ LOG_VIEWER_TEMPLATE = '''
         // Initialize
         document.addEventListener('DOMContentLoaded', () => {
             // Set date to today
-            document.getElementById('filterDate').value = new Date().toISOString().split('T')[0];
+            document.getElementById('filterDate').value = new Date(Date.now() + 21600000).toISOString().slice(0, 10);   // [OPS] v1.11 Bhutan day
             refreshLogs();
         });
         
@@ -5953,6 +6037,7 @@ HTML_TEMPLATE = '''
             .toast { min-width: 0; padding: 0.7rem 0.9rem; font-size: 0.85rem; }
         }
     </style>
+    <link rel="stylesheet" href="/ops/ops.css">
 </head>
 <body>
     <div class="header">
@@ -5965,6 +6050,7 @@ HTML_TEMPLATE = '''
             <span id="wsStatusText" data-i18n="Connecting...">Connecting...</span>
             <span class="lang-switch" title="Language" data-i18n-title="Language"></span>
             <button onclick="switchCsmsVersion()" title="Switch CSMS to OCPP 2.0.1" data-i18n-title="Switch CSMS to OCPP 2.0.1" style="margin-left: 1rem; padding: 0.35rem 0.8rem; background: rgba(255,255,255,0.22); color: #fff; border: 1px solid rgba(255,255,255,0.35); border-radius: 8px; font-size: 0.8rem; font-weight: 700; cursor: pointer;" data-i18n="🔀 Switch to 2.0.1">🔀 Switch to 2.0.1</button>
+            <span class="ops-user" id="opsUserBadge"></span>
             <a href="/logout" style="margin-left: 1rem; padding: 0.35rem 0.8rem; background: rgba(239,68,68,0.85); color: #fff; border-radius: 8px; text-decoration: none; font-size: 0.8rem; font-weight: 700;" data-i18n="🚪 Logout">🚪 Logout</a>
         </div>
     </div>
@@ -5972,15 +6058,24 @@ HTML_TEMPLATE = '''
     <!-- ===== Fleet navigation ===== -->
     <nav class="tabs" id="mainTabs">
         <button class="tab active" data-tab="stations" onclick="showTab('stations')"><span data-i18n="🗺️ Stations">🗺️ Stations</span><span class="tab-badge" id="stationsBadge"></span></button>
+        <button class="tab" data-tab="health" onclick="showTab('health')"><span data-i18n="🩺 Health">🩺 Health</span><span class="tab-badge warn" id="healthBadge"></span></button>
+        <button class="tab" data-tab="alerts" onclick="showTab('alerts')"><span data-i18n="🔔 Alerts">🔔 Alerts</span><span class="tab-badge warn" id="alertsBadge"></span></button>
+        <button class="tab" data-tab="maint" onclick="showTab('maint')"><span data-i18n="🛠️ Maintenance">🛠️ Maintenance</span><span class="tab-badge" id="maintBadge"></span></button>
+        <button class="tab" data-tab="kpi" onclick="showTab('kpi')"><span data-i18n="📈 KPIs & reports">📈 KPIs &amp; reports</span></button>
+        <button class="tab" data-tab="lm" onclick="showTab('lm')"><span data-i18n="⚡ Load management">⚡ Load management</span></button>
         <button class="tab" data-tab="map" onclick="showTab('map')"><span data-i18n="📍 Map">📍 Map</span></button>
         <button class="tab" data-tab="log" onclick="showTab('log')"><span data-i18n="📋 Message Log">📋 Message Log</span><span class="tab-badge" id="logBadge"></span></button>
         <button class="tab" data-tab="payments" onclick="showTab('payments')"><span data-i18n="💳 Payments">💳 Payments</span><span class="tab-badge pay-tab-badge" id="payBadge"></span></button>
+        <button class="tab" data-tab="free" onclick="showTab('free')"><span data-i18n="🎟️ Free charging">🎟️ Free charging</span><span class="tab-badge" id="freeBadge"></span></button>
         <button class="tab" data-tab="customers" onclick="showTab('customers')"><span data-i18n="👥 Customers">👥 Customers</span></button>
         <button class="tab" data-tab="rfid" onclick="showTab('rfid')"><span data-i18n="🎴 RFID Cards">🎴 RFID Cards</span></button>
         <button class="tab" data-tab="registration" onclick="showTab('registration')"><span data-i18n="🔐 Registration">🔐 Registration</span><span class="tab-badge warn" id="pendingBadge"></span></button>
         <button class="tab" data-tab="config" onclick="showTab('config')"><span data-i18n="⚙️ Default Config">⚙️ Default Config</span></button>
+        <button class="tab" data-tab="fwdiag" onclick="showTab('fwdiag')"><span data-i18n="🧰 Firmware & logs">🧰 Firmware &amp; logs</span></button>
         <button class="tab" data-tab="export" onclick="showTab('export')"><span data-i18n="📊 Log Export">📊 Log Export</span></button>
         <button class="tab" data-tab="db" onclick="showTab('db')"><span data-i18n="🗄️ Database">🗄️ Database</span></button>
+        <button class="tab" data-tab="users" onclick="showTab('users')"><span data-i18n="👤 Users">👤 Users</span></button>
+        <button class="tab" data-tab="server" onclick="showTab('server')"><span data-i18n="🖥️ Server">🖥️ Server</span></button>
     </nav>
 
     <!-- ===== Stations: KPIs + filters + table/grid ===== -->
@@ -6418,6 +6513,16 @@ HTML_TEMPLATE = '''
     </main>
 
     <!-- ===== Database: where the CSMS keeps its data (local JSON files or MongoDB) ===== -->
+    <main class="view" id="view-health"></main>
+    <main class="view" id="view-kpi"></main>
+    <main class="view" id="view-alerts"></main>
+    <main class="view" id="view-maint"></main>
+    <main class="view" id="view-free"></main>
+    <main class="view" id="view-lm"></main>
+    <main class="view" id="view-fwdiag"></main>
+    <main class="view" id="view-server"></main>
+    <main class="view" id="view-users"></main>
+
     <main class="view" id="view-db">
         <section class="kpis db-kpis">
             <div class="kpi info static"><span class="kpi-label" data-i18n="Storage">Storage</span><span class="kpi-value" id="dbKpiType">—</span><span class="kpi-sub" id="dbKpiTypeSub"></span></div>
@@ -8283,8 +8388,24 @@ HTML_TEMPLATE = '''
 
         function parseTs(s) {
             if (!s) return null;
+            // [OPS] v1.11 times from the CSMS without a zone are Bhutan Time (UTC+06:00), whatever the browser's zone
+            if (typeof s === 'string' && /^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}(:[0-9]{2}([.][0-9]+)?)?$/.test(s)) s = s.replace(' ', 'T') + '+06:00';
             const d = new Date(s);
             return isNaN(d.getTime()) ? null : d;
+        }
+
+        function bttDate(d) {   // [OPS] v1.11 a Date shown as Bhutan Time: YYYY-MM-DD HH:MM
+            const b = new Date(d.getTime() + 21600000);
+            return b.toISOString().slice(0, 16).replace('T', ' ');
+        }
+
+        function bttToday() {   // [OPS] v1.11 today in Bhutan Time (YYYY-MM-DD)
+            return new Date(Date.now() + 21600000).toISOString().slice(0, 10);
+        }
+
+        function bttLocalInput(s) {   // [OPS] v1.11 a stored time -> value of a datetime-local input in Bhutan Time
+            const d = parseTs(s);
+            return d ? new Date(d.getTime() + 21600000).toISOString().slice(0, 16) : '';
         }
 
         function tsNum(s) {
@@ -8565,7 +8686,7 @@ HTML_TEMPLATE = '''
             const blob = new Blob([lines.join(NL)], {type: 'text/csv;charset=utf-8'});
             const a = document.createElement('a');
             a.href = URL.createObjectURL(blob);
-            a.download = 'stations_' + new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-') + '.csv';
+            a.download = 'stations_' + bttDate(new Date()).replace(/[: ]/g, '-') + '.csv';
             document.body.appendChild(a);
             a.click();
             setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 2000);
@@ -8783,8 +8904,9 @@ HTML_TEMPLATE = '''
         function fmtClock(iso) {
             const d = parseTs(iso);
             if (!d) return '';
+            const b = new Date(d.getTime() + 21600000);   // [OPS] v1.11 Bhutan Time
             const p = n => String(n).padStart(2, '0');
-            return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+            return p(b.getUTCHours()) + ':' + p(b.getUTCMinutes()) + ':' + p(b.getUTCSeconds());
         }
 
         function fmtDuration(ms) {
@@ -9172,7 +9294,7 @@ HTML_TEMPLATE = '''
         }
 
         function exportPayCsv() {
-            window.open('/api/pay/export.csv?date=' + new Date().toISOString().slice(0, 10), '_blank');
+            window.open('/api/pay/export.csv?date=' + bttToday(), '_blank');
         }
 
         function openStickers(cp) {
@@ -11799,8 +11921,8 @@ async function switchCsmsVersion() {
                     'Invalid': '❌'
                 };
                 
-                const expiry = card.expiry_date ? new Date(card.expiry_date).toLocaleString() : '-';
-                const lastUsed = card.last_used ? new Date(card.last_used).toLocaleString() : trh('Never');
+                const expiry = card.expiry_date && parseTs(card.expiry_date) ? bttDate(parseTs(card.expiry_date)) : '-';   // [OPS] v1.11 BTT
+                const lastUsed = card.last_used && parseTs(card.last_used) ? bttDate(parseTs(card.last_used)) : trh('Never');
                 
                 return `
                     <tr>
@@ -11899,8 +12021,7 @@ async function switchCsmsVersion() {
             
             if (card.expiry_date) {
                 // Convert to local datetime format
-                const dt = new Date(card.expiry_date);
-                document.getElementById('rfidExpiry').value = dt.toISOString().slice(0, 16);
+                document.getElementById('rfidExpiry').value = bttLocalInput(card.expiry_date);   // [OPS] v1.11 Bhutan Time
             } else {
                 document.getElementById('rfidExpiry').value = '';
             }
@@ -12500,7 +12621,7 @@ async function switchCsmsVersion() {
             });
             
             // Add today if not in list
-            const today = new Date().toISOString().split('T')[0];
+            const today = bttToday();   // [OPS] v1.11
             if (!logDates.includes(today)) {
                 const option = document.createElement('option');
                 option.value = today;
@@ -12592,7 +12713,7 @@ async function switchCsmsVersion() {
         }
         
         function exportTodayLogs() {
-            const today = new Date().toISOString().split('T')[0];
+            const today = bttToday();   // [OPS] v1.11
             window.location.href = `/api/logs/export?date=${today}`;
             showToast(tr("Exporting today's logs"), 'success');
         }
@@ -12649,7 +12770,7 @@ async function switchCsmsVersion() {
         }
         
         function viewLogsInModal() {
-            const date = document.getElementById('logExportDate').value || new Date().toISOString().split('T')[0];
+            const date = document.getElementById('logExportDate').value || bttToday();
             viewLogsForDate(date);
         }
         
@@ -13019,6 +13140,7 @@ async function switchCsmsVersion() {
             setTimeout(() => reveal(false), 300);
         })();
     </script>
+    <script src="/ops/ops.js"></script>
 </body>
 </html>
 '''
@@ -18417,6 +18539,9 @@ async def handle_ocpp_web(request):
     if not ws.can_prepare(request).ok:
         return web.Response(text='OCPP 1.6-J endpoint: connect a charge point to ws(s)://<this host>/ocpp/<id>\n',
                             content_type='text/plain')
+    _deny = await ops_sec_web_gate(request)   # [OPS] v1.6 charger security (Basic Auth / unknown ids / TLS)
+    if _deny is not None:
+        return _deny
     await ws.prepare(request)
     try:
         await on_ocpp_connect(_WebOcppSocket(ws, request))
@@ -18429,7 +18554,10945 @@ async def handle_ocpp_web(request):
 # ============================================================================
 # Main
 # ============================================================================
+# =====================================================================================================================
+# [OPS] Operations platform for BPC - v1.1 users, roles & audit log            (inserted by ops/patch_users.py)
+#   v1.2 status history + network health, v1.3 KPIs & reports, v1.4 alerts, v1.5 maintenance build on this block.
+#   Everything below keeps the single-file layout: data lives in ops_data/ (JSON) or in MongoDB (ops_* collections).
+# =====================================================================================================================
+import threading as _ops_threading
+import time as _ops_time
+import re as _ops_re
+import csv as _ops_csv
+import io as _ops_io
+
+OPS_VERSION = '1.11.1'
+OPS_FEATURES: List[str] = ['users']
+OPS_DIR = str(APP_DIR / 'ops_data')
+OPS_TZ = timezone(timedelta(hours=6))           # Bhutan Time (BTT, UTC+06:00): ops views, monthly files, reports
+OPS_JS_PARTS: List[str] = []                    # console script parts, served as /ops/ops.js
+OPS_CSS_PARTS: List[str] = []                   # console styles, served as /ops/ops.css
+OPS_HOOKS: Dict[str, list] = {}                 # event name -> listeners (see ops_emit)
+OPS_STARTUP: list = []                          # run once by ops_startup() inside main()
+OPS_TASKS: list = []                            # coroutine functions started together with the web server
+OPS_STORES: list = []                           # document stores (also written by db_sync_everything)
+OPS_EVENT_LOGS: list = []                       # append-only event logs
+
+
+def ops_now() -> float:
+    return _ops_time.time()
+
+
+def ops_dt(t: float = None) -> datetime:
+    return datetime.fromtimestamp(ops_now() if t is None else t, OPS_TZ)
+
+
+def ops_iso(t: float = None) -> str:
+    return ops_dt(t).isoformat(timespec='seconds')
+
+
+def ops_ym(t: float) -> str:
+    return ops_dt(t).strftime('%Y-%m')
+
+
+def ops_day_start(date_str: str) -> float:
+    """'YYYY-MM-DD' (Bhutan Time) -> epoch seconds at 00:00 BTT."""
+    return datetime.strptime(str(date_str)[:10], '%Y-%m-%d').replace(tzinfo=OPS_TZ).timestamp()
+
+
+def ops_range_from_query(q, default_days: int = 7):
+    """(t0, t1) from ?from=YYYY-MM-DD&to=YYYY-MM-DD - whole days, Bhutan Time, 'to' inclusive."""
+    now = ops_now()
+    try:
+        t1 = ops_day_start(q.get('to')) + 86400 if q.get('to') else now + 1
+    except ValueError:
+        t1 = now + 1
+    try:
+        t0 = ops_day_start(q.get('from')) if q.get('from') else t1 - default_days * 86400
+    except ValueError:
+        t0 = t1 - default_days * 86400
+    return min(t0, t1), max(t0, t1)
+
+
+def ops_int(v, default=0, lo=None, hi=None):
+    try:
+        n = int(float(v))
+    except (TypeError, ValueError):
+        n = default
+    if lo is not None:
+        n = max(lo, n)
+    if hi is not None:
+        n = min(hi, n)
+    return n
+
+
+def ops_on(kind: str, fn=None):
+    """Register a listener: ops_on('status', fn) or @ops_on('status')."""
+    def deco(f):
+        OPS_HOOKS.setdefault(kind, []).append(f)
+        return f
+    return deco(fn) if fn else deco
+
+
+def ops_emit(kind: str, **kw):
+    """Called from the OCPP handlers: a failing listener is logged, never breaks the conversation with the charger."""
+    for fn in OPS_HOOKS.get(kind, ()):
+        try:
+            fn(**kw)
+        except Exception as e:
+            logger.error(f"ops: {kind} listener {getattr(fn, '__name__', '?')} failed: {e}")
+
+
+# ---- storage --------------------------------------------------------------------------------------------------------
+class OpsEventLog:
+    """Append-only events: monthly JSON-lines files ops_data/<name>_YYYY-MM.jsonl and/or the MongoDB collection <coll>.
+    Recent events stay in memory for the views; older periods are read back on demand (reports)."""
+
+    def __init__(self, name: str, coll: str, keep_days: int = 45, max_recent: int = 300000):
+        self.name, self.coll = name, coll
+        self.keep = keep_days * 86400
+        self.max_recent = max_recent
+        self.recent: List[dict] = []
+        self.loaded = False
+        self._lock = _ops_threading.Lock()
+        OPS_EVENT_LOGS.append(self)
+
+    def _path(self, ym: str) -> str:
+        return os.path.join(OPS_DIR, f'{self.name}_{ym}.jsonl')
+
+    @staticmethod
+    def _months(t0: float, t1: float) -> List[str]:
+        out, d = [], ops_dt(t0).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        end = ops_dt(t1)
+        while d <= end and len(out) < 240:
+            out.append(d.strftime('%Y-%m'))
+            d = (d + timedelta(days=32)).replace(day=1)
+        return out
+
+    def read(self, t0: float, t1: float) -> List[dict]:
+        """Events with t0 <= t < t1, oldest first (blocking I/O: call through asyncio.to_thread from a handler)."""
+        db = _db()
+        if db is not None:
+            try:
+                return list(db.db[self.coll].find({'t': {'$gte': t0, '$lt': t1}}, {'_id': 0}).sort('t', 1))
+            except Exception as e:
+                logger.error(f"ops: reading {self.coll} from the database failed ({e}) - using the files")
+        out = []
+        for ym in self._months(t0, t1):
+            p = self._path(ym)
+            if not os.path.exists(p):
+                continue
+            try:
+                with open(p, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        try:
+                            ev = json.loads(line)
+                        except ValueError:
+                            continue
+                        if t0 <= float(ev.get('t') or 0) < t1:
+                            out.append(ev)
+            except OSError as e:
+                logger.error(f"ops: reading {p} failed: {e}")
+        out.sort(key=lambda e: e.get('t') or 0)
+        return out
+
+    def load(self):
+        self.recent = self.read(ops_now() - self.keep, ops_now() + 86400)
+        self.loaded = True
+        db = _db()
+        if db is not None:
+            def _index(coll=self.coll):
+                try:
+                    db.db[coll].create_index('t', name='t')
+                except Exception as e:
+                    logger.error(f"ops: index on {coll} failed: {e}")
+            _ops_threading.Thread(target=_index, daemon=True).start()
+
+    def add(self, ev: dict) -> dict:
+        ev = dict(ev)
+        ev.setdefault('t', round(ops_now(), 3))
+        with self._lock:
+            self.recent.append(ev)
+            if len(self.recent) > self.max_recent * 1.1 or (self.recent and self.recent[0].get('t', 0) < ops_now() - self.keep * 1.2):
+                cut = ops_now() - self.keep
+                self.recent = [e for e in self.recent if e.get('t', 0) >= cut][-self.max_recent:]
+        db = _db()
+        if db is not None:
+            try:
+                db.writer.put(self.coll, db._ops[3](_db_safe_keys(_db_clean(ev))))
+            except Exception as e:
+                logger.error(f"ops: queueing {self.coll} failed: {e}")
+        if db is None or _db_keep_files():
+            try:
+                os.makedirs(OPS_DIR, exist_ok=True)
+                with open(self._path(ops_ym(ev['t'])), 'a', encoding='utf-8') as f:
+                    f.write(json.dumps(ev, ensure_ascii=False, default=str) + '\n')
+            except OSError as e:
+                logger.error(f"ops: writing {self.name} failed: {e}")
+        return ev
+
+    def query(self, t0: float, t1: float, pred=None, limit: int = None, newest_first: bool = False) -> List[dict]:
+        if self.loaded and t0 >= ops_now() - self.keep + 60:
+            with self._lock:
+                src = [e for e in self.recent if t0 <= (e.get('t') or 0) < t1]
+        else:
+            src = self.read(t0, t1)
+        if pred is not None:
+            src = [e for e in src if pred(e)]
+        if newest_first:
+            src.reverse()
+        return src[:limit] if limit else src
+
+
+class OpsDocStore:
+    """Small document collection: ops_data/<name>.json and/or MongoDB <coll> (same rules as the other CSMS stores)."""
+
+    def __init__(self, name: str, coll: str):
+        self.name, self.coll = name, coll
+        self.path = os.path.join(OPS_DIR, name + '.json')
+        self.data: Dict[str, dict] = {}
+        OPS_STORES.append(self)
+
+    def load(self):
+        data, _src = _db_load_collection(self.coll, lambda: _app_json_load(self.path, {}) or {})
+        self.data = {str(k): v for k, v in (data or {}).items() if isinstance(v, dict)}
+        return self
+
+    def save(self, force_files: bool = False):
+        db = _db()
+        if db is not None:
+            try:
+                db.sync_collection(self.coll, self.data)
+            except Exception as e:
+                logger.error(f"ops: database save of {self.coll} failed: {e}")
+        if db is None or force_files or _db_keep_files():
+            try:
+                os.makedirs(OPS_DIR, exist_ok=True)
+                _app_atomic_write(self.path, self.data)
+            except Exception as e:
+                logger.error(f"ops: failed to save {self.path}: {e}")
+
+
+ops_settings = OpsDocStore('settings', 'ops_settings')     # documents: roles, health, alerts, channels, sla ...
+ops_users = OpsDocStore('users', 'ops_users')
+OPS_AUDIT = OpsEventLog('audit', 'ops_audit', keep_days=40)
+
+
+def ops_cfg(section: str, defaults: dict = None) -> dict:
+    """A settings document; missing keys are filled from defaults (and kept)."""
+    d = ops_settings.data.get(section)
+    if not isinstance(d, dict):
+        d = {}
+        ops_settings.data[section] = d
+    for k, v in (defaults or {}).items():
+        d.setdefault(k, json.loads(json.dumps(v)))
+    return d
+
+
+# ---- roles & permissions --------------------------------------------------------------------------------------------
+OPS_PERMS = ['view', 'control', 'config', 'view_payments', 'payments', 'view_customers', 'customers',
+             'alerts', 'tickets', 'admin']
+OPS_ROLE_ORDER = ['admin', 'operator', 'technician', 'viewer']
+OPS_ROLE_DEFAULTS = {
+    'admin': list(OPS_PERMS),
+    'operator': ['view', 'control', 'view_payments', 'payments', 'view_customers', 'customers', 'alerts', 'tickets'],
+    'technician': ['view', 'control', 'config', 'alerts', 'tickets'],
+    'viewer': ['view'],
+}
+# commands of POST /api/command
+OPS_COMMAND_PERMS = {c: 'control' for c in ('remote_start', 'remote_stop', 'reset', 'unlock', 'availability', 'trigger',
+                                            'reserve', 'cancel_reserve', 'get_config', 'get_composite', 'get_local_list')}
+OPS_COMMAND_PERMS.update({c: 'config' for c in ('set_config', 'clear_cache', 'data_transfer', 'set_profile', 'clear_profile',
+                                                'send_local_list', 'get_diagnostics', 'update_firmware')})
+# (method, path) -> permission; anything not listed: GET = view, everything else = admin
+OPS_PERM_EXACT: Dict[tuple, str] = {
+    ('POST', '/api/switch_version'): 'admin', ('POST', '/api/logs/clear'): 'admin',
+    ('POST', '/api/rfid/add'): 'config', ('POST', '/api/rfid/delete'): 'config', ('POST', '/api/rfid/import'): 'config',
+    ('POST', '/api/cp/set_status'): 'config', ('POST', '/api/cp/delete'): 'config', ('POST', '/api/cp/disconnect'): 'control',
+    ('POST', '/api/config/restore'): 'config', ('POST', '/api/config/batch'): 'config',
+    ('GET', '/api/db/settings'): 'admin', ('GET', '/api/db/status'): 'admin',
+    ('GET', '/api/pay/settings'): 'payments', ('POST', '/api/pay/settings'): 'admin',
+    ('GET', '/api/pay/sessions'): 'view_payments', ('GET', '/api/pay/export.csv'): 'view_payments',
+    ('POST', '/api/pay/session/action'): 'payments', ('POST', '/api/pay/manual'): 'payments',
+    ('GET', '/api/app/admin/customers'): 'view_customers', ('POST', '/api/app/admin/customer/action'): 'customers',
+    ('GET', '/api/app/admin/settings'): 'customers', ('POST', '/api/app/admin/settings'): 'admin',
+    ('POST', '/api/app/admin/station_info'): 'config', ('POST', '/api/app/admin/push/broadcast'): 'customers',
+    ('GET', '/api/ops/me'): 'view', ('POST', '/api/ops/password'): 'view',
+}
+OPS_PERM_PREFIX: List[tuple] = [
+    ('POST', '/api/db/', 'admin'), ('GET', '/api/app/admin/customer/', 'view_customers'),
+    ('GET', '/api/ftp/download/', 'config'),
+    ('*', '/api/ops/users', 'admin'), ('*', '/api/ops/roles', 'admin'), ('*', '/api/ops/audit', 'admin'),
+    ('*', '/api/ops/sessions', 'admin'),
+]
+# console tabs -> permission needed to see them (the server checks every call anyway)
+OPS_TAB_PERMS = {'payments': 'view_payments', 'customers': 'view_customers', 'db': 'admin', 'users': 'admin'}
+
+
+def ops_perm_rule(method: str, path: str, perm: str, prefix: bool = False):
+    """Used by the later ops modules to declare the permission of their endpoints."""
+    if prefix:
+        OPS_PERM_PREFIX.append((method.upper(), path, perm))
+    else:
+        OPS_PERM_EXACT[(method.upper(), path)] = perm
+
+
+def ops_required_perm(method: str, path: str, command: str = '') -> str:
+    method = 'GET' if method in ('GET', 'HEAD', 'OPTIONS') else method
+    if path == '/api/command':
+        return OPS_COMMAND_PERMS.get(command, 'config')
+    p = OPS_PERM_EXACT.get((method, path))
+    if p:
+        return p
+    best = None
+    for m, prefix, perm in OPS_PERM_PREFIX:
+        if (m == '*' or m == method) and path.startswith(prefix) and (best is None or len(prefix) > len(best[0])):
+            best = (prefix, perm)
+    if best:
+        return best[1]
+    return 'view' if method == 'GET' else 'admin'
+
+
+def ops_role_perms(role: str) -> set:
+    if role == 'admin':
+        return set(OPS_PERMS)
+    over = (ops_settings.data.get('roles') or {}).get(role)
+    base = over if isinstance(over, list) else OPS_ROLE_DEFAULTS.get(role, ['view'])
+    return {p for p in base if p in OPS_PERMS and p != 'admin'} | {'view'}
+
+
+def ops_roles_table() -> dict:
+    return {r: sorted(ops_role_perms(r), key=OPS_PERMS.index) for r in OPS_ROLE_ORDER}
+
+
+# ---- users ------------------------------------------------------------------------------------------------------------
+OPS_USERNAME_RE = _ops_re.compile(r'^[a-z0-9][a-z0-9._-]{2,31}$')
+OPS_SESSIONS: Dict[str, dict] = {}              # session token -> {'user', 'ip', 'since', 'seen'}
+OPS_DUMMY_PW = {'salt': 'AAAAAAAAAAAAAAAAAAAAAA', 'hash': 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'}
+
+
+def ops_builtin_name() -> str:
+    return AUTH.get('username') or '' if AUTH.get('password') else ''
+
+
+def ops_user_record(username: str):
+    """Public view of an account (built-in admin from CSMS_USER/CSMS_PASS or a Users-tab account), None when unknown."""
+    if not username:
+        return None
+    if username == ops_builtin_name():
+        return {'username': username, 'name': 'Built-in administrator', 'role': 'admin', 'builtin': True}
+    u = ops_users.data.get(username)
+    if not u:
+        return None
+    out = {k: v for k, v in u.items() if k not in ('pw', 'fails')}
+    out['username'] = username
+    return out
+
+
+def ops_public_user(username: str) -> dict:
+    rec = dict(ops_user_record(username) or {})
+    now = ops_now()
+    sess = [s for t, s in OPS_SESSIONS.items() if s.get('user') == username and _session_valid(t)]
+    rec['sessions'] = len(sess)
+    rec['last_seen'] = max([s.get('seen', 0) for s in sess] or [0]) or None
+    rec['locked'] = bool((rec.get('locked_until') or 0) > now)
+    return rec
+
+
+def ops_check_login(username: str, password: str, ip: str):
+    """(True, username) or (False, reason). Built-in admin first, then the Users-tab accounts (per-account lockout)."""
+    now = ops_now()
+    bu = ops_builtin_name()
+    if bu and secrets.compare_digest(username.encode('utf-8'), bu.encode('utf-8')):
+        return (True, bu) if secrets.compare_digest(password.encode('utf-8'), AUTH['password'].encode('utf-8')) else (False, 'bad_password')
+    key = username.strip().lower()
+    u = ops_users.data.get(key)
+    if not u:
+        _app_check_password(password, OPS_DUMMY_PW)          # same cost as a real check: no user enumeration by timing
+        if not bu and not ops_users.data:
+            logger.warning("ปฏิเสธการ login: ยังไม่ได้ตั้งค่า CSMS_USER/CSMS_PASS และยังไม่มีบัญชีผู้ใช้")
+        return False, 'unknown_user'
+    if (u.get('locked_until') or 0) > now:
+        return False, 'locked'
+    if not _app_check_password(password, u.get('pw') or {}):
+        u['fails'] = int(u.get('fails') or 0) + 1
+        if u['fails'] >= MAX_LOGIN_FAILS:
+            u['locked_until'] = now + LOGIN_LOCKOUT.total_seconds()
+            u['fails'] = 0
+            logger.warning(f"🔒 ล็อกบัญชี {key} ชั่วคราว ({LOGIN_LOCKOUT}) — login ผิด {MAX_LOGIN_FAILS} ครั้ง")
+            ops_audit(key, 'account locked', ip=ip, status=423, detail={'minutes': int(LOGIN_LOCKOUT.total_seconds() // 60)})
+        ops_users.save()
+        return False, 'bad_password'
+    if u.get('disabled'):
+        return False, 'disabled'
+    u.update(fails=0, locked_until=0, last_login=round(now), last_ip=ip)
+    ops_users.save()
+    return True, key
+
+
+def ops_session_start(token: str, username: str, ip: str):
+    OPS_SESSIONS[token] = {'user': username, 'ip': ip, 'since': round(ops_now()), 'seen': round(ops_now())}
+    for t in [t for t in OPS_SESSIONS if t not in ACTIVE_SESSIONS]:
+        OPS_SESSIONS.pop(t, None)                       # tidy up sessions that expired or logged out elsewhere
+
+
+def ops_end_sessions(username: str, keep: str = None) -> int:
+    n = 0
+    for t, s in list(OPS_SESSIONS.items()):
+        if s.get('user') == username and t != keep:
+            OPS_SESSIONS.pop(t, None)
+            ACTIVE_SESSIONS.pop(t, None)
+            n += 1
+    return n
+
+
+def ops_landing(username: str) -> str:
+    return '/'
+
+
+def ops_request_user(request) -> dict:
+    return request.get('ops_user') or {}
+
+
+# ---- audit log --------------------------------------------------------------------------------------------------------
+_OPS_SECRET_KEY = _ops_re.compile(r'pass|secret|token|api_?key|apikey|private|^uri$|_uri$|otp|^pin$|cvv|authorization|webhook|^headers$', _ops_re.I)
+_OPS_SECRET_CFG = _ops_re.compile(r'auth|pass|secret|key$|token', _ops_re.I)
+
+
+def ops_csv_safe(v):
+    """Spreadsheet-safe cell: text that starts like a formula is prefixed so Excel shows it as text."""
+    if isinstance(v, str) and v[:1] in ('=', '+', '-', '@', '\t', '\r'):
+        return "'" + v
+    return v
+
+
+def ops_redact(obj, depth: int = 0):
+    """Copy of a request body that is safe to keep: secrets masked, long values cut."""
+    if depth > 4:
+        return '…'
+    if isinstance(obj, dict):
+        out = {}
+        for i, (k, v) in enumerate(obj.items()):
+            if i >= 40:
+                out['…'] = f'{len(obj) - 40} more'
+                break
+            k = str(k)[:60]
+            out[k] = '***' if (_OPS_SECRET_KEY.search(k) and v not in (None, '', [], {})) else ops_redact(v, depth + 1)
+            if k.lower().endswith('url') and isinstance(v, str) and '?' in v:
+                out[k] = v.split('?', 1)[0] + '?***'                  # query strings often carry API keys
+        if 'key' in out and 'value' in out and _OPS_SECRET_CFG.search(str(out.get('key') or '')):
+            out['value'] = '***'
+        return out
+    if isinstance(obj, list):
+        out = [ops_redact(v, depth + 1) for v in obj[:20]]
+        if len(obj) > 20:
+            out.append(f'… {len(obj) - 20} more')
+        return out
+    if isinstance(obj, str):
+        return obj if len(obj) <= 300 else obj[:300] + '…'
+    return obj
+
+
+def ops_audit(user: str, action: str, *, role: str = '', ip: str = '', method: str = '', path: str = '',
+              status: int = 0, cp: str = '', detail=None) -> dict:
+    ev = {'t': round(ops_now(), 3), 'user': str(user or '')[:64], 'role': role, 'ip': str(ip or '')[:64],
+          'action': str(action or '')[:120], 'method': method, 'path': str(path or '')[:200], 'status': int(status or 0),
+          'cp': str(cp or '')[:80]}
+    if detail is not None:
+        try:
+            s = json.dumps(ops_redact(detail), ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            s = str(detail)
+        ev['detail'] = s if len(s) <= 2000 else s[:2000] + '…'
+    return OPS_AUDIT.add(ev)
+
+
+OPS_AUDIT_SECRET_FIELDS: Dict[str, set] = {'/api/ops/password': {'current', 'new'}}   # bodies with secrets under plain names
+
+
+def ops_audit_request(request, rec: dict, body, command: str, status: int):
+    cp = ''
+    if isinstance(body, dict):
+        cp = str(body.get('cp_id') or body.get('cp') or '')
+        hide = OPS_AUDIT_SECRET_FIELDS.get(request.path)
+        if hide:
+            body = {k: ('***' if k in hide and v not in (None, '') else v) for k, v in body.items()}
+    action = ('command ' + command) if command else request.path
+    ops_audit(rec.get('username', '?'), action, role=rec.get('role', ''), ip=_client_ip(request), method=request.method,
+              path=request.path, status=status, cp=cp, detail=body)
+
+
+async def ops_guard(request, handler, token: str):
+    """auth_middleware hook for a valid session: role permission check, then the audit trail of every change."""
+    sess = OPS_SESSIONS.get(token)
+    rec = ops_user_record((sess or {}).get('user', ''))
+    api = request.path.startswith('/api/') or request.path == '/ws'
+    if rec is None or rec.get('disabled'):
+        ACTIVE_SESSIONS.pop(token, None)
+        OPS_SESSIONS.pop(token, None)
+        if api:
+            return web.json_response({'error': 'Unauthorized'}, status=401)
+        raise web.HTTPFound('/login')
+    sess['seen'] = round(ops_now())
+    request['ops_user'] = rec
+    role = rec.get('role') or 'viewer'
+    method = request.method.upper()
+    body, command = None, ''
+    if method not in ('GET', 'HEAD', 'OPTIONS'):
+        ctype = (request.content_type or '').lower()
+        if not ctype.startswith('multipart/') and (request.content_length or 0) <= 262144:
+            try:
+                raw = await request.read()
+                if raw:
+                    if ctype == 'application/x-www-form-urlencoded':
+                        body = {k: v for k, v in (await request.post()).items()}
+                    else:
+                        body = json.loads(raw.decode('utf-8'))
+            except Exception:
+                body = None
+        if request.path == '/api/command' and isinstance(body, dict):
+            command = str(body.get('command') or '')
+    need = ops_required_perm(method, request.path, command)
+    if need not in ops_role_perms(role):
+        ops_audit(rec['username'], ('command ' + command) if command else request.path, role=role, ip=_client_ip(request),
+                  method=method, path=request.path, status=403, cp=str((body or {}).get('cp_id') or '') if isinstance(body, dict) else '',
+                  detail={'denied': need})
+        if api:
+            return web.json_response({'error': 'forbidden', 'need': need, 'role': role}, status=403)
+        return web.Response(text='<h3>403 - not allowed for your role (%s)</h3><p><a href="/">Back</a></p>' % role,
+                            content_type='text/html', status=403)
+    if method in ('GET', 'HEAD', 'OPTIONS'):
+        return await handler(request)
+    try:
+        resp = await handler(request)
+    except web.HTTPException as ex:
+        ops_audit_request(request, rec, body, command, ex.status)
+        raise
+    except Exception:
+        ops_audit_request(request, rec, body, command, 500)
+        raise
+    ops_audit_request(request, rec, body, command, getattr(resp, 'status', 200))
+    return resp
+
+
+# ---- API ------------------------------------------------------------------------------------------------------------
+def ops_json(data, status: int = 200):
+    return web.json_response(data, status=status, dumps=lambda o: json.dumps(o, ensure_ascii=False, default=str))
+
+
+def ops_err(msg: str, status: int = 400, **extra):
+    return ops_json(dict({'error': msg}, **extra), status=status)
+
+
+async def ops_body(request) -> dict:
+    try:
+        d = await request.json()
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+async def ops_api_me(request):
+    rec = ops_request_user(request)
+    role = rec.get('role') or 'viewer'
+    return ops_json({'user': rec.get('username'), 'name': rec.get('name') or rec.get('username'), 'role': role,
+                     'perms': sorted(ops_role_perms(role), key=OPS_PERMS.index), 'builtin': bool(rec.get('builtin')),
+                     'version': OPS_VERSION, 'features': OPS_FEATURES, 'roles': OPS_ROLE_ORDER, 'all_perms': OPS_PERMS,
+                     'tab_perms': OPS_TAB_PERMS, 'tz': 'Asia/Thimphu', 'now': ops_now()})
+
+
+def _ops_admins_left(excluding: str = None) -> int:
+    n = 1 if ops_builtin_name() else 0
+    for name, u in ops_users.data.items():
+        if name != excluding and u.get('role') == 'admin' and not u.get('disabled'):
+            n += 1
+    return n
+
+
+async def ops_api_users(request):
+    names = ([ops_builtin_name()] if ops_builtin_name() else []) + sorted(ops_users.data)
+    return ops_json({'users': [ops_public_user(n) for n in names], 'roles': ops_roles_table(),
+                     'role_defaults': OPS_ROLE_DEFAULTS, 'perms': OPS_PERMS, 'role_order': OPS_ROLE_ORDER})
+
+
+async def ops_api_users_save(request):
+    d = await ops_body(request)
+    me = ops_request_user(request)
+    name = str(d.get('username') or '').strip().lower()
+    create = bool(d.get('create'))
+    if name == ops_builtin_name() or (ops_builtin_name() and name == ops_builtin_name().lower()):
+        return ops_err('The built-in administrator is set with CSMS_USER / CSMS_PASS')
+    if not OPS_USERNAME_RE.match(name):
+        return ops_err('Username: 3-32 characters, a-z 0-9 . _ -')
+    cur = ops_users.data.get(name)
+    if create and cur:
+        return ops_err('This username already exists', 409)
+    if not create and not cur:
+        return ops_err('No such user', 404)
+    role = str(d.get('role') or (cur or {}).get('role') or 'viewer')
+    if role not in OPS_ROLE_ORDER:
+        return ops_err('Unknown role')
+    pw = str(d.get('password') or '')
+    if create and not pw:
+        return ops_err('Set a password for the new user')
+    if pw and (len(pw) < 8 or pw.lower() == name):
+        return ops_err('The password needs at least 8 characters and must differ from the username')
+    disabled = bool(d.get('disabled'))
+    if cur and cur.get('role') == 'admin' and (role != 'admin' or disabled) and _ops_admins_left(excluding=name) == 0:
+        return ops_err('Keep at least one active administrator')
+    if name == me.get('username') and (disabled or role != (cur or {}).get('role')):
+        return ops_err('You cannot disable yourself or change your own role')
+    u = dict(cur or {'created_at': round(ops_now()), 'created_by': me.get('username')})
+    u['role'] = role
+    u['disabled'] = disabled
+    for k, n in (('name', 80), ('email', 120), ('phone', 40), ('telegram', 64), ('note', 200)):
+        if k in d:
+            u[k] = str(d.get(k) or '').strip()[:n]
+    if pw:
+        u['pw'] = _app_hash_password(pw)
+        u['pw_changed_at'] = round(ops_now())
+        u['fails'], u['locked_until'] = 0, 0
+    u['updated_at'] = round(ops_now())
+    ops_users.data[name] = u
+    ops_users.save()
+    if disabled or (pw and not create):
+        ops_end_sessions(name)
+    return ops_json({'ok': True, 'user': ops_public_user(name)})
+
+
+async def ops_api_users_delete(request):
+    d = await ops_body(request)
+    name = str(d.get('username') or '').strip().lower()
+    me = ops_request_user(request)
+    if name not in ops_users.data:
+        return ops_err('No such user', 404)
+    if name == me.get('username'):
+        return ops_err('You cannot delete yourself')
+    if ops_users.data[name].get('role') == 'admin' and _ops_admins_left(excluding=name) == 0:
+        return ops_err('Keep at least one active administrator')
+    ops_users.data.pop(name, None)
+    ops_users.save()
+    ops_end_sessions(name)
+    return ops_json({'ok': True})
+
+
+async def ops_api_users_unlock(request):
+    d = await ops_body(request)
+    name = str(d.get('username') or '').strip().lower()
+    u = ops_users.data.get(name)
+    if not u:
+        return ops_err('No such user', 404)
+    u.update(fails=0, locked_until=0)
+    ops_users.save()
+    return ops_json({'ok': True})
+
+
+async def ops_api_users_signout(request):
+    d = await ops_body(request)
+    name = str(d.get('username') or '').strip()
+    me = ops_request_user(request)
+    n = ops_end_sessions(name, keep=request.cookies.get(SESSION_COOKIE) if name == me.get('username') else None)
+    return ops_json({'ok': True, 'ended': n})
+
+
+async def ops_api_password(request):
+    d = await ops_body(request)
+    me = ops_request_user(request)
+    if me.get('builtin'):
+        return ops_err('The built-in administrator password is set with CSMS_PASS')
+    u = ops_users.data.get(me.get('username') or '')
+    if not u:
+        return ops_err('No such user', 404)
+    if not _app_check_password(str(d.get('current') or ''), u.get('pw') or {}):
+        await asyncio.sleep(FAIL_DELAY_SECONDS)
+        return ops_err('The current password is not correct', 403, kind='bad_password')
+    new = str(d.get('new') or '')
+    if len(new) < 8 or new.lower() == me.get('username'):
+        return ops_err('The password needs at least 8 characters and must differ from the username')
+    u['pw'] = _app_hash_password(new)
+    u['pw_changed_at'] = round(ops_now())
+    ops_users.save()
+    ops_end_sessions(me.get('username'), keep=request.cookies.get(SESSION_COOKIE))
+    return ops_json({'ok': True})
+
+
+async def ops_api_roles(request):
+    if request.method == 'POST':
+        d = await ops_body(request)
+        roles = d.get('roles') if isinstance(d.get('roles'), dict) else {}
+        out = {}
+        for r in OPS_ROLE_ORDER:
+            if r == 'admin':
+                continue
+            if r in roles and isinstance(roles[r], list):
+                out[r] = [p for p in OPS_PERMS if p in roles[r] and p != 'admin']
+        if d.get('reset'):
+            out = {}
+        ops_settings.data['roles'] = out
+        ops_settings.save()
+    return ops_json({'roles': ops_roles_table(), 'role_defaults': OPS_ROLE_DEFAULTS, 'perms': OPS_PERMS})
+
+
+def _ops_audit_filter(request):
+    q = request.query
+    t0, t1 = ops_range_from_query(q, 7)
+    user = (q.get('user') or '').strip().lower()
+    text = (q.get('q') or '').strip().lower()
+    only = (q.get('only') or '').strip()                 # '' | 'changes' | 'denied' | 'logins'
+
+    def pred(e):
+        if user and str(e.get('user', '')).lower() != user:
+            return False
+        st = int(e.get('status') or 0)
+        act = str(e.get('action', ''))
+        if only == 'denied' and st not in (401, 403, 423, 429) and not act.startswith('login failed'):
+            return False
+        if only == 'logins' and not (act.startswith('login') or act in ('logout', 'account locked')):
+            return False
+        if only == 'changes' and (act.startswith('login') or act == 'logout'):
+            return False
+        if text:
+            blob = ' '.join(str(e.get(k, '')) for k in ('user', 'action', 'path', 'cp', 'ip', 'detail')).lower()
+            if text not in blob:
+                return False
+        return True
+    return t0, t1, pred
+
+
+async def ops_api_audit(request):
+    t0, t1, pred = _ops_audit_filter(request)
+    limit = ops_int(request.query.get('limit'), 500, 1, 5000)
+    items = await asyncio.to_thread(OPS_AUDIT.query, t0, t1, pred, None, True)
+    return ops_json({'items': items[:limit], 'total': len(items), 'from': t0, 'to': t1})
+
+
+async def ops_api_audit_csv(request):
+    t0, t1, pred = _ops_audit_filter(request)
+    items = await asyncio.to_thread(OPS_AUDIT.query, t0, t1, pred, None, True)
+    buf = _ops_io.StringIO()
+    w = _ops_csv.writer(buf)
+    w.writerow(['time (BTT)', 'user', 'role', 'action', 'charger', 'result', 'ip', 'method', 'path', 'details'])
+    for e in items:
+        w.writerow([ops_csv_safe(x) for x in (ops_iso(e.get('t')), e.get('user', ''), e.get('role', ''), e.get('action', ''), e.get('cp', ''),
+                    e.get('status', ''), e.get('ip', ''), e.get('method', ''), e.get('path', ''), e.get('detail', ''))])
+    name = 'csms_audit_%s.csv' % ops_dt().strftime('%Y%m%d_%H%M')
+    return web.Response(body=('﻿' + buf.getvalue()).encode('utf-8'), content_type='text/csv',
+                        headers={'Content-Disposition': f'attachment; filename="{name}"'})
+
+
+async def ops_asset_js(request):
+    return web.Response(text='\n;\n'.join(OPS_JS_PARTS), content_type='application/javascript',
+                        headers={'Cache-Control': 'no-cache'})
+
+
+async def ops_asset_css(request):
+    return web.Response(text='\n'.join(OPS_CSS_PARTS), content_type='text/css', headers={'Cache-Control': 'no-cache'})
+
+
+OPS_ROUTES: List[tuple] = [
+    ('GET', '/ops/ops.js', ops_asset_js), ('GET', '/ops/ops.css', ops_asset_css),
+    ('GET', '/api/ops/me', ops_api_me), ('POST', '/api/ops/password', ops_api_password),
+    ('GET', '/api/ops/users', ops_api_users), ('POST', '/api/ops/users/save', ops_api_users_save),
+    ('POST', '/api/ops/users/delete', ops_api_users_delete), ('POST', '/api/ops/users/unlock', ops_api_users_unlock),
+    ('POST', '/api/ops/users/signout', ops_api_users_signout),
+    ('GET', '/api/ops/roles', ops_api_roles), ('POST', '/api/ops/roles', ops_api_roles),
+    ('GET', '/api/ops/audit', ops_api_audit), ('GET', '/api/ops/audit.csv', ops_api_audit_csv),
+]
+
+
+def ops_register_routes(app):
+    for method, path, fn in OPS_ROUTES:
+        app.router.add_route(method, path, fn)
+
+
+def ops_startup():
+    """Load the ops stores (called at the top of main(), after the database connection was opened)."""
+    try:
+        os.makedirs(OPS_DIR, exist_ok=True)
+    except OSError as e:
+        logger.error(f"ops: cannot create {OPS_DIR}: {e}")
+    for store in OPS_STORES:
+        store.load()
+    for log in OPS_EVENT_LOGS:
+        log.load()
+    for fn in OPS_STARTUP:
+        try:
+            fn()
+        except Exception as e:
+            logger.error(f"ops: start-up step {getattr(fn, '__name__', '?')} failed: {e}")
+    logger.info(f"🧭 Ops platform {OPS_VERSION}: {', '.join(OPS_FEATURES)} - {len(ops_users.data)} user account(s), data in "
+                + ('MongoDB' if _db() is not None else OPS_DIR))
+
+
+def ops_start_tasks():
+    async def _guarded(fn):
+        while True:
+            try:
+                await fn()
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"ops: background task {getattr(fn, '__name__', '?')} crashed ({e}) - restarting in 10 s")
+                await asyncio.sleep(10)
+    for fn in OPS_TASKS:
+        asyncio.create_task(_guarded(fn))
+
+OPS_CSS_PARTS.append(r'''/* [OPS] console styles - served as /ops/ops.css */
+.ops-user { margin-left: 1rem; display: inline-flex; align-items: center; gap: 0.4rem; padding: 0.3rem 0.65rem; border-radius: 8px;
+    background: rgba(255,255,255,0.18); color: #fff; font-size: 0.78rem; font-weight: 600; white-space: nowrap; max-width: 260px; }
+.ops-user:empty { display: none; }
+.ops-user-name { overflow: hidden; text-overflow: ellipsis; }
+.ops-user-role { padding: 0.05rem 0.45rem; border-radius: 50px; font-size: 0.6rem; text-transform: uppercase; letter-spacing: 0.3px; background: rgba(255,255,255,0.28); }
+.ops-panel { margin-top: 1rem; }
+.pay-panel.ops-panel { max-height: none; overflow: visible; }
+.ops-kpis { margin-bottom: 0; }
+.ops-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.5rem; margin-bottom: 0.4rem; }
+.ops-head h3 { margin: 0; }
+.ops-actions { display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; }
+.ops-filters label { display: inline-flex; align-items: center; gap: 0.3rem; font-size: 0.75rem; color: var(--text-dim); font-weight: 600; }
+.ops-filters .tb-inp, .ops-filters .tb-sel { width: auto; min-width: 0; }
+.ops-filters input[type=search] { width: 160px; }
+.ops-table-wrap { overflow-x: auto; max-width: 100%; -webkit-overflow-scrolling: touch; }
+.ops-tall { max-height: 62vh; overflow-y: auto; }
+.ops-table td { vertical-align: top; }
+.ops-table .ops-btns { white-space: nowrap; }
+.ops-nowrap { white-space: nowrap; }
+.tb-btn.ops-mini { padding: 0.2rem 0.5rem; font-size: 0.72rem; margin: 0 0.2rem 0.2rem 0; }
+.ops-ok { color: var(--success); font-weight: 700; }
+.ops-bad { color: var(--error); font-weight: 700; }
+.ops-warn { color: var(--warning); font-weight: 700; }
+.ops-info { color: var(--info); font-weight: 700; }
+.pill.ops-role-admin { background: #fee2e2; color: #b91c1c; }
+.pill.ops-role-operator { background: #dbeafe; color: #1d4ed8; }
+.pill.ops-role-technician { background: #fef3c7; color: #b45309; }
+.pill.ops-role-viewer { background: #e2e8f0; color: #475569; }
+.pill.ops-live { background: #d1fae5; color: #047857; }
+.ops-detail { max-width: 380px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-dim);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.72rem; cursor: pointer; }
+.ops-detail.open { white-space: pre-wrap; word-break: break-all; }
+.ops-matrix td.c, .ops-matrix th.c { text-align: center; }
+.ops-foot { margin-top: 0.4rem; font-size: 0.75rem; }
+.ops-modal-wrap { position: fixed; inset: 0; background: rgba(15,23,42,0.45); display: flex; align-items: center; justify-content: center;
+    z-index: 10000; padding: 16px; }
+.ops-modal { background: var(--bg-card, #fff); color: var(--text); border-radius: 14px; box-shadow: var(--shadow-xl); width: min(600px, 100%);
+    max-height: 92vh; display: flex; flex-direction: column; }
+.ops-modal.wide { width: min(900px, 100%); }
+.ops-modal-head, .ops-modal-foot { padding: 0.7rem 1rem; display: flex; justify-content: space-between; align-items: center; gap: 0.5rem; }
+.ops-modal-foot { justify-content: flex-end; border-top: 1px solid var(--border); }
+.ops-modal-head { border-bottom: 1px solid var(--border); }
+.ops-modal-body { padding: 0.8rem 1rem; overflow-y: auto; }
+.ops-x { border: none; background: transparent; font-size: 1rem; cursor: pointer; color: var(--text-dim); }
+.ops-form { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 0.6rem; }
+.ops-form > label { display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.75rem; color: var(--text-dim); font-weight: 600; }
+.ops-form .wide { grid-column: 1 / -1; }
+.ops-form textarea { min-height: 70px; resize: vertical; font: inherit; }
+.ops-inline { display: flex; gap: 0.4rem; align-items: center; flex-wrap: wrap; }
+.ops-inline .tb-inp { flex: 1 1 180px; }
+.ops-check { display: inline-flex !important; flex-direction: row !important; align-items: center; gap: 0.35rem; font-size: 0.78rem; color: var(--text); font-weight: 600; }
+.db-secret { -webkit-text-security: disc; }
+@media (max-width: 700px) {
+    table.ops-cards, table.ops-cards tbody { display: block; }
+    table.ops-cards thead { display: none; }
+    table.ops-cards tr { display: block; margin: 0 0 0.6rem; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; background: var(--bg-input); }
+    table.ops-cards td { display: block; border: none !important; padding: 0.3rem 0.7rem; background: transparent; }
+    table.ops-cards td[data-l]::before { content: attr(data-l); display: block; font-size: 0.62rem; font-weight: 700; text-transform: uppercase;
+        letter-spacing: 0.3px; color: var(--text-dim); }
+    table.ops-cards tr[class*=ops-sevrow-] { border-left-width: 4px; }
+    table.ops-cards tr.ops-sevrow-critical { border-left-color: #ef4444; }
+    table.ops-cards tr.ops-sevrow-major { border-left-color: #f97316; }
+    table.ops-cards tr.ops-sevrow-minor { border-left-color: #eab308; }
+    table.ops-cards td.c { text-align: left; }
+    .ops-head { flex-direction: column; align-items: stretch; }
+    .ops-user { margin-left: 0; max-width: 100%; justify-content: center; }
+    .ops-filters input[type=search] { width: 100%; }
+    .ops-modal-wrap { padding: 8px; align-items: flex-end; }
+    .ops-modal { max-height: 94vh; }
+}
+''')
+OPS_JS_PARTS.append(r'''/* [OPS] console helpers + 👤 Users tab (v1.1) - served as /ops/ops.js */
+(function () {
+    'use strict';
+    if (window.OPS) return;
+    const OPS = window.OPS = {me: null, mods: {}, timers: {}, active: null, actionLabels: {}};
+    const BTT_MS = 6 * 3600 * 1000;
+
+    OPS.$ = id => document.getElementById(id);
+    OPS.esc = s => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    OPS.tx = (k, v) => (typeof tr === 'function' ? tr(k, v) : k);
+    OPS.t = (k, v) => (typeof trh === 'function' ? trh(k, v) : OPS.esc(k));
+    OPS.addI18n = function (dict) {
+        try {
+            Object.keys(dict).forEach(k => {
+                const pair = dict[k] || [];
+                if (pair[0] && I18N.dz && !I18N.dz[k]) I18N.dz[k] = pair[0];
+                if (pair[1] && I18N.th && !I18N.th[k]) I18N.th[k] = pair[1];
+            });
+        } catch (e) { console.error('ops i18n', e); }
+    };
+    OPS.pad = n => String(n).padStart(2, '0');
+    OPS.fmt = function (t, sec) {
+        if (!t) return '—';
+        const d = new Date(t * 1000 + BTT_MS);
+        const s = d.getUTCFullYear() + '-' + OPS.pad(d.getUTCMonth() + 1) + '-' + OPS.pad(d.getUTCDate()) + ' ' +
+            OPS.pad(d.getUTCHours()) + ':' + OPS.pad(d.getUTCMinutes());
+        return sec ? s + ':' + OPS.pad(d.getUTCSeconds()) : s;
+    };
+    OPS.day = function (t) {
+        const d = new Date((t || Date.now() / 1000) * 1000 + BTT_MS);
+        return d.getUTCFullYear() + '-' + OPS.pad(d.getUTCMonth() + 1) + '-' + OPS.pad(d.getUTCDate());
+    };
+    OPS.dayStart = t => Math.floor(((t || Date.now() / 1000) * 1000 + BTT_MS) / 86400000) * 86400 - 6 * 3600;
+    OPS.dur = function (sec) {
+        sec = Math.max(0, Math.round(sec || 0));
+        if (sec < 60) return sec + ' s';
+        const m = Math.floor(sec / 60), h = Math.floor(m / 60), d = Math.floor(h / 24);
+        if (d) return d + ' d ' + (h % 24) + ' h';
+        if (h) return h + ' h ' + (m % 60) + ' min';
+        return m + ' min';
+    };
+    OPS.ago = t => (t ? OPS.dur(Date.now() / 1000 - t) : '—');
+    OPS.num = (v, dig) => (v == null || isNaN(v) ? '—' : Number(v).toLocaleString('en-US', {maximumFractionDigits: dig == null ? 1 : dig, minimumFractionDigits: 0}));
+    OPS.toast = (msg, type) => { try { showToast(msg, type || 'info'); } catch (e) { console.log(msg); } };
+    OPS.api = async function (url, opts) {
+        opts = opts || {};
+        const init = {method: opts.method || (opts.body !== undefined ? 'POST' : 'GET'), headers: {}, credentials: 'same-origin'};
+        if (opts.body !== undefined) { init.headers['Content-Type'] = 'application/json'; init.body = JSON.stringify(opts.body); }
+        const r = await fetch(url, init);
+        let j = null;
+        try { j = await r.json(); } catch (e) { j = null; }
+        if (!r.ok) {
+            const err = new Error((j && j.error) || ('HTTP ' + r.status));
+            err.status = r.status; err.data = j;
+            throw err;
+        }
+        return j;
+    };
+    OPS.post = (url, body) => OPS.api(url, {body: body || {}});
+    OPS.fail = e => { if (e && e.status === 403) return; OPS.toast(OPS.tx((e && e.message) || 'Error'), 'error'); };
+    OPS.can = p => !!(OPS.me && OPS.me.perms && OPS.me.perms.includes(p));
+    OPS.register = m => { OPS.mods[m.tab] = m; };
+    OPS.has = f => !!(OPS.me && (OPS.me.features || []).includes(f));
+    OPS.ROLE_LABELS = {admin: 'Administrator', operator: 'Operator', technician: 'Technician', viewer: 'Viewer'};
+    OPS.PERM_LABELS = {view: 'View dashboards', control: 'Charger commands', config: 'Charger configuration',
+        view_payments: 'See payments', payments: 'Manage payments', view_customers: 'See customers',
+        customers: 'Manage customers', alerts: 'Handle alerts', tickets: 'Maintenance tickets', admin: 'Administration'};
+    OPS.roleLabel = r => OPS.ROLE_LABELS[r] || r || '';
+    OPS.rolePill = r => '<span class="pill ops-role-' + OPS.esc(r) + '">' + OPS.t(OPS.roleLabel(r)) + '</span>';
+    OPS.opt = (v, label, sel) => '<option value="' + OPS.esc(v) + '"' + (sel ? ' selected' : '') + '>' + OPS.esc(OPS.tx(label)) + '</option>';
+    OPS.kpi = (cls, label, id, sub) => '<div class="kpi ' + cls + ' static"><span class="kpi-label">' + OPS.t(label) +
+        '</span><span class="kpi-value" id="' + id + '">—</span><span class="kpi-sub" id="' + id + 'Sub">' + (sub ? OPS.t(sub) : '') + '</span></div>';
+    OPS.td = (label, html, cls) => '<td' + (cls ? ' class="' + cls + '"' : '') + (label ? ' data-l="' + OPS.esc(OPS.tx(label)) + '"' : '') + '>' + html + '</td>';
+    OPS.randomPassword = function () {
+        const a = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
+        const b = new Uint32Array(12);
+        crypto.getRandomValues(b);
+        return Array.from(b, x => a[x % a.length]).join('').replace(/(.{4})(?=.)/g, '$1-');
+    };
+    OPS.csvLink = function (url, params) {
+        const q = new URLSearchParams(params || {});
+        return url + (String(q) ? '?' + q : '');
+    };
+
+    // ---- modal dialog: buttons [{label, cls, run(box) -> true closes}]
+    OPS.modal = function (title, bodyHtml, buttons, opts) {
+        const wrap = document.createElement('div');
+        wrap.className = 'ops-modal-wrap';
+        wrap.innerHTML = '<div class="ops-modal' + (opts && opts.wide ? ' wide' : '') + '" role="dialog" aria-modal="true">' +
+            '<div class="ops-modal-head"><b>' + OPS.t(title, opts && opts.vars) + '</b><button class="ops-x" type="button" aria-label="Close">✕</button></div>' +
+            '<div class="ops-modal-body">' + bodyHtml + '</div><div class="ops-modal-foot"></div></div>';
+        const close = () => { wrap.remove(); document.removeEventListener('keydown', onKey); };
+        const onKey = e => { if (e.key === 'Escape') close(); };
+        wrap.querySelector('.ops-x').onclick = close;
+        wrap.addEventListener('mousedown', e => { if (e.target === wrap) close(); });
+        document.addEventListener('keydown', onKey);
+        const foot = wrap.querySelector('.ops-modal-foot');
+        (buttons || [{label: 'Close'}]).forEach(b => {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'tb-btn ' + (b.cls || '');
+            btn.innerHTML = OPS.t(b.label);
+            btn.onclick = async () => {
+                if (!b.run) return close();
+                btn.disabled = true;
+                try { if (await b.run(wrap)) close(); } catch (e) { OPS.fail(e); } finally { btn.disabled = false; }
+            };
+            foot.appendChild(btn);
+        });
+        document.body.appendChild(wrap);
+        const first = wrap.querySelector('input:not([readonly]):not([type=checkbox]), select, textarea');
+        if (first) setTimeout(() => first.focus(), 30);
+        return wrap;
+    };
+    OPS.confirm = (msg, vars) => window.confirm(OPS.tx(msg, vars));
+    OPS.val = (box, sel) => { const el = box.querySelector(sel); return el ? (el.type === 'checkbox' ? el.checked : el.value.trim()) : ''; };
+
+    // ---- 403 from any call -> one clear message
+    const rawFetch = window.fetch.bind(window);
+    window.fetch = async function () {
+        const r = await rawFetch.apply(window, arguments);
+        if (r.status === 403) {
+            r.clone().json().then(j => {
+                if (j && j.error === 'forbidden') OPS.toast(OPS.tx('Not allowed for your role ({role})', {role: OPS.tx(OPS.roleLabel(j.role))}), 'error');
+            }).catch(() => {});
+        }
+        return r;
+    };
+
+    // ---- tabs: lazy render + refresh while visible
+    OPS.onTab = function (name) {
+        OPS.active = name;
+        Object.keys(OPS.timers).forEach(k => { if (k !== name) { clearInterval(OPS.timers[k]); delete OPS.timers[k]; } });
+        const m = OPS.mods[name];
+        if (!m || !OPS.me) return;
+        try { m.show(); } catch (e) { console.error('ops tab', name, e); }
+        if (m.every && !OPS.timers[name]) {
+            OPS.timers[name] = setInterval(() => {
+                if (OPS.active === name && !document.hidden) { try { (m.refresh || m.show)(); } catch (e) { console.error(e); } }
+            }, m.every * 1000);
+        }
+    };
+    const activeTab = () => { const b = document.querySelector('#mainTabs .tab.active'); return b ? b.dataset.tab : 'stations'; };
+    const origShowTab = window.showTab;
+    if (typeof origShowTab === 'function') {
+        window.showTab = function () { const r = origShowTab.apply(this, arguments); try { OPS.onTab(activeTab()); } catch (e) {} return r; };
+    }
+    const origSetLang = window.setLang;
+    if (typeof origSetLang === 'function') {
+        window.setLang = function () {
+            const r = origSetLang.apply(this, arguments);
+            try { OPS.renderBadge(); const m = OPS.mods[OPS.active]; if (m && m.relang) m.relang(); } catch (e) {}
+            return r;
+        };
+    }
+    OPS.applyPerms = function () {
+        const tp = (OPS.me && OPS.me.tab_perms) || {};
+        document.querySelectorAll('#mainTabs .tab[data-tab]').forEach(b => {
+            const mod = OPS.mods[b.dataset.tab];
+            const need = tp[b.dataset.tab] || (mod && mod.perm);
+            b.style.display = (!need || OPS.can(need)) ? '' : 'none';
+        });
+        const act = document.querySelector('#mainTabs .tab.active');
+        if (act && act.style.display === 'none') showTab('stations');
+        document.body.classList.toggle('ops-no-control', !OPS.can('control'));
+        document.body.classList.toggle('ops-no-config', !OPS.can('config'));
+    };
+    OPS.renderBadge = function () {
+        const el = OPS.$('opsUserBadge');
+        if (!el || !OPS.me) return;
+        el.innerHTML = '<span class="ops-user-name">👤 ' + OPS.esc(OPS.me.builtin ? OPS.me.user : (OPS.me.name || OPS.me.user)) + '</span>' +
+            '<span class="ops-user-role">' + OPS.esc(OPS.tx(OPS.roleLabel(OPS.me.role))) + '</span>';
+        el.title = OPS.tx('Signed in as {u}', {u: OPS.me.user}) + (OPS.me.builtin ? '' : ' · ' + OPS.tx('🔑 Change password'));
+        el.onclick = OPS.me.builtin ? null : OPS.changePassword;
+        el.style.cursor = OPS.me.builtin ? 'default' : 'pointer';
+    };
+    OPS.changePassword = function () {
+        OPS.modal('🔑 Change password',
+            '<div class="ops-form">' +
+            '<label class="wide">' + OPS.t('Current password') + '<input class="tb-inp db-secret" type="text" autocomplete="off" data-lpignore="true" data-1p-ignore id="opsPwCur"></label>' +
+            '<label>' + OPS.t('New password') + '<input class="tb-inp db-secret" type="text" autocomplete="off" data-lpignore="true" data-1p-ignore id="opsPwNew"></label>' +
+            '<label>' + OPS.t('Repeat new password') + '<input class="tb-inp db-secret" type="text" autocomplete="off" data-lpignore="true" data-1p-ignore id="opsPwNew2"></label>' +
+            '</div><div class="pay-help">' + OPS.t('At least 8 characters. Your other sessions are signed out.') + '</div>',
+            [{label: 'Cancel'}, {label: 'Save', cls: 'primary', run: async box => {
+                const a = OPS.val(box, '#opsPwNew'), b = OPS.val(box, '#opsPwNew2');
+                if (a !== b) { OPS.toast(OPS.tx('The new passwords do not match'), 'error'); return false; }
+                await OPS.post('/api/ops/password', {current: box.querySelector('#opsPwCur').value, new: a});
+                OPS.toast(OPS.tx('Password changed'), 'success');
+                return true;
+            }}]);
+    };
+    OPS.loadMe = async function () {
+        try {
+            OPS.me = await OPS.api('/api/ops/me');
+        } catch (e) {
+            console.error('ops: /api/ops/me failed', e);
+            return;
+        }
+        try { if (typeof applyI18n === 'function') applyI18n(document); } catch (e) {}
+        OPS.renderBadge();
+        OPS.applyPerms();
+        OPS.onTab(activeTab());
+        document.dispatchEvent(new CustomEvent('ops-ready'));
+    };
+
+    // ---- audit action labels (later modules add theirs)
+    Object.assign(OPS.actionLabels, {
+        'login': '🔑 Signed in', 'logout': '🚪 Signed out', 'login failed': '⛔ Sign-in failed',
+        'login blocked': '🔒 Sign-in blocked', 'account locked': '🔒 Account locked',
+        '/api/rfid/add': 'RFID card added', '/api/rfid/delete': 'RFID card removed', '/api/rfid/import': 'RFID cards imported',
+        '/api/cp/set_status': 'Charger registration changed', '/api/cp/delete': 'Charger registration deleted',
+        '/api/cp/disconnect': 'Charger disconnected', '/api/config/restore': 'Default config restored',
+        '/api/config/batch': 'Configuration sent', '/api/logs/clear': 'Message log cleared',
+        '/api/pay/settings': 'Payment settings changed', '/api/pay/session/action': 'Payment session action',
+        '/api/pay/manual': 'Manual payment', '/api/app/admin/customer/action': 'Customer account action',
+        '/api/app/admin/settings': 'App settings changed', '/api/app/admin/station_info': 'Station info changed',
+        '/api/app/admin/push/broadcast': 'Push message sent', '/api/db/settings': 'Database settings changed',
+        '/api/db/export': 'Database exported', '/api/db/flush': 'Database flushed', '/api/db/test': 'Database connection tested',
+        '/api/ops/users/save': 'User saved', '/api/ops/users/delete': 'User deleted', '/api/ops/users/unlock': 'User unlocked',
+        '/api/ops/users/signout': 'User signed out', '/api/ops/roles': 'Role permissions changed',
+        '/api/ops/password': 'Password changed', '/api/switch_version': 'Switched to OCPP 2.0.1'
+    });
+    OPS.actionLabel = function (a) {
+        if (!a) return '';
+        if (a.indexOf('command ') === 0) return OPS.t('Command') + ': <b>' + OPS.esc(a.slice(8)) + '</b>';
+        return OPS.actionLabels[a] ? OPS.t(OPS.actionLabels[a]) : OPS.esc(a);
+    };
+
+    // =========================================================================================================
+    // 👤 Users tab: accounts, role permissions, audit log
+    // =========================================================================================================
+    const U = {users: [], roles: {}, defaults: {}, perms: [], order: [], audit: []};
+
+    function usersBuild(v) {
+        v.dataset.built = '1';
+        const d7 = OPS.day(Date.now() / 1000 - 6 * 86400), d0 = OPS.day();
+        v.innerHTML =
+            '<section class="kpis ops-kpis">' +
+            OPS.kpi('info', 'Accounts', 'uKpiTotal', 'incl. built-in admin') +
+            OPS.kpi('good', 'Signed in now', 'uKpiOnline', 'active sessions') +
+            OPS.kpi('warn', 'Locked / disabled', 'uKpiLocked', 'accounts') +
+            OPS.kpi('info', 'Changes today', 'uKpiChanges', 'in the audit log') +
+            '</section>' +
+            '<section class="pay-panel ops-panel"><div class="ops-head"><h3>' + OPS.t('👤 Users') + '</h3><div class="ops-actions">' +
+            '<button class="tb-btn primary" id="uAdd">' + OPS.t('➕ Add user') + '</button>' +
+            '<button class="tb-btn" id="uReload">' + OPS.t('🔄 Refresh') + '</button></div></div>' +
+            '<div class="pay-help">' + OPS.t('Each person signs in with their own account. The role decides what they can see and do; every change is written to the audit log below.') + '</div>' +
+            '<div class="ops-table-wrap"><table class="fleet-table ops-table" id="uTable"></table></div></section>' +
+            '<section class="pay-panel ops-panel"><div class="ops-head"><h3>' + OPS.t('🛡️ Roles & permissions') + '</h3><div class="ops-actions">' +
+            '<button class="tb-btn" id="rReset">' + OPS.t('Restore defaults') + '</button>' +
+            '<button class="tb-btn primary" id="rSave">' + OPS.t('💾 Save roles') + '</button></div></div>' +
+            '<div class="ops-table-wrap"><table class="fleet-table ops-table ops-matrix" id="rTable"></table></div></section>' +
+            '<section class="pay-panel ops-panel"><div class="ops-head"><h3>' + OPS.t('📜 Audit log') + '</h3>' +
+            '<div class="ops-actions ops-filters">' +
+            '<label>' + OPS.t('From') + ' <input class="tb-inp" type="date" id="aFrom" value="' + d7 + '"></label>' +
+            '<label>' + OPS.t('To') + ' <input class="tb-inp" type="date" id="aTo" value="' + d0 + '"></label>' +
+            '<select class="tb-sel" id="aUser"></select>' +
+            '<select class="tb-sel" id="aOnly">' + OPS.opt('', 'Everything') + OPS.opt('changes', 'Changes') + OPS.opt('logins', 'Sign-ins') + OPS.opt('denied', 'Denied') + '</select>' +
+            '<input class="tb-inp" type="search" id="aQ" autocomplete="off" data-i18n-placeholder="Search…" placeholder="' + OPS.esc(OPS.tx('Search…')) + '">' +
+            '<button class="tb-btn" id="aGo">' + OPS.t('🔍 Search') + '</button>' +
+            '<button class="tb-btn" id="aCsv">' + OPS.t('📥 Export CSV') + '</button></div></div>' +
+            '<div class="ops-table-wrap ops-tall"><table class="fleet-table ops-table" id="aTable"></table></div>' +
+            '<div class="muted ops-foot" id="aInfo"></div></section>';
+        OPS.$('uAdd').onclick = () => userEdit(null);
+        OPS.$('uReload').onclick = () => { usersLoad(); auditLoad(); };
+        OPS.$('rSave').onclick = rolesSave;
+        OPS.$('rReset').onclick = async () => {
+            if (!OPS.confirm('Restore the default permissions of every role?')) return;
+            try { await OPS.post('/api/ops/roles', {reset: true}); OPS.toast(OPS.tx('Roles saved'), 'success'); usersLoad(); } catch (e) { OPS.fail(e); }
+        };
+        OPS.$('aGo').onclick = auditLoad;
+        OPS.$('aQ').addEventListener('keydown', e => { if (e.key === 'Enter') auditLoad(); });
+        ['aUser', 'aOnly', 'aFrom', 'aTo'].forEach(id => OPS.$(id).addEventListener('change', auditLoad));
+        OPS.$('aCsv').onclick = () => { window.location.href = OPS.csvLink('/api/ops/audit.csv', auditParams()); };
+        v.addEventListener('click', e => {
+            const det = e.target.closest('.ops-detail');
+            if (det) det.classList.toggle('open');
+            const btn = e.target.closest('[data-uact]');
+            if (btn) userAction(btn.dataset.uact, btn.dataset.user);
+        });
+    }
+
+    async function usersLoad() {
+        try {
+            const j = await OPS.api('/api/ops/users');
+            U.users = j.users || []; U.roles = j.roles || {}; U.defaults = j.role_defaults || {}; U.perms = j.perms || []; U.order = j.role_order || [];
+        } catch (e) { return OPS.fail(e); }
+        usersRender();
+        rolesRender();
+    }
+
+    function usersRender() {
+        const now = Date.now() / 1000;
+        let online = 0, locked = 0;
+        const rows = U.users.map(u => {
+            online += u.sessions || 0;
+            if (u.locked || u.disabled) locked++;
+            const status = u.disabled ? '<span class="ops-bad">' + OPS.t('Disabled') + '</span>'
+                : u.locked ? '<span class="ops-warn">' + OPS.t('Locked') + '</span>'
+                : '<span class="ops-ok">' + OPS.t('Active') + '</span>';
+            const live = u.sessions ? ' <span class="pill ops-live">' + OPS.t('online now') + '</span>' : '';
+            const contact = [u.email, u.phone, u.telegram ? 'TG ' + u.telegram : ''].filter(Boolean).map(OPS.esc).join('<br>') || '<span class="muted">—</span>';
+            const last = u.builtin ? '<span class="muted">' + OPS.t('set with CSMS_USER / CSMS_PASS') + '</span>'
+                : (u.last_login ? OPS.fmt(u.last_login) + '<br><span class="muted">' + OPS.esc(u.last_ip || '') + '</span>' : '<span class="muted">' + OPS.t('never') + '</span>');
+            const b = (act, label) => '<button class="tb-btn ops-mini" data-uact="' + act + '" data-user="' + OPS.esc(u.username) + '">' + OPS.t(label) + '</button>';
+            const acts = u.builtin ? (u.sessions ? b('signout', '🚪 Sign out') : '')
+                : b('edit', '✏️ Edit') + (u.locked ? b('unlock', '🔓 Unlock') : '') + (u.sessions ? b('signout', '🚪 Sign out') : '') + b('delete', '🗑️ Delete');
+            return '<tr><td><b>' + OPS.esc(u.username) + '</b>' + (u.builtin ? ' <span class="pill">' + OPS.t('Built-in') + '</span>' : '') +
+                '<br><span class="muted">' + OPS.esc(u.builtin ? OPS.tx('Built-in administrator') : (u.name || '')) + '</span></td>' +
+                '<td>' + OPS.rolePill(u.role) + '</td><td>' + contact + '</td><td>' + status + live + '</td><td>' + last + '</td>' +
+                '<td class="ops-btns">' + acts + '</td></tr>';
+        });
+        OPS.$('uTable').innerHTML = '<thead><tr><th>' + OPS.t('User') + '</th><th>' + OPS.t('Role') + '</th><th>' + OPS.t('Contact') +
+            '</th><th>' + OPS.t('Status') + '</th><th>' + OPS.t('Last sign-in') + '</th><th>' + OPS.t('Actions') + '</th></tr></thead><tbody>' +
+            (rows.join('') || '<tr><td colspan="6" class="muted">' + OPS.t('No entries') + '</td></tr>') + '</tbody>';
+        OPS.$('uKpiTotal').textContent = U.users.length;
+        OPS.$('uKpiOnline').textContent = online;
+        OPS.$('uKpiLocked').textContent = locked;
+        const sel = OPS.$('aUser');
+        const cur = sel.value;
+        sel.innerHTML = OPS.opt('', 'All users') + U.users.map(u => OPS.opt(u.username, u.username, u.username === cur)).join('');
+        void now;
+    }
+
+    function rolesRender() {
+        const roles = U.order.length ? U.order : Object.keys(U.roles);
+        const head = '<thead><tr><th>' + OPS.t('Permission') + '</th>' + roles.map(r => '<th class="c">' + OPS.rolePill(r) + '</th>').join('') + '</tr></thead>';
+        const body = U.perms.map(p => '<tr><td>' + OPS.t(OPS.PERM_LABELS[p] || p) + ' <span class="muted">' + OPS.esc(p) + '</span></td>' +
+            roles.map(r => {
+                const on = (U.roles[r] || []).includes(p);
+                const fixed = r === 'admin' || p === 'view' || p === 'admin';
+                return '<td class="c"><input type="checkbox" data-role="' + r + '" data-perm="' + p + '"' + (on ? ' checked' : '') + (fixed ? ' disabled' : '') + '></td>';
+            }).join('') + '</tr>').join('');
+        OPS.$('rTable').innerHTML = head + '<tbody>' + body + '</tbody>';
+    }
+
+    async function rolesSave() {
+        const roles = {};
+        document.querySelectorAll('#rTable input[data-role]').forEach(cb => {
+            const r = cb.dataset.role;
+            if (r === 'admin') return;
+            roles[r] = roles[r] || [];
+            if (cb.checked) roles[r].push(cb.dataset.perm);
+        });
+        try { await OPS.post('/api/ops/roles', {roles}); OPS.toast(OPS.tx('Roles saved'), 'success'); usersLoad(); } catch (e) { OPS.fail(e); }
+    }
+
+    function userEdit(name) {
+        const u = name ? (U.users.find(x => x.username === name) || {}) : {};
+        const roleOpts = (U.order.length ? U.order : ['admin', 'operator', 'technician', 'viewer'])
+            .map(r => OPS.opt(r, OPS.roleLabel(r), (u.role || 'operator') === r)).join('');
+        const sec = 'class="tb-inp db-secret" type="text" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" data-lpignore="true" data-1p-ignore';
+        const html = '<div class="ops-form">' +
+            '<label>' + OPS.t('Username') + '<input class="tb-inp" id="ueName" autocomplete="off" value="' + OPS.esc(u.username || '') + '"' + (name ? ' readonly' : '') + '></label>' +
+            '<label>' + OPS.t('Display name') + '<input class="tb-inp" id="ueDisp" autocomplete="off" value="' + OPS.esc(u.name || '') + '"></label>' +
+            '<label>' + OPS.t('Role') + '<select class="tb-sel" id="ueRole">' + roleOpts + '</select></label>' +
+            '<label>' + OPS.t('Email') + '<input class="tb-inp" id="ueEmail" type="email" autocomplete="off" value="' + OPS.esc(u.email || '') + '"></label>' +
+            '<label>' + OPS.t('Phone') + '<input class="tb-inp" id="uePhone" autocomplete="off" value="' + OPS.esc(u.phone || '') + '"></label>' +
+            '<label>' + OPS.t('Telegram chat ID') + '<input class="tb-inp" id="ueTg" autocomplete="off" value="' + OPS.esc(u.telegram || '') + '"></label>' +
+            '<label class="wide">' + OPS.t('Note') + '<input class="tb-inp" id="ueNote" autocomplete="off" value="' + OPS.esc(u.note || '') + '"></label>' +
+            '<label class="wide">' + OPS.t(name ? 'New password' : 'Password') +
+            '<span class="ops-inline"><input ' + sec + ' id="uePw" placeholder="' + OPS.esc(name ? OPS.tx('Leave blank to keep the current password') : '') + '">' +
+            '<button type="button" class="tb-btn ops-mini" id="ueGen">' + OPS.t('Generate') + '</button>' +
+            '<label class="ops-check"><input type="checkbox" id="ueShow"> ' + OPS.t('Show') + '</label></span></label>' +
+            (name ? '<label class="ops-check wide"><input type="checkbox" id="ueDis"' + (u.disabled ? ' checked' : '') + '> ' + OPS.t('Account disabled') + '</label>' : '') +
+            '</div><div class="pay-help">' + OPS.t('Contact details are used for alert notifications and work orders.') + '</div>';
+        const box = OPS.modal(name ? 'Edit user {u}' : 'Add user', html, [{label: 'Cancel'}, {label: 'Save', cls: 'primary', run: async b => {
+            const body = {create: !name, username: OPS.val(b, '#ueName'), name: OPS.val(b, '#ueDisp'), role: OPS.val(b, '#ueRole'),
+                email: OPS.val(b, '#ueEmail'), phone: OPS.val(b, '#uePhone'), telegram: OPS.val(b, '#ueTg'), note: OPS.val(b, '#ueNote'),
+                password: b.querySelector('#uePw').value, disabled: name ? OPS.val(b, '#ueDis') : false};
+            await OPS.post('/api/ops/users/save', body);
+            OPS.toast(OPS.tx('User saved'), 'success');
+            usersLoad(); auditLoad();
+            return true;
+        }}], {vars: {u: name || ''}});
+        const pw = box.querySelector('#uePw');
+        box.querySelector('#ueGen').onclick = () => { pw.value = OPS.randomPassword(); box.querySelector('#ueShow').checked = true; pw.classList.remove('db-secret'); };
+        box.querySelector('#ueShow').onchange = e => pw.classList.toggle('db-secret', !e.target.checked);
+    }
+
+    async function userAction(act, name) {
+        try {
+            if (act === 'edit') return userEdit(name);
+            if (act === 'unlock') await OPS.post('/api/ops/users/unlock', {username: name});
+            if (act === 'signout') {
+                if (!OPS.confirm('Sign out all sessions of {u}?', {u: name})) return;
+                const j = await OPS.post('/api/ops/users/signout', {username: name});
+                OPS.toast(OPS.tx('{n} session(s) ended', {n: j.ended || 0}), 'success');
+            }
+            if (act === 'delete') {
+                if (!OPS.confirm('Delete user {u}?', {u: name})) return;
+                await OPS.post('/api/ops/users/delete', {username: name});
+                OPS.toast(OPS.tx('User deleted'), 'success');
+            }
+            usersLoad(); auditLoad();
+        } catch (e) { OPS.fail(e); }
+    }
+
+    function auditParams() {
+        const p = {from: OPS.$('aFrom').value, to: OPS.$('aTo').value};
+        if (OPS.$('aUser').value) p.user = OPS.$('aUser').value;
+        if (OPS.$('aOnly').value) p.only = OPS.$('aOnly').value;
+        if (OPS.$('aQ').value.trim()) p.q = OPS.$('aQ').value.trim();
+        return p;
+    }
+
+    OPS.resultCell = function (st) {
+        st = Number(st || 0);
+        if (!st) return '<span class="muted">—</span>';
+        if (st < 400) return '<span class="ops-ok">✓ ' + st + '</span>';
+        const word = st === 403 ? OPS.tx('denied') : st === 401 ? OPS.tx('not signed in') : st === 423 ? OPS.tx('locked') : st === 429 ? OPS.tx('blocked') : OPS.tx('error');
+        return '<span class="ops-bad">✕ ' + st + ' ' + OPS.esc(word) + '</span>';
+    };
+
+    async function auditLoad() {
+        let j;
+        try { j = await OPS.api(OPS.csvLink('/api/ops/audit', Object.assign({limit: 1000}, auditParams()))); } catch (e) { return OPS.fail(e); }
+        U.audit = j.items || [];
+        const t0 = OPS.dayStart();
+        OPS.$('uKpiChanges').textContent = U.audit.filter(e => e.t >= t0 && e.method && e.method !== 'GET' && (e.status || 0) < 400).length;
+        const rows = U.audit.map(e => {
+            let det = e.detail || '';
+            try { const d = JSON.parse(det); if (d && d.denied) det = OPS.tx('needs {p}', {p: OPS.tx(OPS.PERM_LABELS[d.denied] || d.denied)}); } catch (x) {}
+            return '<tr><td class="ops-nowrap">' + OPS.fmt(e.t, true) + '</td><td><b>' + OPS.esc(e.user) + '</b>' + (e.role ? '<br>' + OPS.rolePill(e.role) : '') +
+                '</td><td>' + OPS.actionLabel(e.action) + '</td><td>' + OPS.esc(e.cp || '') + '</td><td class="ops-nowrap">' + OPS.resultCell(e.status) +
+                '</td><td class="muted">' + OPS.esc(e.ip || '') + '</td><td><div class="ops-detail" title="' + OPS.esc(det) + '">' + OPS.esc(det) + '</div></td></tr>';
+        });
+        OPS.$('aTable').innerHTML = '<thead><tr><th>' + OPS.t('Time (BTT)') + '</th><th>' + OPS.t('User') + '</th><th>' + OPS.t('Action') +
+            '</th><th>' + OPS.t('Charger') + '</th><th>' + OPS.t('Result') + '</th><th>IP</th><th>' + OPS.t('Details') + '</th></tr></thead><tbody>' +
+            (rows.join('') || '<tr><td colspan="7" class="muted">' + OPS.t('No entries') + '</td></tr>') + '</tbody>';
+        OPS.$('aInfo').innerHTML = OPS.t('Showing {n} of {t} entries', {n: U.audit.length, t: j.total || 0});
+    }
+
+    OPS.register({tab: 'users', perm: 'admin', every: 30,
+        show() { const v = OPS.$('view-users'); if (!v) return; if (!v.dataset.built) usersBuild(v); usersLoad(); auditLoad(); },
+        refresh() { usersLoad(); },
+        relang() { usersRender(); rolesRender(); auditLoad(); }});
+
+    OPS.addI18n({
+        '👤 Users': ['👤 ལག་ལེན་པ་', '👤 ผู้ใช้'],
+        '🔄 Refresh': ['🔄 གསར་བཅོས་', '🔄 รีเฟรช'],
+        'Accounts': ['རྩིས་ཐོ་', 'บัญชี'],
+        'incl. built-in admin': ['', 'รวมผู้ดูแลระบบในตัว'],
+        'Signed in now': ['ད་ལྟོ་ནང་འཛུལ་ཡོད་མི་', 'ออนไลน์อยู่ตอนนี้'],
+        'active sessions': ['', 'เซสชันที่ใช้งานอยู่'],
+        'Locked / disabled': ['', 'ถูกล็อก / ปิดใช้งาน'],
+        'accounts': ['རྩིས་ཐོ་', 'บัญชี'],
+        'Changes today': ['', 'การเปลี่ยนแปลงวันนี้'],
+        'in the audit log': ['', 'ในบันทึกการใช้งาน'],
+        '➕ Add user': ['➕ ལག་ལེན་པ་ཁ་སྐོང་', '➕ เพิ่มผู้ใช้'],
+        'Each person signs in with their own account. The role decides what they can see and do; every change is written to the audit log below.':
+            ['', 'แต่ละคนเข้าสู่ระบบด้วยบัญชีของตัวเอง บทบาทเป็นตัวกำหนดว่าเห็นและทำอะไรได้บ้าง ทุกการเปลี่ยนแปลงจะถูกบันทึกไว้ในบันทึกการใช้งานด้านล่าง'],
+        '🛡️ Roles & permissions': ['🛡️ འགན་ཁུར་དང་ཆོག་ཐམ་', '🛡️ บทบาทและสิทธิ์'],
+        'Restore defaults': ['', 'คืนค่าเริ่มต้น'],
+        '💾 Save roles': ['', '💾 บันทึกบทบาท'],
+        '📜 Audit log': ['📜 ཞིབ་དཔྱད་ཐོ་', '📜 บันทึกการใช้งาน'],
+        'From': ['ལས་', 'จาก'], 'To': ['ཚུན་', 'ถึง'],
+        'All users': ['ལག་ལེན་པ་ཆ་མཉམ་', 'ผู้ใช้ทั้งหมด'], 'Everything': ['ཆ་མཉམ་', 'ทั้งหมด'],
+        'Changes': ['', 'การเปลี่ยนแปลง'], 'Sign-ins': ['', 'การเข้าสู่ระบบ'], 'Denied': ['', 'ถูกปฏิเสธ'],
+        'Search…': ['འཚོལ་…', 'ค้นหา…'], '🔍 Search': ['🔍 འཚོལ་', '🔍 ค้นหา'], '📥 Export CSV': ['📥 CSV ཕྱིར་གཏང་', '📥 ส่งออก CSV'],
+        'User': ['ལག་ལེན་པ་', 'ผู้ใช้'], 'Role': ['འགན་ཁུར་', 'บทบาท'], 'Contact': ['འབྲེལ་བ་', 'ติดต่อ'],
+        'Last sign-in': ['', 'เข้าสู่ระบบล่าสุด'], 'Time (BTT)': ['དུས་ཚོད་ (BTT)', 'เวลา (BTT)'], 'Action': ['ལཱ་', 'การกระทำ'],
+        'Charger': ['གློག་བླུགས་འཕྲུལ་ཆས་', 'ตู้ชาร์จ'], 'Details': ['རྒྱས་བཤད་', 'รายละเอียด'], 'Permission': ['ཆོག་ཐམ་', 'สิทธิ์'],
+        'Administrator': ['བདག་སྐྱོང་པ་', 'ผู้ดูแลระบบ'], 'Operator': ['བཀོལ་སྤྱོད་པ་', 'ผู้ปฏิบัติการ'],
+        'Technician': ['བཟོ་རིག་པ་', 'ช่างเทคนิค'], 'Viewer': ['བལྟ་མི་', 'ผู้ดูอย่างเดียว'],
+        'View dashboards': ['', 'ดูแดชบอร์ด'], 'Charger commands': ['', 'สั่งงานตู้ชาร์จ'], 'Charger configuration': ['', 'ตั้งค่าตู้ชาร์จ'],
+        'See payments': ['', 'ดูการชำระเงิน'], 'Manage payments': ['', 'จัดการการชำระเงิน'], 'See customers': ['', 'ดูข้อมูลลูกค้า'],
+        'Manage customers': ['', 'จัดการลูกค้า'], 'Handle alerts': ['', 'จัดการการแจ้งเตือน'], 'Maintenance tickets': ['', 'ใบงานซ่อมบำรุง'],
+        'Administration': ['', 'ดูแลระบบ'],
+        'Active': ['ལག་ལེན་འཐབ་དོ་', 'ใช้งาน'], 'Disabled': ['ལག་ལེན་བཀག་ཡོད་', 'ปิดใช้งาน'], 'Locked': ['ཟྭ་རྒྱབ་ཡོད་', 'ถูกล็อก'],
+        'online now': ['', 'ออนไลน์อยู่'], 'Built-in': ['', 'ในตัว'], 'Built-in administrator': ['', 'ผู้ดูแลระบบในตัว'],
+        'set with CSMS_USER / CSMS_PASS': ['', 'ตั้งค่าด้วย CSMS_USER / CSMS_PASS'], 'never': ['', 'ยังไม่เคย'],
+        '✏️ Edit': ['✏️ ཞུན་དག་', '✏️ แก้ไข'], '🔓 Unlock': ['', '🔓 ปลดล็อก'], '🚪 Sign out': ['', '🚪 ออกจากระบบ'], '🗑️ Delete': ['🗑️ བཏོན་གཏང་', '🗑️ ลบ'],
+        'Cancel': ['ཆ་མེད་', 'ยกเลิก'], 'Close': ['ཁ་བསྡམ་', 'ปิด'], 'Generate': ['', 'สุ่มรหัส'], 'Show': ['སྟོན་', 'แสดง'],
+        'Username': ['ལག་ལེན་པའི་མིང་', 'ชื่อผู้ใช้'], 'Display name': ['', 'ชื่อที่แสดง'], 'Email': ['གློག་འཕྲིན་', 'อีเมล'],
+        'Phone': ['ཁ་པར་', 'โทรศัพท์'], 'Telegram chat ID': ['', 'Telegram chat ID'], 'New password': ['གསང་ཚིག་གསརཔ་', 'รหัสผ่านใหม่'],
+        'Password': ['གསང་ཚིག་', 'รหัสผ่าน'], 'Leave blank to keep the current password': ['', 'เว้นว่างไว้ถ้าไม่เปลี่ยนรหัสผ่าน'],
+        'Account disabled': ['', 'ปิดการใช้งานบัญชีนี้'], 'Add user': ['ལག་ལེན་པ་ཁ་སྐོང་', 'เพิ่มผู้ใช้'], 'Edit user {u}': ['', 'แก้ไขผู้ใช้ {u}'],
+        'Contact details are used for alert notifications and work orders.': ['', 'ข้อมูลติดต่อใช้สำหรับส่งการแจ้งเตือนและใบงานซ่อม'],
+        'User saved': ['', 'บันทึกผู้ใช้แล้ว'], 'Delete user {u}?': ['', 'ลบผู้ใช้ {u} ?'], 'User deleted': ['', 'ลบผู้ใช้แล้ว'],
+        'Roles saved': ['', 'บันทึกบทบาทแล้ว'], 'Restore the default permissions of every role?': ['', 'คืนค่าสิทธิ์เริ่มต้นของทุกบทบาท?'],
+        'Not allowed for your role ({role})': ['ཁྱོད་ཀྱི་འགན་ཁུར་ ({role}) ལུ་ཆོག་ཐམ་མེད་', 'บทบาทของคุณ ({role}) ไม่มีสิทธิ์ทำรายการนี้'],
+        'Signed in as {u}': ['', 'เข้าสู่ระบบในชื่อ {u}'], '🔑 Change password': ['🔑 གསང་ཚིག་སོར་', '🔑 เปลี่ยนรหัสผ่าน'],
+        'Current password': ['', 'รหัสผ่านปัจจุบัน'], 'Repeat new password': ['', 'ยืนยันรหัสผ่านใหม่'],
+        'At least 8 characters. Your other sessions are signed out.': ['', 'อย่างน้อย 8 ตัวอักษร เซสชันอื่นของคุณจะถูกออกจากระบบ'],
+        'The new passwords do not match': ['', 'รหัสผ่านใหม่ไม่ตรงกัน'], 'Password changed': ['', 'เปลี่ยนรหัสผ่านแล้ว'],
+        'Sign out all sessions of {u}?': ['', 'ออกจากระบบทุกเซสชันของ {u} ?'], '{n} session(s) ended': ['', 'ปิดแล้ว {n} เซสชัน'],
+        'This username already exists': ['', 'ชื่อผู้ใช้นี้มีอยู่แล้ว'], 'Username: 3-32 characters, a-z 0-9 . _ -': ['', 'ชื่อผู้ใช้: 3-32 ตัวอักษร a-z 0-9 . _ -'],
+        'Set a password for the new user': ['', 'กรุณาตั้งรหัสผ่านให้ผู้ใช้ใหม่'],
+        'The password needs at least 8 characters and must differ from the username': ['', 'รหัสผ่านต้องยาวอย่างน้อย 8 ตัวอักษรและต้องไม่เหมือนชื่อผู้ใช้'],
+        'Keep at least one active administrator': ['', 'ต้องมีผู้ดูแลระบบที่ใช้งานได้อย่างน้อย 1 คน'],
+        'You cannot disable yourself or change your own role': ['', 'ไม่สามารถปิดใช้งานหรือเปลี่ยนบทบาทของตัวเองได้'],
+        'You cannot delete yourself': ['', 'ไม่สามารถลบบัญชีของตัวเองได้'], 'The current password is not correct': ['', 'รหัสผ่านปัจจุบันไม่ถูกต้อง'],
+        'The built-in administrator password is set with CSMS_PASS': ['', 'รหัสผ่านผู้ดูแลระบบในตัวตั้งค่าที่ CSMS_PASS'],
+        'The built-in administrator is set with CSMS_USER / CSMS_PASS': ['', 'ผู้ดูแลระบบในตัวตั้งค่าที่ CSMS_USER / CSMS_PASS'],
+        'No such user': ['', 'ไม่พบผู้ใช้นี้'], 'No entries': ['', 'ไม่มีรายการ'], 'Showing {n} of {t} entries': ['', 'แสดง {n} จาก {t} รายการ'],
+        'Command': ['བཀའ་རྒྱ་', 'คำสั่ง'], 'denied': ['', 'ถูกปฏิเสธ'], 'not signed in': ['', 'ยังไม่เข้าสู่ระบบ'], 'locked': ['', 'ถูกล็อก'],
+        'blocked': ['', 'ถูกบล็อก'], 'error': ['', 'ผิดพลาด'], 'needs {p}': ['', 'ต้องมีสิทธิ์: {p}'],
+        '🔑 Signed in': ['', '🔑 เข้าสู่ระบบ'], '🚪 Signed out': ['', '🚪 ออกจากระบบ'], '⛔ Sign-in failed': ['', '⛔ เข้าสู่ระบบไม่สำเร็จ'],
+        '🔒 Sign-in blocked': ['', '🔒 ถูกบล็อกการเข้าสู่ระบบ'], '🔒 Account locked': ['', '🔒 บัญชีถูกล็อก'],
+        'RFID card added': ['', 'เพิ่มบัตร RFID'], 'RFID card removed': ['', 'ลบบัตร RFID'], 'RFID cards imported': ['', 'นำเข้าบัตร RFID'],
+        'Charger registration changed': ['', 'เปลี่ยนสถานะการลงทะเบียนตู้'], 'Charger registration deleted': ['', 'ลบการลงทะเบียนตู้'],
+        'Charger disconnected': ['', 'ตัดการเชื่อมต่อตู้'], 'Default config restored': ['', 'คืนค่า config เริ่มต้น'],
+        'Configuration sent': ['', 'ส่ง configuration'], 'Message log cleared': ['', 'ล้าง message log'],
+        'Payment settings changed': ['', 'เปลี่ยนการตั้งค่าการชำระเงิน'], 'Payment session action': ['', 'จัดการรายการชำระเงิน'],
+        'Manual payment': ['', 'บันทึกการชำระเงินเอง'], 'Customer account action': ['', 'จัดการบัญชีลูกค้า'],
+        'App settings changed': ['', 'เปลี่ยนการตั้งค่าแอป'], 'Station info changed': ['', 'แก้ไขข้อมูลสถานี'],
+        'Push message sent': ['', 'ส่งข้อความ push'], 'Database settings changed': ['', 'เปลี่ยนการตั้งค่าฐานข้อมูล'],
+        'Database exported': ['', 'ส่งออกฐานข้อมูล'], 'Database flushed': ['', 'บันทึกคิวฐานข้อมูล'], 'Database connection tested': ['', 'ทดสอบการเชื่อมต่อฐานข้อมูล'],
+        'User saved': ['', 'บันทึกผู้ใช้แล้ว'], 'User unlocked': ['', 'ปลดล็อกผู้ใช้'], 'User signed out': ['', 'สั่งออกจากระบบ'],
+        'Role permissions changed': ['', 'เปลี่ยนสิทธิ์ของบทบาท'], 'Switched to OCPP 2.0.1': ['', 'สลับเป็น OCPP 2.0.1']
+    });
+
+    function boot() { OPS.loadMe(); }
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot); else boot();
+})();
+''')
+
+
+# ---- [OPS] v1.2 status history, network health (NOC), OCPP error-code dictionary   (inserted by ops/patch_health.py)
+OPS_FEATURES.append('health')
+OPS_STATUS = OpsEventLog('status', 'ops_status', keep_days=45)
+OPS_CP: Dict[str, dict] = {}            # charger -> live facts (online, last message, connectors, reboots ...)
+OPS_TX: Dict[str, dict] = {}            # 'cp|txn' -> live session facts (last meter values, energy flow)
+OPS_ISSUES: Dict[str, dict] = {}        # issue id -> open issue
+OPS_TICK = max(0.5, float(os.environ.get('OPS_TICK') or 30))
+OPS_STARTED = ops_now()
+OPS_UP_STATES = {'Available', 'Preparing', 'Charging', 'SuspendedEV', 'SuspendedEVSE', 'Finishing', 'Reserved'}
+OPS_EXCLUSIONS: list = []               # fn(cp, connector, t0, t1) -> [(a, b, why)] planned downtime (maintenance module)
+OPS_HEALTH_DEFAULTS = {
+    'offline_after_min': 10, 'heartbeat_factor': 3, 'heartbeat_min_s': 300, 'meter_gap_min': 5,
+    'stuck_no_meter_min': 15, 'stuck_no_energy_min': 30, 'stuck_max_hours': 12, 'stuck_open_after_stop_min': 10,
+    'stuck_offline_min': 30, 'unavailable_after_min': 60, 'boot_loop_per_hour': 3, 'flapping_per_hour': 5,
+    'unavailable_counts_as_down': True, 'restart_grace_s': 120, 'ignore': [],
+}
+OPS_SEV_ORDER = {'critical': 0, 'major': 1, 'minor': 2, 'info': 3}
+for _p in ('/api/ops/errorcodes', '/api/ops/health/config'):
+    ops_perm_rule('POST', _p, 'config')
+
+# OCPP 1.6 ChargePointErrorCode (section 7.6) - meaning, usual causes, first action for the technician
+OPS_OCPP_ERRORS = {
+    'ConnectorLockFailure': ('major', 'Connector lock failure', 'The plug could not be locked or unlocked.',
+                             'Check the plug is fully inserted; inspect the lock actuator; try Unlock, then a soft reset.'),
+    'EVCommunicationError': ('minor', 'EV communication error', 'The charger lost the control-pilot / PLC link with the vehicle.',
+                             'Re-plug and retry; try another vehicle; inspect the cable, plug pins and the PLC modem.'),
+    'GroundFailure': ('critical', 'Ground fault', 'The ground-fault / residual-current protection tripped.',
+                      'Take the connector out of service; an electrician checks insulation, moisture and the cable.'),
+    'HighTemperature': ('major', 'High temperature', 'The temperature inside the charger is too high.',
+                        'Check fans, air filters and ventilation; clean the filters; look for an overloaded power module.'),
+    'InternalError': ('major', 'Internal error', 'An internal hardware or software component failed.',
+                      'Read the vendor error code; hard reset; check the firmware; contact the manufacturer if it repeats.'),
+    'LocalListConflict': ('minor', 'Local list conflict', 'The authorization list on the charger conflicts with the CSMS.',
+                          'Send the local list again or clear the authorization cache.'),
+    'NoError': ('info', 'No error', 'No error to report.', '-'),
+    'OtherError': ('minor', 'Other error', 'Another error - details are in the vendor error code.',
+                   'Look up the vendor error code; follow the manufacturer manual.'),
+    'OverCurrentFailure': ('critical', 'Over-current', 'The over-current protection tripped.',
+                           'Inspect breaker, contactor and cable for a short circuit before resetting the protection.'),
+    'OverVoltage': ('major', 'Over-voltage', 'The supply voltage rose above the acceptable level.',
+                    'Measure the supply voltage on every phase; inform BPC distribution / the substation.'),
+    'PowerMeterFailure': ('major', 'Power meter failure', 'The energy meter cannot be read - billing is affected.',
+                          'Check the meter supply and its communication cable (RS-485 / Modbus).'),
+    'PowerSwitchFailure': ('critical', 'Power switch failure', 'The contactor / relay cannot be controlled.',
+                           'Take the connector out of service; inspect the contactor and its control relay.'),
+    'ReaderFailure': ('minor', 'RFID reader failure', 'The RFID reader does not work (QR / app start still works).',
+                      'Check the reader cable and module; replace the reader.'),
+    'ResetFailure': ('major', 'Reset failure', 'The charger could not perform a reset.', 'Power-cycle the charger on site.'),
+    'UnderVoltage': ('major', 'Under-voltage', 'The supply voltage dropped below the acceptable level.',
+                     'Measure the voltage on every phase; look for a lost phase or a loose connection; inform distribution.'),
+    'WeakSignal': ('minor', 'Weak signal', 'The mobile / wireless link reports a weak signal.',
+                   'Check the antenna and SIM / modem; consider an external antenna or a wired link.'),
+}
+
+
+def ops_health_cfg() -> dict:
+    return ops_cfg('health', OPS_HEALTH_DEFAULTS)
+
+
+def _ops_cp(cp_id: str) -> dict:
+    s = OPS_CP.get(cp_id)
+    if s is None:
+        s = OPS_CP[cp_id] = {'online': False, 'since': OPS_STARTED, 'seen': 0, 'hb': 0, 'hb_interval': 0,
+                             'boots': [], 'disc': [], 'conn': {}}
+    return s
+
+
+def ops_known_chargers() -> List[str]:
+    ignore = {str(x).strip() for x in (ops_health_cfg().get('ignore') or []) if str(x).strip()}
+    ids = set(OPS_CP) | set(app_state.cp_data) | set(app_state.charge_points)
+    ids |= {k for k, v in app_state.cp_registrations.items() if v != 'Rejected'}
+    return sorted(i for i in ids if i and i not in ignore and app_state.cp_registrations.get(i) != 'Rejected')
+
+
+def ops_cp_name(cp_id: str) -> str:
+    try:
+        return str((station_info.data.get(cp_id) or {}).get('name') or '')
+    except Exception:
+        return ''
+
+
+# ---- live state from the OCPP handlers ------------------------------------------------------------------------------
+@ops_on('connect')
+def _ops_h_connect(cp_id='', remote='', **kw):
+    s, now = _ops_cp(cp_id), ops_now()
+    if not s['online']:
+        OPS_STATUS.add({'cp': cp_id, 'k': 'online', 'ip': str(remote or '')[:60]})
+    s.update(online=True, since=now, seen=now)
+
+
+@ops_on('disconnect')
+def _ops_h_disconnect(cp_id='', **kw):
+    s, now = _ops_cp(cp_id), ops_now()
+    if s['online']:
+        OPS_STATUS.add({'cp': cp_id, 'k': 'offline'})
+    s.update(online=False, since=now)
+    s['disc'].append(now)
+
+
+@ops_on('message')
+def _ops_h_message(cp_id='', **kw):
+    _ops_cp(cp_id)['seen'] = ops_now()
+
+
+@ops_on('heartbeat')
+def _ops_h_heartbeat(cp_id='', **kw):
+    s = _ops_cp(cp_id)
+    s['hb'] = s['seen'] = ops_now()
+
+
+@ops_on('boot')
+def _ops_h_boot(cp_id='', vendor='', model='', serial='', firmware='', interval=0, registration='', **kw):
+    s = _ops_cp(cp_id)
+    s.update(vendor=vendor or '', model=model or '', serial=serial or '', fw=firmware or '', reg=registration or '')
+    try:
+        s['hb_interval'] = int(interval or 0)
+    except (TypeError, ValueError):
+        s['hb_interval'] = 0
+    s['boots'].append(ops_now())
+    OPS_STATUS.add({'cp': cp_id, 'k': 'boot', 'fw': str(firmware or '')[:40], 'model': str(model or '')[:40], 'vendor': str(vendor or '')[:40]})
+
+
+@ops_on('status')
+def _ops_h_status(cp_id='', connector=0, status='', error_code='', vendor_error='', info='', **kw):
+    s, now = _ops_cp(cp_id), ops_now()
+    try:
+        cid = int(connector)
+    except (TypeError, ValueError):
+        cid = 0
+    c = s['conn'].setdefault(cid, {})
+    err = error_code or 'NoError'
+    if c.get('status') == status and c.get('err') == err and c.get('verr', '') == (vendor_error or ''):
+        return                                              # the same notification again: nothing new
+    ev = {'cp': cp_id, 'k': 'conn', 'c': cid, 's': status, 'p': c.get('status') or '', 'e': err}
+    if vendor_error:
+        ev['ve'] = str(vendor_error)[:50]
+    if info:
+        ev['i'] = str(info)[:60]
+    OPS_STATUS.add(ev)
+    if c.get('status') != status:
+        c['since'] = now
+    c.update(status=status, err=err, verr=str(vendor_error or ''), info=str(info or ''))
+
+
+@ops_on('tx_start')
+def _ops_h_tx_start(cp_id='', connector=0, txn_id=None, id_tag='', meter_start=0, **kw):
+    now = ops_now()
+    for k in [k for k, t in OPS_TX.items() if t['cp'] == cp_id and t['c'] == connector]:
+        OPS_TX.pop(k, None)                                 # the CSMS also drops a stale session on this connector
+    try:
+        ms = float(meter_start or 0)
+    except (TypeError, ValueError):
+        ms = 0.0
+    OPS_TX[f'{cp_id}|{txn_id}'] = {'cp': cp_id, 'c': connector, 'tx': txn_id, 'tag': str(id_tag or ''), 'start': now,
+                                   'ms': ms, 'mv': now, 'e': ms, 'e_t': now, 'p': 0.0, 'maxp': 0.0, 'gaps': 0, 'gap_s': 0.0}
+
+
+@ops_on('meter')
+def _ops_h_meter(cp_id='', connector=0, txn_id=None, energy_wh=None, power_w=None, **kw):
+    if txn_id is None:
+        return
+    key, now = f'{cp_id}|{txn_id}', ops_now()
+    t = OPS_TX.get(key)
+    if t is None:                                           # a session that began before this CSMS run / reconnect
+        e0 = float(energy_wh) if energy_wh is not None else 0.0
+        t = OPS_TX[key] = {'cp': cp_id, 'c': connector, 'tx': txn_id, 'tag': '', 'start': now, 'resumed': True,
+                           'ms': e0, 'mv': now, 'e': e0, 'e_t': now, 'p': 0.0, 'maxp': 0.0, 'gaps': 0, 'gap_s': 0.0}
+    gap = now - t['mv']
+    if gap > ops_health_cfg()['meter_gap_min'] * 60:
+        t['gaps'] += 1
+        t['gap_s'] += gap
+        OPS_STATUS.add({'cp': cp_id, 'k': 'gap', 'c': t['c'], 'tx': txn_id, 'from': round(t['mv'], 1), 'dur': round(gap)})
+    t['mv'] = now
+    if energy_wh is not None:
+        e = float(energy_wh)
+        if e < t['e'] - 1:
+            OPS_STATUS.add({'cp': cp_id, 'k': 'meter_back', 'c': t['c'], 'tx': txn_id, 'from_wh': t['e'], 'to_wh': e})
+        if e > t['e'] + 0.5:
+            t['e_t'] = now
+        t['e'] = e
+    if power_w is not None:
+        t['p'] = float(power_w)
+        t['maxp'] = max(t['maxp'], t['p'])
+
+
+@ops_on('tx_stop')
+def _ops_h_tx_stop(cp_id='', txn_id=None, **kw):
+    OPS_TX.pop(f'{cp_id}|{txn_id}', None)
+
+
+# ---- start-up: CSMS availability + last known state from the history ------------------------------------------------
+def _ops_health_startup():
+    alive = (ops_settings.data.get('_alive') or {}).get('t') or 0
+    last_ev = OPS_STATUS.recent[-1]['t'] if OPS_STATUS.recent else 0
+    last = max(float(alive or 0), float(last_ev or 0))
+    for ev in OPS_STATUS.recent:                            # seed the board with what we knew before the restart
+        cp = ev.get('cp')
+        if not cp:
+            continue
+        s = _ops_cp(cp)
+        k = ev.get('k')
+        if k == 'offline':
+            s['since'] = ev['t']
+        elif k == 'online':
+            s['since'] = OPS_STARTED
+        elif k == 'conn':
+            c = s['conn'].setdefault(int(ev.get('c') or 0), {})
+            if c.get('status') != ev.get('s'):
+                c['since'] = ev['t']
+            c.update(status=ev.get('s'), err=ev.get('e') or 'NoError', verr=ev.get('ve') or '', info=ev.get('i') or '')
+        elif k == 'boot':
+            s.update(vendor=ev.get('vendor', ''), model=ev.get('model', ''), fw=ev.get('fw', ''))
+    if last:
+        OPS_STATUS.add({'k': 'csms', 's': 'down', 't': round(last, 3)})
+    OPS_STATUS.add({'k': 'csms', 's': 'up', 't': round(OPS_STARTED, 3)})
+
+
+OPS_STARTUP.append(_ops_health_startup)
+
+
+# ---- issue detection ------------------------------------------------------------------------------------------------
+def ops_dur_text(sec) -> str:
+    sec = max(0, int(sec or 0))
+    if sec < 60:
+        return f'{sec} s'
+    m, h, d = sec // 60, sec // 3600, sec // 86400
+    if d:
+        return f'{d} d {h % 24} h'
+    if h:
+        return f'{h} h {m % 60} min'
+    return f'{m} min'
+
+
+def ops_issue_text(iss: dict, now: float = None) -> str:
+    """English one-liner of an issue (notifications, CSV); the console translates the same template."""
+    v = dict(iss.get('vars') or {})
+    v['d'] = ops_dur_text((now or ops_now()) - (iss.get('since') or ops_now()))
+    s = iss.get('msg') or iss.get('kind', '')
+    for k, val in v.items():
+        s = s.replace('{' + k + '}', str(val))
+    return s
+
+
+def ops_error_info(code: str, vendor_code: str = '', vendor: str = '') -> dict:
+    sev, title, cause, action = OPS_OCPP_ERRORS.get(code or 'NoError', ('minor', code or '', '', ''))
+    out = {'code': code, 'sev': sev, 'title': title, 'cause': cause, 'action': action}
+    if vendor_code:
+        vd = (ops_settings.data.get('error_codes') or {}).get('vendor') or {}
+        hit = vd.get(f'{(vendor or "").lower()}|{vendor_code}') or vd.get(f'|{vendor_code}')
+        if hit:
+            out.update(vendor_code=vendor_code, vendor_title=hit.get('title', ''), vendor_action=hit.get('action', ''))
+            if hit.get('sev') in OPS_SEV_ORDER:
+                out['sev'] = hit['sev']
+        else:
+            out['vendor_code'] = vendor_code
+    return out
+
+
+def ops_health_eval() -> Dict[str, dict]:
+    now, cfg = ops_now(), ops_health_cfg()
+    found: Dict[str, dict] = {}
+
+    def add(kind, cp, conn, sev, since, msg, **vars_):
+        iid = f'{kind}:{cp}:{conn}'
+        found[iid] = {'id': iid, 'kind': kind, 'cp': cp, 'conn': conn, 'sev': sev, 'since': since, 'msg': msg, 'vars': vars_}
+
+    for cp_id in ops_known_chargers():
+        s = _ops_cp(cp_id)
+        data = app_state.cp_data.get(cp_id)
+        online = bool(s['online'] and data is not None and getattr(data, 'connected', True))
+        s['boots'] = [t for t in s['boots'] if t > now - 86400]
+        s['disc'] = [t for t in s['disc'] if t > now - 86400]
+        if not online:
+            if now - s['since'] >= cfg['offline_after_min'] * 60:
+                add('offline', cp_id, 0, 'major', s['since'], 'Offline for {d}')
+        else:
+            limit = max(cfg['heartbeat_factor'] * (s.get('hb_interval') or 60), cfg['heartbeat_min_s'])
+            if s['seen'] and now - s['seen'] > limit:
+                add('heartbeat_missing', cp_id, 0, 'major', s['seen'], 'No message for {d} (heartbeat every {i} s)',
+                    i=s.get('hb_interval') or 0)
+            for cid, c in sorted(s['conn'].items()):
+                st, err = c.get('status'), c.get('err') or 'NoError'
+                if st == 'Faulted':
+                    info = ops_error_info(err, c.get('verr'), s.get('vendor'))
+                    add('faulted', cp_id, cid, info['sev'] if info['sev'] != 'info' else 'major', c.get('since') or now,
+                        'Faulted: {code}', code=err, ve=c.get('verr') or '', title=info.get('title', ''))
+                elif err != 'NoError':
+                    add('error_code', cp_id, cid, 'minor', c.get('since') or now, '{code} while {status}', code=err,
+                        status=st or '', ve=c.get('verr') or '')
+                if st == 'Unavailable' and now - (c.get('since') or now) >= cfg['unavailable_after_min'] * 60:
+                    add('unavailable', cp_id, cid, 'minor', c.get('since') or now, 'Unavailable for {d}')
+            if data is not None and getattr(data, 'registration_status', 'Accepted') not in ('Accepted', '', None):
+                add('not_accepted', cp_id, 0, 'info', s['since'], 'Registration {r}', r=data.registration_status)
+        if len([t for t in s['boots'] if t > now - 3600]) > cfg['boot_loop_per_hour']:
+            add('boot_loop', cp_id, 0, 'major', min(t for t in s['boots'] if t > now - 3600), '{n} reboots in the last hour',
+                n=len([t for t in s['boots'] if t > now - 3600]))
+        if len([t for t in s['disc'] if t > now - 3600]) > cfg['flapping_per_hour']:
+            add('flapping', cp_id, 0, 'minor', min(t for t in s['disc'] if t > now - 3600), '{n} disconnections in the last hour',
+                n=len([t for t in s['disc'] if t > now - 3600]))
+
+    for key, t in list(OPS_TX.items()):
+        cp_id, cid, s = t['cp'], t['c'], _ops_cp(t['cp'])
+        data = app_state.cp_data.get(cp_id)
+        online = bool(s['online'] and data is not None)
+        if online and data is not None and t['tx'] not in (data.transactions or {}) and now - t['start'] > 120:
+            OPS_TX.pop(key, None)                          # the CSMS no longer tracks it (replaced / stopped)
+            continue
+        cst = (s['conn'].get(cid) or {})
+        if not online:
+            if now - s['since'] >= cfg['stuck_offline_min'] * 60:
+                add('stuck_session', cp_id, cid, 'major', s['since'], 'Session {tx} open while the charger is offline', tx=t['tx'])
+            continue
+        if now - t['mv'] >= cfg['meter_gap_min'] * 60:
+            add('meter_gap', cp_id, cid, 'minor', t['mv'], 'No meter values for {d} (session {tx})', tx=t['tx'])
+        if now - t['mv'] >= cfg['stuck_no_meter_min'] * 60:
+            add('stuck_session', cp_id, cid, 'major', t['mv'], 'No meter values for {d} (session {tx})', tx=t['tx'])
+        elif cst.get('status') == 'Charging' and now - t['e_t'] >= cfg['stuck_no_energy_min'] * 60:
+            add('stuck_session', cp_id, cid, 'major', t['e_t'], 'No energy for {d} while Charging (session {tx})', tx=t['tx'])
+        elif cst.get('status') in ('Available', 'Faulted', 'Unavailable') and now - (cst.get('since') or now) >= cfg['stuck_open_after_stop_min'] * 60:
+            add('stuck_session', cp_id, cid, 'major', cst.get('since') or now, 'Connector {status} but session {tx} is still open',
+                tx=t['tx'], status=cst.get('status'))
+        elif now - t['start'] >= cfg['stuck_max_hours'] * 3600:
+            add('stuck_session', cp_id, cid, 'minor', t['start'], 'Session {tx} running for {d}', tx=t['tx'])
+
+    for _prov in OPS_ISSUE_PROVIDERS:   # [OPS] v1.6+ extra issue kinds (charger password refused ...)
+        try:
+            _prov(add, now)
+        except Exception as e:
+            logger.error(f"ops: issue provider {getattr(_prov, '__name__', '?')} failed: {e}")
+    for iid, iss in found.items():
+        old = OPS_ISSUES.get(iid)
+        if old:
+            iss['opened'] = old['opened']
+            if iss['kind'] == 'heartbeat_missing':
+                iss['since'] = min(iss['since'], old['since'])
+        else:
+            iss['opened'] = now
+            OPS_STATUS.add({'cp': iss['cp'], 'k': 'issue', 'c': iss['conn'], 'id': iss['kind'], 'on': 1, 'sev': iss['sev'],
+                            'msg': ops_issue_text(iss, now)})
+            ops_emit('issue_open', issue=iss)
+    for iid in [i for i in OPS_ISSUES if i not in found]:
+        old = OPS_ISSUES.pop(iid)
+        OPS_STATUS.add({'cp': old['cp'], 'k': 'issue', 'c': old['conn'], 'id': old['kind'], 'on': 0, 'sev': old['sev'],
+                        'dur': round(now - old['opened'])})
+        ops_emit('issue_close', issue=old)
+    OPS_ISSUES.update(found)
+    ops_emit('issues', issues=OPS_ISSUES, now=now)
+    return OPS_ISSUES
+
+
+async def ops_health_loop():
+    last_alive = 0.0
+    await asyncio.sleep(min(5.0, OPS_TICK))
+    while True:
+        try:
+            ops_health_eval()
+        except Exception as e:
+            logger.error(f"ops: health check failed: {e}")
+        now = ops_now()
+        if now - last_alive >= 60:
+            last_alive = now
+            ops_settings.data['_alive'] = {'t': round(now, 1)}
+            ops_settings.save()
+        await asyncio.sleep(OPS_TICK)
+
+
+OPS_TASKS.append(ops_health_loop)
+
+
+# ---- timelines & availability (shared with the KPI reports) ---------------------------------------------------------
+def ops_status_events(t0: float, t1: float) -> List[dict]:
+    return OPS_STATUS.query(t0, t1)
+
+
+def ops_events_by_cp(events: List[dict]) -> Dict[str, List[dict]]:
+    """Split events per charger; CSMS up/down events go into every list ('' holds only those)."""
+    out: Dict[str, List[dict]] = {'': []}
+    for e in events:
+        cp = e.get('cp')
+        if e.get('k') == 'csms':
+            for lst in out.values():
+                lst.append(e)
+        elif cp:
+            if cp not in out:
+                out[cp] = list(out[''])
+            out[cp].append(e)
+    return out
+
+
+def ops_timeline(cp_id: str, t0: float, t1: float, events: List[dict] = None) -> dict:
+    """State segments of every connector of one charger: {connector: [[start, end, state], ...]}.
+    States: OCPP connector statuses, plus Offline (charger not connected) and Unknown (no data / CSMS down)."""
+    cfg = ops_health_cfg()
+    now = ops_now()
+    t1 = min(t1, now)
+    if events is None:
+        events = ops_status_events_lb(t0, t1, cp=cp_id)   # [OPS] v1.10
+    evs = [e for e in events if e.get('cp') == cp_id or e.get('k') == 'csms']
+    conns = sorted({int(e.get('c') or 0) for e in evs if e.get('k') == 'conn'} | set((OPS_CP.get(cp_id) or {}).get('conn', {}).keys()))
+    real = [c for c in conns if c > 0] or [0]
+    grace = float(cfg.get('restart_grace_s') or 0)
+    st = {'csms': None, 'online': None, 'up_t': None, 'conn': {}}
+
+    def eff(c, t):
+        if st['csms'] is False:
+            return 'Unknown'
+        if st['online'] is None:
+            return 'Unknown'
+        if not st['online']:
+            if st['up_t'] is not None and t < st['up_t'] + grace:
+                return 'Unknown'
+            return 'Offline'
+        c0 = st['conn'].get(0)
+        if c0 in ('Faulted', 'Unavailable') and c != 0:
+            return c0
+        return st['conn'].get(c) or 'Unknown'
+
+    def apply(e):
+        k = e.get('k')
+        if k == 'csms':
+            if e.get('s') == 'up':
+                st.update(csms=True, online=False, up_t=e['t'])
+            else:
+                st['csms'] = False
+        elif k == 'online':
+            st['online'] = True
+            if st['csms'] is None:
+                st['csms'] = True
+        elif k == 'offline':
+            st['online'] = False
+            st['up_t'] = None
+        elif k == 'conn':
+            st['conn'][int(e.get('c') or 0)] = e.get('s')
+            if st['online'] is None:
+                st['online'] = True
+                if st['csms'] is None:
+                    st['csms'] = True
+
+    i = 0
+    while i < len(evs) and evs[i]['t'] < t0:
+        apply(evs[i])
+        i += 1
+    # change points inside the window: events + the end of a restart grace period
+    points = []
+    for e in evs[i:]:
+        if e['t'] >= t1:
+            break
+        points.append((e['t'], e))
+        if e.get('k') == 'csms' and e.get('s') == 'up' and grace:
+            points.append((e['t'] + grace, None))
+    if st['up_t'] is not None and t0 < st['up_t'] + grace:
+        points.append((st['up_t'] + grace, None))
+    points.sort(key=lambda p: p[0])
+    segs = {c: [] for c in real}
+    cur = {c: eff(c, t0) for c in real}
+    start = {c: t0 for c in real}
+    for t, e in points:
+        if t >= t1:
+            break
+        if e is not None:
+            apply(e)
+        for c in real:
+            ns = eff(c, t)
+            if ns != cur[c]:
+                if t > start[c]:
+                    segs[c].append([round(start[c], 1), round(t, 1), cur[c]])
+                cur[c], start[c] = ns, t
+    for c in real:
+        if t1 > start[c]:
+            segs[c].append([round(start[c], 1), round(t1, 1), cur[c]])
+    return {'cp': cp_id, 't0': t0, 't1': t1, 'conns': segs}
+
+
+def ops_uptime(segs: List[list], cp_id: str = '', connector: int = 0) -> dict:
+    """Availability of one connector from its segments: up / (up + down); Unknown is left out and reported as coverage."""
+    cfg = ops_health_cfg()
+    up = down = unknown = excl = 0.0
+    outages = 0
+    windows = []
+    if segs:
+        for fn in OPS_EXCLUSIONS:
+            try:
+                windows += [(a, b) for a, b, *_why in fn(cp_id, connector, segs[0][0], segs[-1][1])]
+            except Exception as e:
+                logger.error(f"ops: exclusion source failed: {e}")
+    prev_down = False
+    for a, b, state in segs:
+        d = b - a
+        if state in OPS_UP_STATES:
+            up += d
+            prev_down = False
+            continue
+        if state == 'Unknown':
+            unknown += d
+            continue
+        if state == 'Unavailable' and not cfg.get('unavailable_counts_as_down', True):
+            excl += d
+            continue
+        ov = sum(max(0.0, min(b, wb) - max(a, wa)) for wa, wb in windows)
+        ov = min(ov, d)
+        excl += ov
+        down += d - ov
+        if d - ov > 0 and not prev_down:
+            outages += 1
+        prev_down = True
+    total = up + down + unknown + excl
+    return {'up': round(up), 'down': round(down), 'unknown': round(unknown), 'excluded': round(excl), 'total': round(total),
+            'outages': outages,
+            'uptime': round(100.0 * up / (up + down), 3) if up + down > 0 else None,
+            'coverage': round(100.0 * (total - unknown) / total, 1) if total > 0 else None}
+
+
+def ops_charger_uptime(cp_id: str, t0: float, t1: float, events: List[dict] = None) -> dict:
+    tl = ops_timeline(cp_id, t0, t1, events)
+    per = {c: ops_uptime(s, cp_id, c) for c, s in tl['conns'].items()}
+    vals = [u['uptime'] for u in per.values() if u['uptime'] is not None]
+    return {'uptime': round(sum(vals) / len(vals), 3) if vals else None, 'connectors': per, 'timeline': tl}
+
+
+_OPS_AVAIL_CACHE = {'t': 0.0, 'data': {}}
+
+
+def ops_avail_24h() -> Dict[str, Optional[float]]:
+    now = ops_now()
+    if now - _OPS_AVAIL_CACHE['t'] < 60 and _OPS_AVAIL_CACHE['data']:
+        return _OPS_AVAIL_CACHE['data']
+    by_cp = ops_events_by_cp(ops_status_events_lb(now - 86400, now + 1))   # [OPS] v1.10
+    out = {cp: ops_charger_uptime(cp, now - 86400, now, by_cp.get(cp) or by_cp.get('')).get('uptime') for cp in ops_known_chargers()}
+    _OPS_AVAIL_CACHE.update(t=now, data=out)
+    return out
+
+
+def ops_health_score(online: bool, issues: List[dict]) -> int:
+    if not online:
+        return 0
+    pen = {'faulted': 40, 'heartbeat_missing': 50, 'stuck_session': 30, 'meter_gap': 15, 'boot_loop': 30, 'flapping': 20,
+           'unavailable': 20, 'error_code': 10, 'not_accepted': 10}
+    return max(0, 100 - sum(pen.get(i['kind'], 10) for i in issues))
+
+
+# ---- API ------------------------------------------------------------------------------------------------------------
+def ops_issue_public(iss: dict, now: float) -> dict:
+    d = dict(iss)
+    d['name'] = ops_cp_name(iss['cp'])
+    d['text'] = ops_issue_text(iss, now)
+    if iss['kind'] in ('faulted', 'error_code'):
+        d['info'] = ops_error_info(iss['vars'].get('code'), iss['vars'].get('ve'), (OPS_CP.get(iss['cp']) or {}).get('vendor'))
+    return d
+
+
+async def ops_api_health(request):
+    now = ops_now()
+    avail = await ops_avail_24h_async()   # [OPS] v1.10 one computation for simultaneous views
+    _ops_tx_by_cp: Dict[str, list] = {}   # [OPS] v1.10
+    for _t in list(OPS_TX.values()):
+        _ops_tx_by_cp.setdefault(_t['cp'], []).append(_t)
+    by_cp: Dict[str, list] = {}
+    for iss in OPS_ISSUES.values():
+        by_cp.setdefault(iss['cp'], []).append(iss)
+    chargers = []
+    for cp_id in ops_known_chargers():
+        s = OPS_CP.get(cp_id) or {}
+        data = app_state.cp_data.get(cp_id)
+        online = bool(s.get('online') and data is not None)
+        txs = _ops_tx_by_cp.get(cp_id, [])   # [OPS] v1.10
+        chargers.append({
+            'id': cp_id, 'name': ops_cp_name(cp_id), 'online': online, 'since': s.get('since'), 'seen': s.get('seen') or None,
+            'hb': s.get('hb') or None, 'hb_interval': s.get('hb_interval') or 0, 'vendor': s.get('vendor') or getattr(data, 'vendor', ''),
+            'model': s.get('model') or getattr(data, 'model', ''), 'fw': s.get('fw') or getattr(data, 'firmware_version', ''),
+            'registration': app_state.cp_registrations.get(cp_id, getattr(data, 'registration_status', '')),
+            'conns': [{'id': c, 'status': v.get('status'), 'since': v.get('since'), 'err': v.get('err'), 'verr': v.get('verr')}
+                      for c, v in sorted((s.get('conn') or {}).items())],
+            'boots24': len(s.get('boots') or []), 'disc24': len(s.get('disc') or []),
+            'sessions': [{'tx': t['tx'], 'c': t['c'], 'start': t['start'], 'mv': t['mv'], 'kwh': round((t['e'] - t['ms']) / 1000.0, 3),
+                          'p': t['p'], 'gaps': t['gaps']} for t in txs],
+            'issues': len(by_cp.get(cp_id, [])), 'score': ops_health_score(online, by_cp.get(cp_id, [])),
+            'avail24': avail.get(cp_id)})
+    issues = sorted((ops_issue_public(i, now) for i in OPS_ISSUES.values()),
+                    key=lambda i: (OPS_SEV_ORDER.get(i['sev'], 9), i['since']))
+    online_n = sum(1 for c in chargers if c['online'])
+    gaps24 = len(OPS_STATUS.query(now - 86400, now + 1, lambda e: e.get('k') == 'gap'))
+    vals = [c['avail24'] for c in chargers if c['avail24'] is not None]
+    kpis = {'chargers': len(chargers), 'online': online_n, 'issues': len(issues),
+            'critical': sum(1 for i in issues if i['sev'] == 'critical'), 'major': sum(1 for i in issues if i['sev'] == 'major'),
+            'stuck': sum(1 for i in issues if i['kind'] == 'stuck_session'),
+            'hb_missing': sum(1 for i in issues if i['kind'] == 'heartbeat_missing'),
+            'faulted': sum(1 for i in issues if i['kind'] == 'faulted'), 'gaps24': gaps24,
+            'sessions': len(OPS_TX), 'avail24': round(sum(vals) / len(vals), 2) if vals else None}
+    return ops_json({'now': now, 'kpis': kpis, 'issues': issues, 'chargers': chargers, 'tick': OPS_TICK})
+
+
+def _ops_hist_range(q):
+    now = ops_now()
+    hours = ops_int(q.get('hours'), 0, 0, 24 * 400)
+    if hours:
+        return now - hours * 3600, now
+    return ops_range_from_query(q, 1)
+
+
+async def ops_api_history(request):
+    q = request.query
+    cp_id = (q.get('cp') or '').strip()
+    t0, t1 = _ops_hist_range(q)
+
+    def work():
+        evs = ops_status_events_lb(t0, t1)   # [OPS] v1.10
+        out = {'t0': t0, 't1': min(t1, ops_now()), 'cp': cp_id}
+        if cp_id:
+            u = ops_charger_uptime(cp_id, t0, t1, evs)
+            out['timeline'] = u['timeline']['conns']
+            out['uptime'] = u['uptime']
+            out['per_connector'] = u['connectors']
+        sel = [e for e in evs if e['t'] >= t0 and (not cp_id or e.get('cp') == cp_id or e.get('k') == 'csms')]
+        kinds = [k for k in (q.get('kinds') or '').split(',') if k]
+        if kinds:
+            sel = [e for e in sel if e.get('k') in kinds]
+        sel.reverse()
+        out['total'] = len(sel)
+        out['events'] = sel[:ops_int(q.get('limit'), 1500, 1, 20000)]
+        return out
+    return ops_json(await asyncio.to_thread(work))
+
+
+async def ops_api_history_csv(request):
+    q = request.query
+    cp_id = (q.get('cp') or '').strip()
+    t0, t1 = _ops_hist_range(q)
+    evs = await asyncio.to_thread(ops_status_events, t0, t1)
+    buf = _ops_io.StringIO()
+    w = _ops_csv.writer(buf)
+    w.writerow(['time (BTT)', 'charger', 'event', 'connector', 'status', 'previous', 'error code', 'vendor code', 'info'])
+    for e in evs:
+        if cp_id and e.get('cp') != cp_id and e.get('k') != 'csms':
+            continue
+        k = e.get('k')
+        what = {'conn': 'status', 'online': 'connected', 'offline': 'disconnected', 'boot': 'boot', 'gap': 'meter gap',
+                'meter_back': 'meter went backwards', 'issue': 'issue ' + ('opened' if e.get('on') else 'closed'),
+                'csms': 'CSMS ' + str(e.get('s'))}.get(k, k)
+        info = e.get('i') or e.get('msg') or e.get('id') or (f"{e.get('dur')} s" if k == 'gap' else '') or e.get('fw') or ''
+        w.writerow([ops_csv_safe(x) for x in (ops_iso(e['t']), e.get('cp', ''), what, e.get('c', ''), e.get('s', '') if k == 'conn' else '',
+                    e.get('p', ''), e.get('e', ''), e.get('ve', ''), info)])
+    name = 'csms_status_history_%s%s.csv' % ((cp_id + '_') if cp_id else '', ops_dt().strftime('%Y%m%d_%H%M'))
+    return web.Response(body=('﻿' + buf.getvalue()).encode('utf-8'), content_type='text/csv',
+                        headers={'Content-Disposition': f'attachment; filename="{name}"'})
+
+
+async def ops_api_errorcodes(request):
+    doc = ops_cfg('error_codes', {'vendor': {}})
+    if request.method == 'POST':
+        d = await ops_body(request)
+        code = str(d.get('code') or '').strip()[:50]
+        vendor = str(d.get('vendor') or '').strip()[:40]
+        if not code:
+            return ops_err('Enter the vendor error code')
+        key = f'{vendor.lower()}|{code}'
+        if d.get('delete'):
+            doc['vendor'].pop(key, None)
+        else:
+            sev = d.get('sev') if d.get('sev') in OPS_SEV_ORDER else 'minor'
+            doc['vendor'][key] = {'vendor': vendor, 'code': code, 'title': str(d.get('title') or '')[:120],
+                                  'cause': str(d.get('cause') or '')[:300], 'action': str(d.get('action') or '')[:300], 'sev': sev}
+        ops_settings.save()
+    now = ops_now()
+
+    def freq():
+        counts: Dict[tuple, dict] = {}
+        for e in OPS_STATUS.query(now - 30 * 86400, now + 1, lambda e: e.get('k') == 'conn' and (e.get('s') == 'Faulted' or (e.get('e') or 'NoError') != 'NoError')):
+            key = (e.get('e') or 'NoError', e.get('ve') or '')
+            r = counts.setdefault(key, {'code': key[0], 've': key[1], 'n': 0, 'chargers': set(), 'last': 0})
+            r['n'] += 1
+            r['chargers'].add(e.get('cp'))
+            r['last'] = max(r['last'], e['t'])
+        out = sorted(counts.values(), key=lambda r: -r['n'])
+        for r in out:
+            r['chargers'] = sorted(c for c in r['chargers'] if c)
+        return out[:50]
+    return ops_json({'ocpp': [{'code': k, 'sev': v[0], 'title': v[1], 'cause': v[2], 'action': v[3]} for k, v in OPS_OCPP_ERRORS.items()],
+                     'vendor': sorted(doc['vendor'].values(), key=lambda r: (r['vendor'].lower(), r['code'])),
+                     'freq': await asyncio.to_thread(freq)})
+
+
+async def ops_api_health_config(request):
+    cfg = ops_health_cfg()
+    if request.method == 'POST':
+        d = await ops_body(request)
+        for k, v in OPS_HEALTH_DEFAULTS.items():
+            if k not in d:
+                continue
+            if isinstance(v, bool):
+                cfg[k] = bool(d[k])
+            elif k == 'ignore':
+                raw = d[k] if isinstance(d[k], list) else str(d[k] or '').split(',')
+                cfg[k] = [str(x).strip()[:60] for x in raw if str(x).strip()][:200]
+            else:
+                try:
+                    x = max(0.0, float(d[k]))
+                    cfg[k] = int(x) if x == int(x) else x
+                except (TypeError, ValueError):
+                    return ops_err(f'Not a number: {k}')
+        ops_settings.save()
+        _OPS_AVAIL_CACHE['t'] = 0
+    return ops_json({'config': cfg, 'defaults': OPS_HEALTH_DEFAULTS})
+
+
+OPS_ROUTES += [
+    ('GET', '/api/ops/health', ops_api_health), ('GET', '/api/ops/history', ops_api_history),
+    ('GET', '/api/ops/history.csv', ops_api_history_csv),
+    ('GET', '/api/ops/errorcodes', ops_api_errorcodes), ('POST', '/api/ops/errorcodes', ops_api_errorcodes),
+    ('GET', '/api/ops/health/config', ops_api_health_config), ('POST', '/api/ops/health/config', ops_api_health_config),
+]
+
+OPS_CSS_PARTS.append(r'''/* [OPS] v1.2 health board */
+.ops-sev { display: inline-block; padding: 0.12rem 0.5rem; border-radius: 50px; font-size: 0.68rem; font-weight: 700; white-space: nowrap; background: #e2e8f0; color: #334155; }
+.ops-sev-critical { background: #fee2e2; color: #b91c1c; }
+.ops-sev-major { background: #ffedd5; color: #c2410c; }
+.ops-sev-minor { background: #fef9c3; color: #a16207; }
+.ops-sev-info { background: #dbeafe; color: #1d4ed8; }
+.fleet-table tr.ops-sevrow-critical td:first-child { border-left: 4px solid #ef4444; }
+.fleet-table tr.ops-sevrow-major td:first-child { border-left: 4px solid #f97316; }
+.fleet-table tr.ops-sevrow-minor td:first-child { border-left: 4px solid #eab308; }
+.fleet-table tr.ops-sevrow-info td:first-child { border-left: 4px solid #3b82f6; }
+.ops-st { display: inline-flex; align-items: center; gap: 0.25rem; padding: 0.05rem 0.45rem; border-radius: 6px; font-size: 0.7rem; font-weight: 700;
+    color: #fff; background: var(--c, #94a3b8); white-space: nowrap; }
+.ops-table td.c, .ops-table th.c { text-align: center; }
+.ops-hint { margin-top: 0.25rem; font-size: 0.74rem; }
+.ops-score { width: 70px; height: 7px; border-radius: 4px; background: #e2e8f0; overflow: hidden; display: inline-block; vertical-align: middle; margin-right: 0.3rem; }
+.ops-score i { display: block; height: 100%; }
+.ops-seg { display: inline-flex; gap: 0.25rem; }
+.ops-grid2 { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr); gap: 1rem; }
+.ops-grid2 h4 { margin: 0.2rem 0 0.4rem; font-size: 0.85rem; }
+.ops-tl-wrap { margin: 0.4rem 0 0.8rem; }
+.ops-tl-head { font-size: 0.8rem; font-weight: 700; margin-bottom: 0.4rem; }
+.ops-tl { display: flex; flex-direction: column; gap: 4px; }
+.ops-tl-row { display: flex; align-items: center; gap: 0.5rem; }
+.ops-tl-lab { width: 110px; flex: 0 0 110px; font-size: 0.72rem; line-height: 1.15; }
+.ops-tl-bar { flex: 1 1 auto; height: 22px; width: 100%; border-radius: 4px; background: #f1f5f9; }
+.ops-tl-axis { position: relative; flex: 1 1 auto; height: 16px; font-size: 0.62rem; color: var(--text-dim); }
+.ops-tl-axis span { position: absolute; top: 0; transform: translateX(-50%); white-space: nowrap; }
+.ops-legend { display: flex; flex-wrap: wrap; gap: 0.6rem; margin-top: 0.5rem; font-size: 0.68rem; color: var(--text-dim); }
+.ops-lg { display: inline-flex; align-items: center; gap: 0.25rem; }
+.ops-lg i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+.ops-cfg { grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); margin-top: 0.6rem; }
+.ops-cfg input[type=number] { width: 90px; flex: 0 0 90px; }
+details > summary { cursor: pointer; }
+@media (max-width: 900px) { .ops-grid2 { grid-template-columns: 1fr; } .ops-tl-lab { width: 72px; flex-basis: 72px; } }
+''')
+OPS_JS_PARTS.append(r'''/* [OPS] 🩺 Health tab (v1.2): network health board, issues, status history timeline, fault-code dictionary */
+(function () {
+    'use strict';
+    const OPS = window.OPS;
+    if (!OPS) return;
+    const H = {data: null, cp: '', hours: 24, codes: null, cfg: null, defaults: null};
+    OPS.ST_COLORS = {Available: '#22c55e', Preparing: '#38bdf8', Charging: '#2563eb', SuspendedEV: '#8b5cf6',
+        SuspendedEVSE: '#a78bfa', Finishing: '#06b6d4', Reserved: '#14b8a6', Faulted: '#ef4444', Unavailable: '#f59e0b',
+        Offline: '#475569', Unknown: '#e2e8f0'};
+    OPS.SEV = {critical: ['🔴', 'Critical'], major: ['🟠', 'Major'], minor: ['🟡', 'Minor'], info: ['🔵', 'Info']};
+    OPS.ISSUE_KINDS = {offline: 'Charger offline', heartbeat_missing: 'Heartbeat missing', faulted: 'Connector faulted',
+        error_code: 'Error code reported', unavailable: 'Connector unavailable', stuck_session: 'Stuck session',
+        meter_gap: 'Meter values missing', boot_loop: 'Reboot loop', flapping: 'Connection flapping', not_accepted: 'Not accepted'};
+    OPS.sevPill = s => '<span class="ops-sev ops-sev-' + OPS.esc(s) + '">' + (OPS.SEV[s] || ['', s])[0] + ' ' + OPS.t((OPS.SEV[s] || ['', s])[1]) + '</span>';
+    OPS.issueMsg = function (i, now) {
+        const v = Object.assign({}, i.vars || {});
+        v.d = OPS.dur((now || Date.now() / 1000) - (i.since || 0));
+        return OPS.t(i.msg || i.kind, v);
+    };
+    OPS.cpLabel = (id, name) => '<b>' + OPS.esc(id) + '</b>' + (name ? '<br><span class="muted">' + OPS.esc(name) + '</span>' : '');
+    OPS.stChip = (st, extra) => '<span class="ops-st" style="--c:' + (OPS.ST_COLORS[st] || '#94a3b8') + '">' + OPS.t(st || 'Unknown') + (extra || '') + '</span>';
+
+    // ---- timeline: rows of coloured segments (one per connector)
+    OPS.timeline = function (segsByConn, t0, t1, labelFn) {
+        const span = Math.max(1, t1 - t0);
+        const rows = Object.keys(segsByConn).sort((a, b) => a - b).map(c => {
+            const bars = (segsByConn[c] || []).map(s => {
+                const x = ((s[0] - t0) / span) * 1000, w = Math.max(0.6, ((s[1] - s[0]) / span) * 1000);
+                return '<rect x="' + x.toFixed(2) + '" y="0" width="' + w.toFixed(2) + '" height="20" fill="' + (OPS.ST_COLORS[s[2]] || '#94a3b8') +
+                    '"><title>' + OPS.esc(OPS.tx(s[2])) + ' · ' + OPS.fmt(s[0]) + ' → ' + OPS.fmt(s[1]) + ' (' + OPS.dur(s[1] - s[0]) + ')</title></rect>';
+            }).join('');
+            return '<div class="ops-tl-row"><div class="ops-tl-lab">' + (labelFn ? labelFn(c) : OPS.esc(c)) + '</div>' +
+                '<svg class="ops-tl-bar" viewBox="0 0 1000 20" preserveAspectRatio="none">' + bars + '</svg></div>';
+        }).join('');
+        const ticks = [];
+        const step = span <= 2 * 86400 ? (span <= 6 * 3600 ? 3600 : 3 * 3600) : (span <= 14 * 86400 ? 86400 : 7 * 86400);
+        const first = Math.ceil((t0 + 6 * 3600) / step) * step - 6 * 3600;
+        for (let t = first; t < t1; t += step) {
+            const lab = step < 86400 ? OPS.fmt(t).slice(11) : OPS.fmt(t).slice(5, 10);
+            ticks.push('<span style="left:' + (((t - t0) / span) * 100).toFixed(2) + '%">' + lab + '</span>');
+        }
+        const legend = Object.keys(OPS.ST_COLORS).map(k => '<span class="ops-lg"><i style="background:' + OPS.ST_COLORS[k] + '"></i>' + OPS.t(k) + '</span>').join('');
+        return '<div class="ops-tl">' + rows + '<div class="ops-tl-row"><div class="ops-tl-lab"></div><div class="ops-tl-axis">' + ticks.join('') + '</div></div></div>' +
+            '<div class="ops-legend">' + legend + '</div>';
+    };
+
+    function build(v) {
+        v.dataset.built = '1';
+        v.innerHTML =
+            '<section class="kpis ops-kpis">' +
+            OPS.kpi('good', 'Online chargers', 'hKpiOnline', '') +
+            OPS.kpi('warn', 'Open issues', 'hKpiIssues', '') +
+            OPS.kpi('info', 'Availability (24 h)', 'hKpiAvail', 'average of all connectors') +
+            OPS.kpi('warn', 'Stuck sessions', 'hKpiStuck', '') +
+            OPS.kpi('warn', 'Heartbeat missing', 'hKpiHb', 'connected but silent') +
+            OPS.kpi('info', 'Meter gaps (24 h)', 'hKpiGaps', 'during sessions') +
+            '</section>' +
+            '<section class="pay-panel ops-panel"><div class="ops-head"><h3>' + OPS.t('🚨 Open issues') + '</h3><div class="ops-actions">' +
+            '<span class="muted" id="hUpdated"></span><button class="tb-btn" id="hReload">' + OPS.t('🔄 Refresh') + '</button></div></div>' +
+            '<div class="ops-table-wrap"><table class="fleet-table ops-table ops-cards" id="hIssues"></table></div></section>' +
+            '<section class="pay-panel ops-panel"><div class="ops-head"><h3>' + OPS.t('🔌 Chargers') + '</h3></div>' +
+            '<div class="ops-table-wrap"><table class="fleet-table ops-table ops-cards" id="hChargers"></table></div></section>' +
+            '<section class="pay-panel ops-panel" id="hHistBox"><div class="ops-head"><h3>' + OPS.t('🕒 Status history') + '</h3><div class="ops-actions ops-filters">' +
+            '<select class="tb-sel" id="hCp"></select>' +
+            '<span class="ops-seg" id="hRange">' + [[24, '24 h'], [168, '7 days'], [720, '30 days']].map(r =>
+                '<button class="chip" data-h="' + r[0] + '">' + OPS.t(r[1]) + '</button>').join('') + '</span>' +
+            '<button class="tb-btn" id="hCsv">' + OPS.t('📥 Export CSV') + '</button></div></div>' +
+            '<div id="hTimeline" class="ops-tl-wrap"></div>' +
+            '<div class="ops-table-wrap ops-tall"><table class="fleet-table ops-table" id="hEvents"></table></div></section>' +
+            '<section class="pay-panel ops-panel"><div class="ops-head"><h3>' + OPS.t('📖 Fault codes') + '</h3><div class="ops-actions">' +
+            '<input class="tb-inp" type="search" id="hCodeQ" autocomplete="off" data-i18n-placeholder="Search…" placeholder="' + OPS.esc(OPS.tx('Search…')) + '">' +
+            '<button class="tb-btn" id="hAddCode">' + OPS.t('➕ Vendor code') + '</button></div></div>' +
+            '<div class="ops-grid2"><div><h4>' + OPS.t('Most frequent faults (30 days)') + '</h4><div class="ops-table-wrap"><table class="fleet-table ops-table" id="hFreq"></table></div></div>' +
+            '<div><h4>' + OPS.t('Dictionary') + '</h4><div class="ops-table-wrap ops-tall"><table class="fleet-table ops-table" id="hDict"></table></div></div></div></section>' +
+            '<section class="pay-panel ops-panel"><details id="hCfgBox"><summary><b>' + OPS.t('⚙️ Detection settings') + '</b></summary><div id="hCfg"></div></details></section>';
+        OPS.$('hReload').onclick = load;
+        OPS.$('hCp').onchange = () => { H.cp = OPS.$('hCp').value; history(); };
+        OPS.$('hRange').onclick = e => { const b = e.target.closest('[data-h]'); if (b) { H.hours = +b.dataset.h; history(); } };
+        OPS.$('hCsv').onclick = () => { window.location.href = OPS.csvLink('/api/ops/history.csv', {cp: H.cp, hours: H.hours}); };
+        OPS.$('hCodeQ').addEventListener('input', renderCodes);
+        OPS.$('hAddCode').onclick = () => codeEdit(null);
+        OPS.$('hCfgBox').addEventListener('toggle', () => { if (OPS.$('hCfgBox').open) loadCfg(); });
+        v.addEventListener('click', e => {
+            const h = e.target.closest('[data-hist]');
+            if (h) { H.cp = h.dataset.hist; OPS.$('hCp').value = H.cp; history(); OPS.$('hHistBox').scrollIntoView({behavior: 'smooth'}); }
+            const ce = e.target.closest('[data-code]');
+            if (ce) codeEdit(ce.dataset.code);
+        });
+    }
+
+    async function load() {
+        try { H.data = await OPS.api('/api/ops/health'); } catch (e) { return OPS.fail(e); }
+        render();
+        if (!H.cp && H.data.chargers.length) { H.cp = H.data.chargers[0].id; history(); }
+    }
+
+    function render() {
+        const d = H.data, k = d.kpis, now = d.now;
+        OPS.$('hKpiOnline').textContent = k.online + ' / ' + k.chargers;
+        OPS.$('hKpiIssues').textContent = k.issues;
+        OPS.$('hKpiIssuesSub').innerHTML = OPS.t('{c} critical · {m} major', {c: k.critical, m: k.major});
+        OPS.$('hKpiAvail').textContent = k.avail24 == null ? '—' : OPS.num(k.avail24, 2) + '%';
+        OPS.$('hKpiStuck').textContent = k.stuck;
+        OPS.$('hKpiStuckSub').innerHTML = OPS.t('{n} sessions running', {n: k.sessions});
+        OPS.$('hKpiHb').textContent = k.hb_missing;
+        OPS.$('hKpiGaps').textContent = k.gaps24;
+        OPS.$('hUpdated').textContent = OPS.tx('Updated {t}', {t: OPS.fmt(now, true).slice(11)});
+        const td = OPS.td;
+        const ir = d.issues.map(i => '<tr class="ops-sevrow-' + OPS.esc(i.sev) + '">' + td('Severity', OPS.sevPill(i.sev)) + td('Charger', OPS.cpLabel(i.cp, i.name)) +
+            td('Connector', i.conn ? '#' + i.conn : '—') + td('Issue', '<b>' + OPS.t(OPS.ISSUE_KINDS[i.kind] || i.kind) + '</b><br>' + OPS.issueMsg(i, now) + codeHint(i)) +
+            td('Since', OPS.fmt(i.since) + '<br><span class="muted">' + OPS.dur(now - i.since) + '</span>', 'ops-nowrap') +
+            td('', '<button class="tb-btn ops-mini" data-hist="' + OPS.esc(i.cp) + '">' + OPS.t('🕒 History') + '</button>') + '</tr>');
+        OPS.$('hIssues').innerHTML = '<thead><tr><th>' + OPS.t('Severity') + '</th><th>' + OPS.t('Charger') + '</th><th>' + OPS.t('Connector') +
+            '</th><th>' + OPS.t('Issue') + '</th><th>' + OPS.t('Since') + '</th><th></th></tr></thead><tbody>' +
+            (ir.join('') || '<tr><td colspan="6" class="ops-ok">✓ ' + OPS.t('No open issues') + '</td></tr>') + '</tbody>';
+        const cr = d.chargers.map(c => {
+            const state = c.online ? '<span class="ops-ok">● ' + OPS.t('Online') + '</span>' : '<span class="ops-bad">● ' + OPS.t('Offline') + '</span>';
+            const conns = c.conns.filter(x => x.id > 0 || c.conns.length === 1).map(x => '<div>#' + x.id + ' ' + OPS.stChip(x.status) +
+                (x.err && x.err !== 'NoError' ? ' <span class="ops-bad">' + OPS.esc(x.err) + (x.verr ? ' (' + OPS.esc(x.verr) + ')' : '') + '</span>' : '') +
+                (x.since ? ' <span class="muted">' + OPS.dur(now - x.since) + '</span>' : '') + '</div>').join('') || '<span class="muted">—</span>';
+            const sess = c.sessions.map(s => '<div>⚡ #' + s.c + ' · ' + OPS.num(s.kwh, 2) + ' kWh · ' + OPS.num(s.p / 1000, 1) + ' kW' +
+                (s.gaps ? ' · <span class="ops-warn">' + OPS.t('{n} gaps', {n: s.gaps}) + '</span>' : '') + '</div>').join('');
+            const score = c.score;
+            return '<tr>' + td('Charger', OPS.cpLabel(c.id, c.name) + '<br><span class="muted">' + OPS.esc([c.vendor, c.model].filter(Boolean).join(' · ')) + '</span>') +
+                td('Connection', state + '<br><span class="muted">' + OPS.t('since {t}', {t: OPS.fmt(c.since)}) + '</span>', 'ops-nowrap') +
+                td('Last message', (c.seen ? OPS.t('{d} ago', {d: OPS.dur(now - c.seen)}) : '—') + '<br><span class="muted">' +
+                    (c.hb_interval ? OPS.t('heartbeat {i} s', {i: c.hb_interval}) : '') + '</span>', 'ops-nowrap') +
+                td('Connectors', conns + sess) + td('Firmware', OPS.esc(c.fw || '—'), 'ops-nowrap') +
+                td('Reboots / drops (24 h)', (c.boots24 || 0) + ' / ' + (c.disc24 || 0), 'c') +
+                td('Availability (24 h)', c.avail24 == null ? '—' : OPS.num(c.avail24, 1) + '%', 'c') +
+                td('Health', '<div class="ops-score" title="' + score + '/100"><i style="width:' + score + '%;background:' + (score >= 80 ? 'var(--success)' : score >= 50 ? 'var(--warning)' : 'var(--error)') + '"></i></div>' +
+                    '<span class="muted">' + score + '</span>') +
+                td('', '<button class="tb-btn ops-mini" data-hist="' + OPS.esc(c.id) + '">' + OPS.t('🕒 History') + '</button>') + '</tr>';
+        });
+        OPS.$('hChargers').innerHTML = '<thead><tr><th>' + OPS.t('Charger') + '</th><th>' + OPS.t('Connection') + '</th><th>' + OPS.t('Last message') +
+            '</th><th>' + OPS.t('Connectors') + '</th><th>' + OPS.t('Firmware') + '</th><th class="c">' + OPS.t('Reboots / drops (24 h)') +
+            '</th><th class="c">' + OPS.t('Availability (24 h)') + '</th><th>' + OPS.t('Health') + '</th><th></th></tr></thead><tbody>' +
+            (cr.join('') || '<tr><td colspan="9" class="muted">' + OPS.t('No chargers yet') + '</td></tr>') + '</tbody>';
+        const sel = OPS.$('hCp');
+        const cur = H.cp;
+        sel.innerHTML = d.chargers.map(c => OPS.opt(c.id, c.id + (c.name ? ' · ' + c.name : ''), c.id === cur)).join('');
+        const badge = OPS.$('healthBadge');
+        if (badge) { badge.textContent = k.critical + k.major || ''; badge.classList.toggle('show', !!(k.critical + k.major)); }
+    }
+
+    function codeHint(i) {
+        const inf = i.info;
+        if (!inf) return '';
+        let s = '<div class="ops-hint">' + OPS.esc(OPS.tx(inf.title || '')) + (inf.vendor_title ? ' · ' + OPS.esc(inf.vendor_title) : '') + '<br><span class="muted">👉 ' +
+            OPS.esc(OPS.tx(inf.vendor_action || inf.action || '')) + '</span></div>';
+        return s;
+    }
+
+    const EV = {
+        conn: e => OPS.t('Connector #{c}', {c: e.c}) + ': ' + (e.p ? OPS.stChip(e.p) + ' → ' : '') + OPS.stChip(e.s) +
+            (e.e && e.e !== 'NoError' ? ' <span class="ops-bad">' + OPS.esc(e.e) + (e.ve ? ' (' + OPS.esc(e.ve) + ')' : '') + '</span>' : '') + (e.i ? ' <span class="muted">' + OPS.esc(e.i) + '</span>' : ''),
+        online: e => '<span class="ops-ok">🔌 ' + OPS.t('Connected') + '</span>' + (e.ip ? ' <span class="muted">' + OPS.esc(e.ip) + '</span>' : ''),
+        offline: () => '<span class="ops-bad">⛔ ' + OPS.t('Disconnected') + '</span>',
+        boot: e => '🔁 ' + OPS.t('Boot') + ' <span class="muted">' + OPS.esc([e.vendor, e.model, e.fw].filter(Boolean).join(' · ')) + '</span>',
+        gap: e => '<span class="ops-warn">📉 ' + OPS.t('Meter gap of {d} (session {tx})', {d: OPS.dur(e.dur), tx: e.tx}) + '</span>',
+        meter_back: e => '<span class="ops-bad">↩️ ' + OPS.t('Meter went backwards: {a} → {b} Wh', {a: e.from_wh, b: e.to_wh}) + '</span>',
+        issue: e => (e.on ? '🚨 ' + OPS.t('Issue opened') : '✅ ' + OPS.t('Issue closed')) + ': ' + OPS.t(OPS.ISSUE_KINDS[e.id] || e.id) +
+            (e.on ? ' <span class="muted">' + OPS.esc(e.msg || '') + '</span>' : ' <span class="muted">' + OPS.t('after {d}', {d: OPS.dur(e.dur)}) + '</span>'),
+        csms: e => '🖥️ ' + (e.s === 'up' ? OPS.t('CSMS started') : OPS.t('CSMS stopped (last sign of life)'))
+    };
+
+    async function history() {
+        if (!H.cp) return;
+        document.querySelectorAll('#hRange [data-h]').forEach(b => b.classList.toggle('active', +b.dataset.h === H.hours));
+        let j;
+        try { j = await OPS.api(OPS.csvLink('/api/ops/history', {cp: H.cp, hours: H.hours, limit: 1500})); } catch (e) { return OPS.fail(e); }
+        const per = j.per_connector || {};
+        OPS.$('hTimeline').innerHTML = '<div class="ops-tl-head">' + OPS.t('Availability {p} over the period', {p: j.uptime == null ? '—' : OPS.num(j.uptime, 2) + '%'}) +
+            ' · ' + OPS.t('{o} outages', {o: Object.values(per).reduce((a, u) => a + (u.outages || 0), 0)}) + '</div>' +
+            OPS.timeline(j.timeline || {}, j.t0, j.t1, c => OPS.t('Connector #{c}', {c}) + '<br><span class="muted">' +
+                (per[c] && per[c].uptime != null ? OPS.num(per[c].uptime, 1) + '%' : '—') + '</span>');
+        const rows = (j.events || []).map(e => '<tr><td class="ops-nowrap">' + OPS.fmt(e.t, true) + '</td><td>' + (EV[e.k] ? EV[e.k](e) : OPS.esc(e.k)) + '</td></tr>');
+        OPS.$('hEvents').innerHTML = '<thead><tr><th>' + OPS.t('Time (BTT)') + '</th><th>' + OPS.t('Event') + '</th></tr></thead><tbody>' +
+            (rows.join('') || '<tr><td colspan="2" class="muted">' + OPS.t('No entries') + '</td></tr>') + '</tbody>';
+    }
+
+    async function loadCodes() {
+        try { H.codes = await OPS.api('/api/ops/errorcodes'); } catch (e) { return OPS.fail(e); }
+        renderCodes();
+    }
+
+    function renderCodes() {
+        if (!H.codes) return;
+        const q = (OPS.$('hCodeQ').value || '').toLowerCase();
+        const fr = H.codes.freq.map(r => '<tr><td><b>' + OPS.esc(r.code) + '</b>' + (r.ve ? ' <span class="muted">(' + OPS.esc(r.ve) + ')</span>' : '') +
+            '</td><td class="c">' + r.n + '</td><td>' + r.chargers.map(OPS.esc).join(', ') + '</td><td class="ops-nowrap">' + OPS.fmt(r.last) + '</td></tr>');
+        OPS.$('hFreq').innerHTML = '<thead><tr><th>' + OPS.t('Code') + '</th><th class="c">' + OPS.t('Times') + '</th><th>' + OPS.t('Chargers') +
+            '</th><th>' + OPS.t('Last') + '</th></tr></thead><tbody>' + (fr.join('') || '<tr><td colspan="4" class="ops-ok">✓ ' + OPS.t('No faults in the last 30 days') + '</td></tr>') + '</tbody>';
+        const all = H.codes.ocpp.map(r => Object.assign({src: 'OCPP 1.6'}, r)).concat(H.codes.vendor.map(r => Object.assign({src: r.vendor || OPS.tx('Any vendor'), vend: true}, r)));
+        const rows = all.filter(r => !q || (r.code + ' ' + r.title + ' ' + r.cause + ' ' + r.action + ' ' + r.src).toLowerCase().includes(q)).map(r =>
+            '<tr><td><b>' + OPS.esc(r.code) + '</b><br><span class="muted">' + OPS.esc(r.src) + '</span></td><td>' + OPS.sevPill(r.sev) + '</td><td><b>' + OPS.esc(OPS.tx(r.title)) +
+            '</b><br>' + OPS.esc(OPS.tx(r.cause)) + '<br><span class="muted">👉 ' + OPS.esc(OPS.tx(r.action)) + '</span></td><td>' +
+            (r.vend && OPS.can('config') ? '<button class="tb-btn ops-mini" data-code="' + OPS.esc((r.vendor || '').toLowerCase() + '|' + r.code) + '">' + OPS.t('✏️ Edit') + '</button>' : '') + '</td></tr>');
+        OPS.$('hDict').innerHTML = '<thead><tr><th>' + OPS.t('Code') + '</th><th>' + OPS.t('Severity') + '</th><th>' + OPS.t('Meaning · cause · what to do') + '</th><th></th></tr></thead><tbody>' + rows.join('') + '</tbody>';
+    }
+
+    function codeEdit(key) {
+        const r = key ? (H.codes.vendor.find(x => ((x.vendor || '').toLowerCase() + '|' + x.code) === key) || {}) : {};
+        const sevs = ['critical', 'major', 'minor', 'info'].map(s => OPS.opt(s, OPS.SEV[s][1], (r.sev || 'minor') === s)).join('');
+        OPS.modal(key ? 'Edit vendor code' : 'Add vendor code',
+            '<div class="ops-form"><label>' + OPS.t('Vendor') + '<input class="tb-inp" id="vcV" autocomplete="off" value="' + OPS.esc(r.vendor || '') + '" placeholder="Flexxfast"></label>' +
+            '<label>' + OPS.t('Vendor error code') + '<input class="tb-inp" id="vcC" autocomplete="off" value="' + OPS.esc(r.code || '') + '"' + (key ? ' readonly' : '') + '></label>' +
+            '<label>' + OPS.t('Severity') + '<select class="tb-sel" id="vcS">' + sevs + '</select></label>' +
+            '<label class="wide">' + OPS.t('Meaning') + '<input class="tb-inp" id="vcT" autocomplete="off" value="' + OPS.esc(r.title || '') + '"></label>' +
+            '<label class="wide">' + OPS.t('Usual cause') + '<input class="tb-inp" id="vcCa" autocomplete="off" value="' + OPS.esc(r.cause || '') + '"></label>' +
+            '<label class="wide">' + OPS.t('What to do') + '<input class="tb-inp" id="vcA" autocomplete="off" value="' + OPS.esc(r.action || '') + '"></label></div>' +
+            '<div class="pay-help">' + OPS.t('Leave the vendor empty to match the code on every charger.') + '</div>',
+            [].concat(key ? [{label: '🗑️ Delete', run: async b => { await OPS.post('/api/ops/errorcodes', {vendor: OPS.val(b, '#vcV'), code: OPS.val(b, '#vcC'), delete: true}); loadCodes(); return true; }}] : [],
+                [{label: 'Cancel'}, {label: 'Save', cls: 'primary', run: async b => {
+                    await OPS.post('/api/ops/errorcodes', {vendor: OPS.val(b, '#vcV'), code: OPS.val(b, '#vcC'), sev: OPS.val(b, '#vcS'),
+                        title: OPS.val(b, '#vcT'), cause: OPS.val(b, '#vcCa'), action: OPS.val(b, '#vcA')});
+                    OPS.toast(OPS.tx('Saved'), 'success'); loadCodes(); return true;
+                }}]));
+    }
+
+    const CFG_LABELS = {
+        offline_after_min: ['Offline alarm after', 'min'], heartbeat_factor: ['Heartbeat missing after (× interval)', '×'],
+        heartbeat_min_s: ['… but at least', 's'], meter_gap_min: ['Meter gap after', 'min'],
+        stuck_no_meter_min: ['Stuck: no meter values for', 'min'], stuck_no_energy_min: ['Stuck: no energy while Charging for', 'min'],
+        stuck_max_hours: ['Stuck: session longer than', 'h'], stuck_open_after_stop_min: ['Stuck: connector idle but session open for', 'min'],
+        stuck_offline_min: ['Stuck: charger offline during a session for', 'min'], unavailable_after_min: ['Unavailable alarm after', 'min'],
+        boot_loop_per_hour: ['Reboot loop: more than … boots per hour', ''], flapping_per_hour: ['Flapping: more than … drops per hour', ''],
+        restart_grace_s: ['After a CSMS restart, wait before counting chargers offline', 's']
+    };
+
+    async function loadCfg() {
+        let j;
+        try { j = await OPS.api('/api/ops/health/config'); } catch (e) { return OPS.fail(e); }
+        H.cfg = j.config; H.defaults = j.defaults;
+        const ro = OPS.can('config') ? '' : ' disabled';
+        OPS.$('hCfg').innerHTML = '<div class="ops-form ops-cfg">' + Object.keys(CFG_LABELS).map(k =>
+            '<label>' + OPS.t(CFG_LABELS[k][0]) + '<span class="ops-inline"><input class="tb-inp" type="number" min="0" step="any" data-k="' + k + '" value="' +
+            OPS.esc(H.cfg[k]) + '"' + ro + '><span class="muted">' + OPS.esc(CFG_LABELS[k][1]) + '</span></span></label>').join('') +
+            '<label class="ops-check wide"><input type="checkbox" id="hCfgUnav"' + (H.cfg.unavailable_counts_as_down ? ' checked' : '') + ro + '> ' +
+            OPS.t('Count Unavailable as downtime (untick when Unavailable is used for planned work)') + '</label>' +
+            '<label class="wide">' + OPS.t('Chargers to ignore (comma separated)') + '<input class="tb-inp" id="hCfgIgn" autocomplete="off" value="' + OPS.esc((H.cfg.ignore || []).join(', ')) + '"' + ro + '></label>' +
+            '</div>' + (OPS.can('config') ? '<div class="pay-form-row"><button class="tb-btn primary" id="hCfgSave">' + OPS.t('💾 Save settings') + '</button></div>' : '');
+        const sv = OPS.$('hCfgSave');
+        if (sv) sv.onclick = async () => {
+            const body = {unavailable_counts_as_down: OPS.$('hCfgUnav').checked, ignore: OPS.$('hCfgIgn').value};
+            OPS.$('hCfg').querySelectorAll('[data-k]').forEach(i => { body[i.dataset.k] = i.value; });
+            try { await OPS.post('/api/ops/health/config', body); OPS.toast(OPS.tx('Saved'), 'success'); load(); } catch (e) { OPS.fail(e); }
+        };
+    }
+
+    OPS.register({tab: 'health', perm: 'view', every: 10,
+        show() { const v = OPS.$('view-health'); if (!v) return; if (!v.dataset.built) build(v); load(); loadCodes(); if (H.cp) history(); },
+        refresh() { load(); if (H.cp && H.hours <= 24) history(); },
+        relang() { if (H.data) render(); renderCodes(); if (H.cp) history(); }});
+
+    // header badge: critical + major issues, refreshed from any tab
+    async function badge() {
+        if (!OPS.me || OPS.active === 'health') return;
+        try { const d = await OPS.api('/api/ops/health'); const n = d.kpis.critical + d.kpis.major; const b = OPS.$('healthBadge'); if (b) { b.textContent = n || ''; b.classList.toggle('show', !!n); } } catch (e) {}
+    }
+    document.addEventListener('ops-ready', () => { badge(); setInterval(() => { if (!document.hidden) badge(); }, 60000); });
+
+    OPS.addI18n({
+        '🩺 Health': ['🩺 འཕྲུལ་ཆས་གནས་སྟངས་', '🩺 สุขภาพเครือข่าย'],
+        'Online chargers': ['', 'ตู้ที่ออนไลน์'], 'Open issues': ['', 'ปัญหาที่ยังเปิดอยู่'], 'Availability (24 h)': ['', 'ความพร้อมใช้งาน (24 ชม.)'],
+        'average of all connectors': ['', 'เฉลี่ยทุกหัวชาร์จ'], 'Stuck sessions': ['', 'เซสชันค้าง'], 'Heartbeat missing': ['', 'Heartbeat หาย'],
+        'connected but silent': ['', 'เชื่อมต่ออยู่แต่ไม่ส่งข้อมูล'], 'Meter gaps (24 h)': ['', 'ข้อมูลมิเตอร์ขาดหาย (24 ชม.)'], 'during sessions': ['', 'ระหว่างการชาร์จ'],
+        '{c} critical · {m} major': ['', 'วิกฤต {c} · สำคัญ {m}'], '{n} sessions running': ['', 'กำลังชาร์จ {n} เซสชัน'],
+        '🚨 Open issues': ['', '🚨 ปัญหาที่ยังเปิดอยู่'], 'Updated {t}': ['', 'อัปเดต {t}'], '🔌 Chargers': ['', '🔌 ตู้ชาร์จ'],
+        '🕒 Status history': ['', '🕒 ประวัติสถานะ'], '24 h': ['', '24 ชม.'], '7 days': ['', '7 วัน'], '30 days': ['', '30 วัน'],
+        '📖 Fault codes': ['', '📖 รหัสความผิดปกติ'], '➕ Vendor code': ['', '➕ รหัสของผู้ผลิต'], 'Most frequent faults (30 days)': ['', 'ความผิดปกติที่พบบ่อย (30 วัน)'],
+        'Dictionary': ['', 'พจนานุกรม'], '⚙️ Detection settings': ['', '⚙️ ตั้งค่าการตรวจจับ'],
+        'Critical': ['', 'วิกฤต'], 'Major': ['', 'สำคัญ'], 'Minor': ['', 'เล็กน้อย'], 'Info': ['', 'ข้อมูล'],
+        'Charger offline': ['', 'ตู้ออฟไลน์'], 'Connector faulted': ['', 'หัวชาร์จขัดข้อง'], 'Error code reported': ['', 'มีรหัสความผิดปกติ'],
+        'Connector unavailable': ['', 'หัวชาร์จไม่พร้อมใช้งาน'], 'Stuck session': ['', 'เซสชันค้าง'], 'Meter values missing': ['', 'ข้อมูลมิเตอร์ขาดหาย'],
+        'Reboot loop': ['', 'รีบูตวนซ้ำ'], 'Connection flapping': ['', 'การเชื่อมต่อหลุดบ่อย'], 'Not accepted': ['', 'ยังไม่อนุมัติ'],
+        'Offline for {d}': ['', 'ออฟไลน์มา {d}'], 'No message for {d} (heartbeat every {i} s)': ['', 'ไม่มีข้อความมา {d} (heartbeat ทุก {i} วินาที)'],
+        'Faulted: {code}': ['', 'ขัดข้อง: {code}'], '{code} while {status}': ['', '{code} ขณะ {status}'], 'Unavailable for {d}': ['', 'ไม่พร้อมใช้งานมา {d}'],
+        'Registration {r}': ['', 'สถานะลงทะเบียน {r}'], '{n} reboots in the last hour': ['', 'รีบูต {n} ครั้งในชั่วโมงที่ผ่านมา'],
+        '{n} disconnections in the last hour': ['', 'หลุด {n} ครั้งในชั่วโมงที่ผ่านมา'],
+        'Session {tx} open while the charger is offline': ['', 'เซสชัน {tx} ยังเปิดอยู่ขณะที่ตู้ออฟไลน์'],
+        'No meter values for {d} (session {tx})': ['', 'ไม่มีค่ามิเตอร์มา {d} (เซสชัน {tx})'],
+        'No energy for {d} while Charging (session {tx})': ['', 'ไม่มีพลังงานไหลมา {d} ทั้งที่สถานะ Charging (เซสชัน {tx})'],
+        'Connector {status} but session {tx} is still open': ['', 'หัวชาร์จเป็น {status} แต่เซสชัน {tx} ยังเปิดอยู่'],
+        'Session {tx} running for {d}': ['', 'เซสชัน {tx} ทำงานมา {d}'],
+        'Severity': ['', 'ระดับ'], 'Connector': ['', 'หัวชาร์จ'], 'Issue': ['', 'ปัญหา'], 'Since': ['', 'ตั้งแต่'], '🕒 History': ['', '🕒 ประวัติ'],
+        'No open issues': ['', 'ไม่มีปัญหาที่เปิดอยู่'], 'Online': ['', 'ออนไลน์'], 'Offline': ['', 'ออฟไลน์'], 'since {t}': ['', 'ตั้งแต่ {t}'],
+        '{d} ago': ['', '{d} ที่แล้ว'], 'heartbeat {i} s': ['', 'heartbeat {i} วินาที'], '{n} gaps': ['', 'ขาดหาย {n} ครั้ง'],
+        'Connection': ['', 'การเชื่อมต่อ'], 'Last message': ['', 'ข้อความล่าสุด'], 'Connectors': ['', 'หัวชาร์จ'], 'Firmware': ['', 'เฟิร์มแวร์'],
+        'Reboots / drops (24 h)': ['', 'รีบูต / หลุด (24 ชม.)'], 'Health': ['', 'สุขภาพ'], 'No chargers yet': ['', 'ยังไม่มีตู้ชาร์จ'],
+        'Connector #{c}': ['', 'หัวชาร์จ #{c}'], 'Connected': ['', 'เชื่อมต่อ'], 'Disconnected': ['', 'ขาดการเชื่อมต่อ'], 'Boot': ['', 'บูต'],
+        'Meter gap of {d} (session {tx})': ['', 'ข้อมูลมิเตอร์ขาดหาย {d} (เซสชัน {tx})'], 'Meter went backwards: {a} → {b} Wh': ['', 'มิเตอร์ย้อนกลับ: {a} → {b} Wh'],
+        'Issue opened': ['', 'เปิดปัญหา'], 'Issue closed': ['', 'ปิดปัญหา'], 'after {d}': ['', 'หลัง {d}'], 'CSMS started': ['', 'CSMS เริ่มทำงาน'],
+        'CSMS stopped (last sign of life)': ['', 'CSMS หยุดทำงาน (สัญญาณสุดท้าย)'], 'Availability {p} over the period': ['', 'ความพร้อมใช้งาน {p} ในช่วงนี้'],
+        '{o} outages': ['', 'ขัดข้อง {o} ครั้ง'], 'Event': ['', 'เหตุการณ์'], 'Code': ['', 'รหัส'], 'Times': ['', 'จำนวนครั้ง'], 'Chargers': ['', 'ตู้ชาร์จ'],
+        'Last': ['', 'ล่าสุด'], 'No faults in the last 30 days': ['', 'ไม่มีความผิดปกติใน 30 วันที่ผ่านมา'], 'Any vendor': ['', 'ทุกผู้ผลิต'],
+        'Meaning · cause · what to do': ['', 'ความหมาย · สาเหตุ · สิ่งที่ต้องทำ'], 'Edit vendor code': ['', 'แก้ไขรหัสของผู้ผลิต'], 'Add vendor code': ['', 'เพิ่มรหัสของผู้ผลิต'],
+        'Vendor': ['', 'ผู้ผลิต'], 'Vendor error code': ['', 'รหัสความผิดปกติของผู้ผลิต'], 'Meaning': ['', 'ความหมาย'], 'Usual cause': ['', 'สาเหตุที่พบบ่อย'],
+        'What to do': ['', 'สิ่งที่ต้องทำ'], 'Leave the vendor empty to match the code on every charger.': ['', 'เว้นช่องผู้ผลิตว่างไว้เพื่อใช้กับตู้ทุกยี่ห้อ'],
+        'Saved': ['', 'บันทึกแล้ว'], '💾 Save settings': ['', '💾 บันทึกการตั้งค่า'],
+        'Offline alarm after': ['', 'แจ้งออฟไลน์หลังจาก'], 'Heartbeat missing after (× interval)': ['', 'Heartbeat หายเมื่อเกิน (× ช่วงเวลา)'],
+        '… but at least': ['', '… แต่ไม่น้อยกว่า'], 'Meter gap after': ['', 'ข้อมูลมิเตอร์ขาดหายหลังจาก'], 'Stuck: no meter values for': ['', 'ค้าง: ไม่มีค่ามิเตอร์นาน'],
+        'Stuck: no energy while Charging for': ['', 'ค้าง: ไม่มีพลังงานขณะ Charging นาน'], 'Stuck: session longer than': ['', 'ค้าง: เซสชันนานกว่า'],
+        'Stuck: connector idle but session open for': ['', 'ค้าง: หัวชาร์จว่างแต่เซสชันยังเปิดนาน'], 'Stuck: charger offline during a session for': ['', 'ค้าง: ตู้ออฟไลน์ระหว่างเซสชันนาน'],
+        'Unavailable alarm after': ['', 'แจ้งไม่พร้อมใช้งานหลังจาก'], 'Reboot loop: more than … boots per hour': ['', 'รีบูตวน: มากกว่า … ครั้งต่อชั่วโมง'],
+        'Flapping: more than … drops per hour': ['', 'หลุดบ่อย: มากกว่า … ครั้งต่อชั่วโมง'], 'After a CSMS restart, wait before counting chargers offline': ['', 'หลัง CSMS รีสตาร์ท รอก่อนนับว่าตู้ออฟไลน์'],
+        'Count Unavailable as downtime (untick when Unavailable is used for planned work)': ['', 'นับสถานะ Unavailable เป็นเวลาหยุดทำงาน (เอาออกถ้าใช้ Unavailable สำหรับงานที่วางแผนไว้)'],
+        'Chargers to ignore (comma separated)': ['', 'ตู้ที่ไม่ต้องตรวจ (คั่นด้วยจุลภาค)'],
+        'Ground fault': ['', 'ไฟรั่วลงดิน'], 'Over-current': ['', 'กระแสเกิน'], 'Over-voltage': ['', 'แรงดันเกิน'], 'Under-voltage': ['', 'แรงดันต่ำ'],
+        'High temperature': ['', 'อุณหภูมิสูง'], 'Internal error': ['', 'ความผิดพลาดภายใน'], 'Power meter failure': ['', 'มิเตอร์ไฟฟ้าขัดข้อง'],
+        'Power switch failure': ['', 'คอนแทคเตอร์ขัดข้อง'], 'RFID reader failure': ['', 'เครื่องอ่าน RFID ขัดข้อง'], 'Connector lock failure': ['', 'ระบบล็อกหัวชาร์จขัดข้อง'],
+        'EV communication error': ['', 'สื่อสารกับรถไม่ได้'], 'Weak signal': ['', 'สัญญาณอ่อน'], 'Reset failure': ['', 'รีเซ็ตไม่สำเร็จ'],
+        'Local list conflict': ['', 'รายการบัตรไม่ตรงกัน'], 'Other error': ['', 'ความผิดพลาดอื่น'], 'No error': ['', 'ไม่มีข้อผิดพลาด']
+    });
+    Object.assign(OPS.actionLabels, {'/api/ops/errorcodes': 'Fault code dictionary changed', '/api/ops/health/config': 'Health detection settings changed'});
+    OPS.addI18n({'Fault code dictionary changed': ['', 'แก้ไขพจนานุกรมรหัสความผิดปกติ'], 'Health detection settings changed': ['', 'เปลี่ยนการตั้งค่าการตรวจจับ']});
+})();
+''')
+
+
+# ---- [OPS] v1.3 KPIs & reports: charging sessions, uptime / energy reports (DoST), KPI dashboard (ops/patch_reports.py)
+OPS_FEATURES.append('kpi')
+OPS_SESSIONS_LOG = OpsEventLog('sessions', 'ops_sessions', keep_days=100)
+OPS_KPI_DEFAULTS = {'target_uptime': 97.0, 'km_per_kwh': 6.0, 'petrol_co2_kg_per_km': 0.19, 'petrol_km_per_litre': 12.0,
+                    'grid_co2_kg_per_kwh': 0.0, 'short_session_s': 120, 'short_session_kwh': 0.2}
+OPS_KPI_EXTRA: list = []                # fn(t0, t1, result) -> adds figures (maintenance: MTTR, SLA ...)
+ops_perm_rule('POST', '/api/ops/kpi/config', 'config')
+OPS_TAB_PERMS['kpi'] = 'view'
+
+
+def ops_kpi_cfg() -> dict:
+    return ops_cfg('kpi', OPS_KPI_DEFAULTS)
+
+
+def _ops_parse_ts(s):
+    if not s:
+        return None
+    try:
+        d = datetime.fromisoformat(str(s).replace('Z', '+00:00'))
+        return d.timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def _ops_r_tx_stop(cp_id='', txn_id=None, meter_stop=0, reason='', energy_wh=0, txn=None, id_tag='', **kw):
+    """One record per finished session (runs before the health listener drops the live facts)."""
+    now = ops_now()
+    t = OPS_TX.get(f'{cp_id}|{txn_id}') or {}
+    txn = txn or {}
+    start = t.get('start') or _ops_parse_ts(txn.get('start_time')) or now
+    try:
+        wh = float(energy_wh or 0)
+    except (TypeError, ValueError):
+        wh = 0.0
+    suspect = False
+    if t and (t.get('resumed') or wh <= 0):
+        try:
+            wh = max(0.0, float(meter_stop) - float(t.get('ms') or 0)) if meter_stop else max(0.0, t['e'] - t['ms'])
+        except (TypeError, ValueError):
+            wh = max(0.0, t.get('e', 0) - t.get('ms', 0))
+    dur = max(0.0, now - start)
+    if wh > 400000 * max(dur, 60) / 3600.0:               # more than 400 kW on average: a meter mix-up, not a session
+        suspect = True
+        wh = max(0.0, t.get('e', 0) - t.get('ms', 0)) if t else 0.0
+    rec = {'t': round(now, 3), 'uid': secrets.token_hex(8), 'cp': cp_id, 'c': txn.get('connector_id', t.get('c', 0)), 'tx': txn_id,
+           'tag': str(id_tag or txn.get('id_tag') or t.get('tag') or '')[:40], 'start': round(start, 1), 'stop': round(now, 1),
+           'dur': round(dur), 'kwh': round(wh / 1000.0, 4), 'max_kw': round((t.get('maxp') or 0) / 1000.0, 2),
+           'reason': str(reason or '')[:40], 'gaps': t.get('gaps', 0)}
+    if t.get('resumed'):
+        rec['resumed'] = True
+    if suspect:
+        rec['suspect'] = True
+    OPS_SESSIONS_LOG.add(rec)
+
+
+OPS_HOOKS.setdefault('tx_stop', []).insert(0, _ops_r_tx_stop)
+
+
+# ---- computation ----------------------------------------------------------------------------------------------------
+def ops_period(q) -> tuple:
+    """(t0, t1, label) from ?month=YYYY-MM | ?days=N | ?from=&to= (Bhutan Time)."""
+    now = ops_now()
+    m = (q.get('month') or '').strip()
+    if m:
+        try:
+            d0 = datetime.strptime(m[:7] + '-01', '%Y-%m-%d').replace(tzinfo=OPS_TZ)
+            d1 = (d0 + timedelta(days=32)).replace(day=1)
+            return d0.timestamp(), d1.timestamp(), d0.strftime('%B %Y')
+        except ValueError:
+            pass
+    days = ops_int(q.get('days'), 0, 0, 3660)
+    if days:
+        t1 = ops_day_start(ops_dt(now).strftime('%Y-%m-%d')) + 86400
+        return t1 - days * 86400, t1, f'last {days} days'
+    if q.get('from') or q.get('to'):
+        t0, t1 = ops_range_from_query(q, 30)
+        return t0, t1, f"{ops_dt(t0).strftime('%d %b %Y')} - {ops_dt(t1 - 1).strftime('%d %b %Y')}"
+    d0 = ops_dt(now).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return d0.timestamp(), (d0 + timedelta(days=32)).replace(day=1).timestamp(), d0.strftime('%B %Y')
+
+
+def _ops_split_days(segs: List[list], day_starts: List[float]) -> Dict[float, List[list]]:
+    out: Dict[float, List[list]] = {}
+    for a, b, st in segs:
+        for d in day_starts:
+            lo, hi = max(a, d), min(b, d + 86400)
+            if hi > lo:
+                out.setdefault(d, []).append([lo, hi, st])
+    return out
+
+
+def _ops_revenue(t0: float, t1: float) -> dict:
+    total, n, sym, cur = 0.0, 0, '', ''
+    try:
+        for rec in list(pay_ledger.records.values()):
+            if rec.get('state') != 'completed':
+                continue
+            ts = _ops_parse_ts(rec.get('stopped_at'))
+            if ts is None or not (t0 <= ts < t1):
+                continue
+            total += float(rec.get('used_amount') or 0)
+            n += 1
+            sym, cur = rec.get('symbol') or sym, rec.get('currency') or cur
+    except Exception as e:
+        logger.error(f"ops: revenue figures failed: {e}")
+    return {'amount': round(total, 2), 'payments': n, 'symbol': sym or 'Nu.', 'currency': cur or 'BTN'}
+
+
+def ops_kpi_compute(t0: float, t1: float, label: str = '') -> dict:
+    now = ops_now()
+    t1c = min(t1, now)
+    cfg = ops_kpi_cfg()
+    hcfg = ops_health_cfg()
+    by_cp = ops_events_by_cp(ops_status_events_lb(t0, t1c))   # [OPS] v1.10
+    sessions = OPS_SESSIONS_LOG.query(t0, t1c + 1)
+    _ops_sess_by_cp: Dict[str, list] = {}   # [OPS] v1.10
+    for _s in sessions:
+        _ops_sess_by_cp.setdefault(_s['cp'], []).append(_s)
+    day_starts = []
+    d = t0
+    while d < t1c:
+        day_starts.append(d)
+        d += 86400
+    daily = {ds: {'day': ops_dt(ds).strftime('%Y-%m-%d'), 'kwh': 0.0, 'sessions': 0, 'up': 0.0, 'down': 0.0} for ds in day_starts}
+    heat = [[0] * 24 for _ in range(7)]
+    chargers, conns_out, ups = [], [], []
+    cp_ids = sorted(set(ops_known_chargers()) | {s['cp'] for s in sessions})
+    span = max(1.0, t1c - t0)
+    short_s, short_kwh = float(cfg['short_session_s']), float(cfg['short_session_kwh'])
+    tot = {'sessions': 0, 'kwh': 0.0, 'short': 0, 'dur': 0.0, 'occupied': 0.0, 'outage_s': 0.0, 'outages': 0, 'faults': 0,
+           'users': set(), 'excluded_s': 0.0, 'unknown_s': 0.0, 'known_s': 0.0, 'connectors': 0}
+    for cp in cp_ids:
+        evs = by_cp.get(cp) or by_cp.get('') or []
+        tl = ops_timeline(cp, t0, t1c, evs)
+        cs = _ops_sess_by_cp.get(cp, [])   # [OPS] v1.10
+        faults = sum(1 for e in evs if e.get('k') == 'conn' and t0 <= e['t'] < t1c and e.get('s') == 'Faulted' and e.get('p') != 'Faulted')
+        conn_ids = sorted(set(tl['conns'].keys()) | {int(s.get('c') or 0) for s in cs if int(s.get('c') or 0) > 0}) or [0]
+        cp_up = []
+        cp_out = {'outage_s': 0.0, 'outages': 0, 'excluded_s': 0.0, 'unknown_s': 0.0}
+        for c in conn_ids:
+            segs = tl['conns'].get(c) or [[t0, t1c, 'Unknown']]
+            u = ops_uptime(segs, cp, c)
+            for ds, dsegs in _ops_split_days(segs, day_starts).items():
+                du = ops_uptime(dsegs, cp, c)
+                daily[ds]['up'] += du['up']
+                daily[ds]['down'] += du['down']
+            csc = [s for s in cs if int(s.get('c') or 0) == c]
+            occ = sum(max(0.0, min(s['stop'], t1c) - max(s['start'], t0)) for s in csc)
+            row = {'cp': cp, 'c': c, 'uptime': u['uptime'], 'coverage': u['coverage'], 'outage_h': round(u['down'] / 3600, 2),
+                   'outages': u['outages'], 'excluded_h': round(u['excluded'] / 3600, 2), 'excluded_s': round(u['excluded']), 'sessions': len(csc),
+                   'kwh': round(sum(s['kwh'] for s in csc), 3), 'util': round(100.0 * occ / span, 2)}
+            conns_out.append(row)
+            if u['uptime'] is not None:
+                cp_up.append(u['uptime'])
+                ups.append(u['uptime'])
+            cp_out['outage_s'] += u['down']
+            cp_out['outages'] += u['outages']
+            cp_out['excluded_s'] += u['excluded']
+            cp_out['unknown_s'] += u['unknown']
+            tot['occupied'] += occ
+            tot['known_s'] += u['total'] - u['unknown']
+            tot['unknown_s'] += u['unknown']
+            tot['connectors'] += 1
+        kwh = sum(s['kwh'] for s in cs)
+        short = sum(1 for s in cs if s['kwh'] < short_kwh or (s['dur'] < short_s and s['kwh'] < 5 * short_kwh))
+        for s in cs:
+            ds = _ops_day_bucket(day_starts, s['stop']) if day_starts else None   # [OPS] v1.10
+            if ds is not None and ds in daily:
+                daily[ds]['kwh'] += s['kwh']
+                daily[ds]['sessions'] += 1
+            sd = ops_dt(s['start'])
+            heat[sd.weekday()][sd.hour] += 1
+            if s.get('tag'):
+                tot['users'].add(s['tag'])
+        chargers.append({'cp': cp, 'name': ops_cp_name(cp), 'connectors': len(conn_ids),
+                         'uptime': round(sum(cp_up) / len(cp_up), 3) if cp_up else None,
+                         'outage_h': round(cp_out['outage_s'] / 3600, 2), 'outages': cp_out['outages'],
+                         'excluded_h': round(cp_out['excluded_s'] / 3600, 2),
+                         'coverage': round(100.0 * (1 - cp_out['unknown_s'] / (span * len(conn_ids))), 1),
+                         'sessions': len(cs), 'kwh': round(kwh, 3), 'avg_kwh': round(kwh / len(cs), 3) if cs else None,
+                         'avg_min': round(sum(s['dur'] for s in cs) / len(cs) / 60.0, 1) if cs else None,
+                         'util': round(sum(r['util'] for r in conns_out[-len(conn_ids):]) / len(conn_ids), 2),   # [OPS] v1.10
+                         'peak_kw': max([s.get('max_kw') or 0 for s in cs] or [0]), 'short': short, 'faults': faults,
+                         'users': len({s['tag'] for s in cs if s.get('tag')})})
+        tot['sessions'] += len(cs)
+        tot['kwh'] += kwh
+        tot['short'] += short
+        tot['dur'] += sum(s['dur'] for s in cs)
+        tot['outage_s'] += cp_out['outage_s']
+        tot['outages'] += cp_out['outages']
+        tot['excluded_s'] += cp_out['excluded_s']
+        tot['faults'] += faults
+    km = tot['kwh'] * float(cfg['km_per_kwh'])
+    co2 = km * float(cfg['petrol_co2_kg_per_km']) - tot['kwh'] * float(cfg['grid_co2_kg_per_kwh'])
+    target = float(cfg['target_uptime'])
+    totals = {
+        'uptime': round(sum(ups) / len(ups), 3) if ups else None, 'target_uptime': target,
+        'below_target': sum(1 for c in chargers if c['uptime'] is not None and c['uptime'] < target),
+        'chargers': len(chargers), 'connectors': tot['connectors'], 'sessions': tot['sessions'], 'kwh': round(tot['kwh'], 3),
+        'avg_kwh': round(tot['kwh'] / tot['sessions'], 3) if tot['sessions'] else None,
+        'avg_min': round(tot['dur'] / tot['sessions'] / 60.0, 1) if tot['sessions'] else None,
+        'util': round(100.0 * tot['occupied'] / (span * max(1, tot['connectors'])), 2), 'short': tot['short'],
+        'outage_h': round(tot['outage_s'] / 3600, 2), 'outages': tot['outages'], 'excluded_h': round(tot['excluded_s'] / 3600, 2),
+        'faults': tot['faults'], 'users': len(tot['users']),
+        'coverage': round(100.0 * tot['known_s'] / (tot['known_s'] + tot['unknown_s']), 1) if tot['known_s'] + tot['unknown_s'] else None,
+        'km': round(km), 'co2_kg': round(co2, 1), 'petrol_l': round(km / max(0.1, float(cfg['petrol_km_per_litre'])), 1),
+        'revenue': _ops_revenue(t0, t1c)}
+    daily_out = []
+    for ds in day_starts:
+        r = daily[ds]
+        r['uptime'] = round(100.0 * r['up'] / (r['up'] + r['down']), 3) if r['up'] + r['down'] > 0 else None
+        r['kwh'] = round(r['kwh'], 3)
+        daily_out.append({k: r[k] for k in ('day', 'kwh', 'sessions', 'uptime')})
+    res = {'period': {'t0': t0, 't1': t1, 'until': t1c, 'label': label or f'{ops_iso(t0)} - {ops_iso(t1)}', 'days': len(day_starts)},
+           'generated': now, 'totals': totals, 'chargers': chargers, 'connectors': conns_out, 'daily': daily_out, 'heatmap': heat,
+           'cfg': cfg, 'unavailable_counts_as_down': bool(hcfg.get('unavailable_counts_as_down', True))}
+    for fn in OPS_KPI_EXTRA:
+        try:
+            fn(t0, t1c, res)
+        except Exception as e:
+            logger.error(f"ops: KPI extra {getattr(fn, '__name__', '?')} failed: {e}")
+    return res
+
+
+_OPS_KPI_CACHE: Dict[tuple, tuple] = {}
+
+
+async def ops_kpi_cached(q) -> dict:
+    t0, t1, label = ops_period(q)
+    key = (round(t0), round(t1))
+    hit = _OPS_KPI_CACHE.get(key)
+    if hit and ops_now() - hit[0] < 30 and not q.get('fresh'):
+        return hit[1]
+    res = await asyncio.to_thread(ops_kpi_compute, t0, t1, label)
+    _OPS_KPI_CACHE.clear() if len(_OPS_KPI_CACHE) > 20 else None
+    _OPS_KPI_CACHE[key] = (ops_now(), res)
+    return res
+
+
+OPS_KPI_DEFINITIONS = [
+    ('Uptime', 'Per connector: time the connector was available or in use, divided by that time plus the time it was down '
+               '(charger offline, Faulted, or Unavailable when that setting is on). Planned maintenance windows are excluded. '
+               'Time without data (CSMS not running) is left out and shown as coverage. Charger and network figures are the '
+               'average of their connectors.'),
+    ('Outage hours', 'Down time of all connectors in the period (connector-hours).'),
+    ('Utilisation', 'Share of the period during which connectors had a charging session.'),
+    ('Sessions / energy', 'Sessions that ended in the period; energy = meter stop - meter start reported by the charger.'),
+    ('Short sessions', 'Sessions with less energy than the configured kWh, or shorter than the configured time with little energy - often failed starts.'),
+    ('CO2 avoided (estimate)', 'kWh x km per kWh x petrol car CO2 per km, minus grid CO2 per kWh (Bhutan grid ~ hydro).'),
+    ('Time zone', 'All times are Bhutan Time (BTT, UTC+06:00).'),
+]
+
+
+async def ops_api_kpi(request):
+    res = await ops_kpi_cached(request.query)
+    out = dict(res)
+    out['definitions'] = OPS_KPI_DEFINITIONS
+    return ops_json(out)
+
+
+async def ops_api_sessions(request):
+    q = request.query
+    t0, t1, _label = ops_period(q)
+    cp = (q.get('cp') or '').strip()
+    items = await asyncio.to_thread(OPS_SESSIONS_LOG.query, t0, t1, (lambda s: s.get('cp') == cp) if cp else None, None, True)
+    return ops_json({'items': items[:ops_int(q.get('limit'), 2000, 1, 50000)], 'total': len(items)})
+
+
+_OPS_CHARGER_COLS = [('cp', 'Charger'), ('name', 'Station'), ('connectors', 'Connectors'), ('uptime', 'Uptime %'),
+                     ('outage_h', 'Outage hours'), ('outages', 'Outages'), ('excluded_h', 'Excluded hours'), ('coverage', 'Data coverage %'),
+                     ('sessions', 'Sessions'), ('kwh', 'Energy kWh'), ('avg_kwh', 'kWh per session'), ('avg_min', 'Minutes per session'),
+                     ('util', 'Utilisation %'), ('peak_kw', 'Peak kW'), ('short', 'Short sessions'), ('faults', 'Faults'), ('users', 'Users')]
+_OPS_CONN_COLS = [('cp', 'Charger'), ('c', 'Connector'), ('uptime', 'Uptime %'), ('outage_h', 'Outage hours'), ('outages', 'Outages'),
+                  ('excluded_h', 'Excluded hours'), ('coverage', 'Data coverage %'), ('sessions', 'Sessions'), ('kwh', 'Energy kWh'),
+                  ('util', 'Utilisation %')]
+_OPS_SESSION_COLS = [('cp', 'Charger'), ('c', 'Connector'), ('tx', 'Transaction'), ('tag', 'idTag'), ('start', 'Start (BTT)'),
+                     ('stop', 'Stop (BTT)'), ('dur', 'Minutes'), ('kwh', 'Energy kWh'), ('max_kw', 'Peak kW'), ('reason', 'Stop reason')]
+_OPS_DAILY_COLS = [('day', 'Day'), ('uptime', 'Uptime %'), ('sessions', 'Sessions'), ('kwh', 'Energy kWh')]
+
+
+def _ops_cell(key, v):
+    if key in ('start', 'stop') and isinstance(v, (int, float)):
+        return ops_dt(v).strftime('%Y-%m-%d %H:%M')
+    if key == 'dur' and isinstance(v, (int, float)):
+        return round(v / 60.0, 1)
+    return '' if v is None else ops_csv_safe(v)
+
+
+def ops_summary_rows(res: dict) -> List[tuple]:
+    t = res['totals']
+    rv = t['revenue']
+    return [('Period', res['period']['label']), ('Generated (BTT)', ops_iso(res['generated'])),
+            ('Network uptime %', t['uptime']), ('Target uptime %', t['target_uptime']),
+            ('Chargers below target', t['below_target']), ('Chargers', t['chargers']), ('Connectors', t['connectors']),
+            ('Sessions', t['sessions']), ('Energy kWh', t['kwh']), ('kWh per session', t['avg_kwh']), ('Minutes per session', t['avg_min']),
+            ('Utilisation %', t['util']), ('Outage hours', t['outage_h']), ('Outages', t['outages']), ('Excluded hours', t['excluded_h']),
+            ('Faults', t['faults']), ('Short sessions', t['short']), ('Users (idTags)', t['users']), ('Data coverage %', t['coverage']),
+            ('Prepaid revenue ' + rv['currency'], rv['amount']), ('Electric km (estimate)', t['km']),
+            ('CO2 avoided kg (estimate)', t['co2_kg']), ('Petrol saved litres (estimate)', t['petrol_l'])] + \
+           [(k, v) for k, v in (res.get('extra_summary') or [])]
+
+
+async def _ops_report_data(request):
+    res = await ops_kpi_cached(request.query)
+    t0, t1 = res['period']['t0'], res['period']['until']
+    sessions = await asyncio.to_thread(OPS_SESSIONS_LOG.query, t0, t1 + 1)
+    return res, sessions
+
+
+def _ops_fname(res, ext):
+    return 'BPC_charging_report_%s.%s' % (ops_dt(res['period']['t0']).strftime('%Y-%m') if res['period']['days'] >= 28
+                                          else ops_dt(res['period']['t0']).strftime('%Y%m%d'), ext)
+
+
+async def ops_api_report_csv(request):
+    res, sessions = await _ops_report_data(request)
+    level = request.query.get('level') or 'chargers'
+    cols, rows = {'connectors': (_OPS_CONN_COLS, res['connectors']), 'sessions': (_OPS_SESSION_COLS, sessions),
+                  'daily': (_OPS_DAILY_COLS, res['daily'])}.get(level, (_OPS_CHARGER_COLS, res['chargers']))
+    buf = _ops_io.StringIO()
+    w = _ops_csv.writer(buf)
+    w.writerow([label for _k, label in cols])
+    for r in rows:
+        w.writerow([_ops_cell(k, r.get(k)) for k, _l in cols])
+    return web.Response(body=('﻿' + buf.getvalue()).encode('utf-8'), content_type='text/csv',
+                        headers={'Content-Disposition': 'attachment; filename="%s"' % _ops_fname(res, level + '.csv')})
+
+
+async def ops_api_report_xlsx(request):
+    res, sessions = await _ops_report_data(request)
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill, Alignment
+    except Exception:
+        return ops_err('Excel export needs the openpyxl package (pip install openpyxl) - use CSV instead', 501)
+
+    def build():
+        wb = Workbook()
+        head_font, head_fill = Font(bold=True, color='FFFFFF'), PatternFill('solid', fgColor='0A7A3C')
+        ws = wb.active
+        ws.title = 'Summary'
+        ws.append(['Bhutan Power Corporation - EV charging network report'])
+        ws['A1'].font = Font(bold=True, size=14)
+        ws.append([])
+        for k, v in ops_summary_rows(res):
+            ws.append([k, v])
+        ws.column_dimensions['A'].width = 34
+        ws.column_dimensions['B'].width = 26
+        for title, cols, rows in (('Chargers', _OPS_CHARGER_COLS, res['chargers']), ('Connectors', _OPS_CONN_COLS, res['connectors']),
+                                  ('Daily', _OPS_DAILY_COLS, res['daily']), ('Sessions', _OPS_SESSION_COLS, sessions)):
+            sh = wb.create_sheet(title)
+            sh.append([label for _k, label in cols])
+            for cell in sh[1]:
+                cell.font, cell.fill = head_font, head_fill
+                cell.alignment = Alignment(wrap_text=True, vertical='center')
+            for r in rows:
+                sh.append([_ops_cell(k, r.get(k)) for k, _l in cols])
+            for i, (_k, label) in enumerate(cols):
+                sh.column_dimensions[sh.cell(row=1, column=i + 1).column_letter].width = max(10, min(28, len(label) + 4))
+            sh.freeze_panes = 'A2'
+        dfn = wb.create_sheet('Definitions')
+        for k, v in OPS_KPI_DEFINITIONS:
+            dfn.append([k, v])
+        dfn.column_dimensions['A'].width = 24
+        dfn.column_dimensions['B'].width = 120
+        buf = _ops_io.BytesIO()
+        wb.save(buf)
+        return buf.getvalue()
+    data = await asyncio.to_thread(build)
+    return web.Response(body=data, content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                        headers={'Content-Disposition': 'attachment; filename="%s"' % _ops_fname(res, 'xlsx')})
+
+
+def _ops_h(s) -> str:
+    return str('' if s is None else s).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
+
+async def ops_report_print(request):
+    res, _sessions = await _ops_report_data(request)
+    t = res['totals']
+
+    def table(cols, rows):
+        head = ''.join(f'<th>{_ops_h(label)}</th>' for _k, label in cols)
+        body = ''.join('<tr>' + ''.join(f'<td>{_ops_h(_ops_cell(k, r.get(k)))}</td>' for k, _l in cols) + '</tr>' for r in rows)
+        return f'<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>'
+    tiles = ''.join(f'<div class="tile"><span>{_ops_h(k)}</span><b>{_ops_h(v)}</b></div>' for k, v in (
+        ('Network uptime', (f"{t['uptime']:.2f} %" if t['uptime'] is not None else '-')), ('Sessions', t['sessions']),
+        ('Energy', f"{t['kwh']:,.1f} kWh"), ('Utilisation', f"{t['util']:.1f} %"), ('Outage hours', t['outage_h']),
+        ('Chargers below target', t['below_target'])))
+    summary = ''.join(f'<tr><th>{_ops_h(k)}</th><td>{_ops_h(v)}</td></tr>' for k, v in ops_summary_rows(res))
+    defs = ''.join(f'<p><b>{_ops_h(k)}.</b> {_ops_h(v)}</p>' for k, v in OPS_KPI_DEFINITIONS)
+    html = f'''<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BPC charging report - {_ops_h(res['period']['label'])}</title><style>
+body {{ font-family: Inter, 'Segoe UI', Arial, sans-serif; color: #1e293b; margin: 24px; font-size: 12px; }}
+header {{ display: flex; align-items: center; gap: 14px; border-bottom: 3px solid #0a7a3c; padding-bottom: 10px; margin-bottom: 14px; }}
+header img {{ height: 52px; }} h1 {{ font-size: 18px; margin: 0; }} h2 {{ font-size: 14px; margin: 18px 0 6px; color: #0a7a3c; }}
+.sub {{ color: #64748b; }} .tiles {{ display: grid; grid-template-columns: repeat(6, 1fr); gap: 8px; }}
+.tile {{ border: 1px solid #e2e8f0; border-radius: 8px; padding: 8px; }} .tile span {{ display: block; color: #64748b; font-size: 10px; text-transform: uppercase; }}
+.tile b {{ font-size: 16px; }} table {{ border-collapse: collapse; width: 100%; margin-bottom: 6px; }}
+th, td {{ border: 1px solid #e2e8f0; padding: 3px 6px; text-align: left; }} thead th {{ background: #0a7a3c; color: #fff; font-size: 10px; }}
+.summary th {{ width: 40%; background: #f8fafc; font-weight: 600; }} .defs p {{ margin: 3px 0; color: #475569; }}
+.btn {{ position: fixed; top: 16px; right: 16px; background: #0a7a3c; color: #fff; border: 0; border-radius: 8px; padding: 8px 14px; font-weight: 700; cursor: pointer; }}
+@media print {{ .btn {{ display: none; }} body {{ margin: 0; }} h2 {{ break-after: avoid; }} tr {{ break-inside: avoid; }} }}
+@media (max-width: 700px) {{ .tiles {{ grid-template-columns: repeat(2, 1fr); }} }}
+</style></head><body><button class="btn" onclick="window.print()">Print / Save as PDF</button>
+<header><img src="/static/bpc_logo.png" alt="BPC"><div><h1>Bhutan Power Corporation Limited - EV charging network report</h1>
+<div class="sub">{_ops_h(res['period']['label'])} · generated {_ops_h(ops_iso(res['generated']))} (Bhutan Time)</div></div></header>
+<div class="tiles">{tiles}</div>
+<h2>Summary</h2><table class="summary">{summary}</table>
+<h2>Chargers</h2>{table(_OPS_CHARGER_COLS, res['chargers'])}
+<h2>Connectors</h2>{table(_OPS_CONN_COLS, res['connectors'])}
+<h2>Daily</h2>{table(_OPS_DAILY_COLS, res['daily'])}
+<h2>Definitions</h2><div class="defs">{defs}</div></body></html>'''
+    return web.Response(text=html, content_type='text/html')
+
+
+async def ops_api_kpi_config(request):
+    cfg = ops_kpi_cfg()
+    if request.method == 'POST':
+        d = await ops_body(request)
+        for k in OPS_KPI_DEFAULTS:
+            if k in d:
+                try:
+                    cfg[k] = max(0.0, float(d[k]))
+                except (TypeError, ValueError):
+                    return ops_err(f'Not a number: {k}')
+        ops_settings.save()
+        _OPS_KPI_CACHE.clear()
+    return ops_json({'config': cfg, 'defaults': OPS_KPI_DEFAULTS})
+
+
+OPS_ROUTES += [
+    ('GET', '/api/ops/kpi', ops_api_kpi), ('GET', '/api/ops/sessions', ops_api_sessions),
+    ('GET', '/api/ops/report.csv', ops_api_report_csv), ('GET', '/api/ops/report.xlsx', ops_api_report_xlsx),
+    ('GET', '/ops/report/print', ops_report_print),
+    ('GET', '/api/ops/kpi/config', ops_api_kpi_config), ('POST', '/api/ops/kpi/config', ops_api_kpi_config),
+]
+
+OPS_CSS_PARTS.append(r'''/* [OPS] v1.3 KPI dashboard */
+.ops-tip { position: fixed; z-index: 10001; display: none; pointer-events: none; background: #0f172a; color: #fff; font-size: 0.74rem;
+    padding: 0.3rem 0.55rem; border-radius: 6px; box-shadow: var(--shadow-lg); max-width: 320px; }
+.ops-charts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 1rem; }
+.ops-chartbox h4 { margin: 0 0 0.4rem; font-size: 0.85rem; }
+.ops-chart { width: 100%; height: auto; display: block; overflow: visible; }
+.ops-chart .ops-ax { font-size: 11px; fill: #52514e; font-family: inherit; }
+.ops-chart .ops-ax-strong { fill: #1e293b; font-weight: 600; }
+.ops-chart .ops-hit { cursor: default; }
+.ops-chart .ops-hit:hover { fill: rgba(15, 23, 42, 0.05); }
+.ops-ramp { display: flex; align-items: center; gap: 2px; font-size: 0.68rem; color: var(--text-dim); margin-top: 0.3rem; }
+.ops-ramp i { width: 16px; height: 9px; border-radius: 2px; display: inline-block; }
+.ops-ramp span { margin: 0 0.35rem; }
+.kpi-value small { font-size: 0.6em; font-weight: 600; color: var(--text-dim); }
+.ops-kbar .muted { font-size: 0.78rem; }
+.ops-table caption { caption-side: bottom; text-align: left; padding: 0.3rem 0; }
+@media (max-width: 900px) { .ops-charts { grid-template-columns: 1fr; } }
+''')
+OPS_JS_PARTS.append(r'''/* [OPS] 📈 KPIs & reports tab (v1.3): KPI dashboard, uptime / energy report, exports */
+(function () {
+    'use strict';
+    const OPS = window.OPS;
+    if (!OPS) return;
+    const K = {q: {days: 30}, data: null, preset: 'd30'};
+    const BLUE = '#2a78d6', INK2 = '#52514e', GRID = '#e2e8f0';
+    const RAMP = ['#cde2fb', '#b7d3f6', '#9ec5f4', '#86b6ef', '#6da7ec', '#5598e7', '#3987e5', '#2a78d6', '#256abf', '#1c5cab', '#184f95', '#104281', '#0d366b'];
+
+    // ---- hover tooltip shared by all charts
+    const tip = document.createElement('div');
+    tip.className = 'ops-tip';
+    document.body.appendChild(tip);
+    const moveTip = e => {
+        const t = e.target && e.target.closest ? e.target.closest('[data-tip]') : null;
+        if (!t || !t.closest('.ops-chart')) { tip.style.display = 'none'; return; }
+        tip.textContent = t.getAttribute('data-tip');
+        tip.style.display = 'block';
+        const x = Math.min(window.innerWidth - tip.offsetWidth - 8, e.clientX + 12);
+        tip.style.left = Math.max(4, x) + 'px';
+        tip.style.top = (e.clientY + 16) + 'px';
+    };
+    document.addEventListener('pointermove', moveTip);
+    document.addEventListener('pointerdown', moveTip);
+
+    function niceMax(v) {
+        if (!(v > 0)) return 1;
+        const p = Math.pow(10, Math.floor(Math.log10(v)));
+        for (const m of [1, 2, 2.5, 5, 10]) if (m * p >= v) return m * p;
+        return 10 * p;
+    }
+    const fmtN = v => OPS.num(v, v >= 100 ? 0 : 1);
+    function barPath(x, y, w, h, r) {
+        r = Math.min(r, w / 2, h);
+        if (h <= 0) return '';
+        return 'M' + x + ',' + (y + h) + 'V' + (y + r) + 'Q' + x + ',' + y + ' ' + (x + r) + ',' + y + 'H' + (x + w - r) + 'Q' + (x + w) + ',' + y + ' ' + (x + w) + ',' + (y + r) + 'V' + (y + h) + 'Z';
+    }
+    function hbarPath(x, y, w, h, r) {
+        r = Math.min(r, h / 2, w);
+        if (w <= 0) return '';
+        return 'M' + x + ',' + y + 'H' + (x + w - r) + 'Q' + (x + w) + ',' + y + ' ' + (x + w) + ',' + (y + r) + 'V' + (y + h - r) + 'Q' + (x + w) + ',' + (y + h) + ' ' + (x + w - r) + ',' + (y + h) + 'H' + x + 'Z';
+    }
+
+    // vertical bars over time: items [{label, value, tip}]
+    OPS.vbars = function (items, o) {
+        o = o || {};
+        const W = Math.round(Math.max(300, Math.min(900, o.w || 640))), H = 210, pl = 46, pr = 8, pt = 10, pb = 26, ih = H - pt - pb;
+        const vals = items.map(i => i.value || 0);
+        const max = niceMax(Math.max(o.min || 0, ...vals, 0));
+        const n = Math.max(1, items.length), bw = (W - pl - pr) / n, gap = Math.max(Math.min(2, bw * 0.25), bw - 34);
+        let s = '';
+        for (let k = 0; k <= 4; k++) {
+            const v = max * k / 4, y = pt + ih - ih * k / 4;
+            s += '<line x1="' + pl + '" x2="' + (W - pr) + '" y1="' + y + '" y2="' + y + '" stroke="' + GRID + '" stroke-width="1"/>' +
+                '<text x="' + (pl - 6) + '" y="' + (y + 3) + '" text-anchor="end" class="ops-ax">' + fmtN(v) + '</text>';
+        }
+        const every = Math.max(1, Math.ceil(n / 8));
+        items.forEach((it, i) => {
+            const x = pl + i * bw + gap / 2, w = Math.max(0.5, bw - gap), h = ih * (it.value || 0) / max, y = pt + ih - h;
+            s += '<path d="' + barPath(x, y, w, h, 4) + '" fill="' + (o.color || BLUE) + '"/>';
+            s += '<rect x="' + (pl + i * bw) + '" y="' + pt + '" width="' + bw + '" height="' + ih + '" fill="transparent" class="ops-hit" data-tip="' + OPS.esc(it.tip || (it.label + ': ' + fmtN(it.value))) + '"/>';
+            if (i % every === 0) s += '<text x="' + (pl + i * bw + bw / 2) + '" y="' + (H - 8) + '" text-anchor="middle" class="ops-ax">' + OPS.esc(it.label) + '</text>';
+        });
+        return '<svg class="ops-chart" viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="' + OPS.esc(o.aria || '') + '">' + s + '</svg>';
+    };
+
+    // line over time with an optional target line: items [{label, value|null, tip}]
+    OPS.vline = function (items, o) {
+        o = o || {};
+        const W = Math.round(Math.max(300, Math.min(900, o.w || 640))), H = 210, pl = 46, pr = 8, pt = 10, pb = 26, ih = H - pt - pb;
+        const vals = items.map(i => i.value).filter(v => v != null);
+        const lo = Math.min(o.floor != null ? o.floor : 0, ...(vals.length ? vals : [0]), o.target != null ? o.target - 2 : 100);
+        const min = Math.max(0, Math.floor(lo / 5) * 5), max = o.max || 100;
+        const n = Math.max(1, items.length), bw = (W - pl - pr) / n;
+        const Y = v => pt + ih - ih * (v - min) / Math.max(1e-9, max - min);
+        let s = '';
+        for (let k = 0; k <= 4; k++) {
+            const v = min + (max - min) * k / 4, y = Y(v);
+            s += '<line x1="' + pl + '" x2="' + (W - pr) + '" y1="' + y + '" y2="' + y + '" stroke="' + GRID + '"/>' +
+                '<text x="' + (pl - 6) + '" y="' + (y + 3) + '" text-anchor="end" class="ops-ax">' + fmtN(v) + '%</text>';
+        }
+        if (o.target != null) {
+            const y = Y(o.target);
+            s += '<line x1="' + pl + '" x2="' + (W - pr) + '" y1="' + y + '" y2="' + y + '" stroke="' + INK2 + '" stroke-dasharray="5 4" stroke-width="1.2"/>' +
+                '<text x="' + (W - pr) + '" y="' + (y - 4) + '" text-anchor="end" class="ops-ax ops-ax-strong">' + OPS.esc(OPS.tx('Target {p}%', {p: o.target})) + '</text>';
+        }
+        let path = '', pen = false;
+        const pts = [];
+        items.forEach((it, i) => {
+            const x = pl + i * bw + bw / 2;
+            if (it.value == null) { pen = false; return; }
+            const y = Y(it.value);
+            path += (pen ? 'L' : 'M') + x.toFixed(1) + ',' + y.toFixed(1);
+            pen = true;
+            pts.push([x, y]);
+        });
+        s += '<path d="' + path + '" fill="none" stroke="' + BLUE + '" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>';
+        if (pts.length <= 40) pts.forEach(p => { s += '<circle cx="' + p[0].toFixed(1) + '" cy="' + p[1].toFixed(1) + '" r="3.5" fill="' + BLUE + '" stroke="#fff" stroke-width="2"/>'; });
+        const every = Math.max(1, Math.ceil(n / 8));
+        items.forEach((it, i) => {
+            s += '<rect x="' + (pl + i * bw) + '" y="' + pt + '" width="' + bw + '" height="' + ih + '" fill="transparent" class="ops-hit" data-tip="' +
+                OPS.esc(it.tip || (it.label + ': ' + (it.value == null ? '—' : OPS.num(it.value, 2) + '%'))) + '"/>';
+            if (i % every === 0) s += '<text x="' + (pl + i * bw + bw / 2) + '" y="' + (H - 8) + '" text-anchor="middle" class="ops-ax">' + OPS.esc(it.label) + '</text>';
+        });
+        return '<svg class="ops-chart" viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="' + OPS.esc(o.aria || '') + '">' + s + '</svg>';
+    };
+
+    // horizontal bars per entity: items [{label, value, text, tip}]
+    OPS.hbars = function (items, o) {
+        o = o || {};
+        const W = Math.round(Math.max(300, Math.min(900, o.w || 640))), row = 24, pr = 58, pt = 6;
+        const pl = Math.round(Math.max(70, Math.min(W * 0.45, 10 + 6.7 * Math.max(4, ...items.map(i => String(i.label).length)))));
+        const H = pt * 2 + row * Math.max(1, items.length) + (o.target != null ? 14 : 0);
+        const max = o.max || niceMax(Math.max(...items.map(i => i.value || 0), 0));
+        const iw = W - pl - pr;
+        let s = '';
+        items.forEach((it, i) => {
+            const y = pt + i * row, w = iw * Math.max(0, it.value || 0) / max;
+            s += '<text x="' + (pl - 8) + '" y="' + (y + row / 2 + 4) + '" text-anchor="end" class="ops-ax ops-ax-strong">' + OPS.esc(it.label) + '</text>' +
+                '<path d="' + hbarPath(pl, y + 4, w, row - 8, 4) + '" fill="' + BLUE + '"/>' +
+                '<text x="' + (pl + w + 6) + '" y="' + (y + row / 2 + 4) + '" class="ops-ax">' + OPS.esc(it.text != null ? it.text : fmtN(it.value)) + '</text>' +
+                '<rect x="0" y="' + y + '" width="' + W + '" height="' + row + '" fill="transparent" class="ops-hit" data-tip="' + OPS.esc(it.tip || it.label) + '"/>';
+        });
+        if (o.target != null) {
+            const x = pl + iw * o.target / max;
+            s += '<line x1="' + x + '" x2="' + x + '" y1="' + pt + '" y2="' + (H - 14) + '" stroke="' + INK2 + '" stroke-dasharray="5 4" stroke-width="1.2"/>' +
+                '<text x="' + x + '" y="' + (H - 3) + '" text-anchor="middle" class="ops-ax ops-ax-strong">' + OPS.esc(OPS.tx('Target {p}%', {p: o.target})) + '</text>';
+        }
+        return '<svg class="ops-chart" viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="' + OPS.esc(o.aria || '') + '">' + s + '</svg>';
+    };
+
+    // weekday x hour heat map (sessions started)
+    OPS.heatmap = function (grid) {
+        const days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+        const W = Math.round(Math.max(300, Math.min(900, (arguments[1] || {}).w || 640))), pl = 40, pt = 4, cw = (W - pl - 4) / 24, ch = 20, H = pt + ch * 7 + 22;
+        const max = Math.max(1, ...grid.map(r => Math.max(...r)));
+        let s = '';
+        grid.forEach((r, d) => {
+            s += '<text x="' + (pl - 6) + '" y="' + (pt + d * ch + ch / 2 + 4) + '" text-anchor="end" class="ops-ax">' + OPS.esc(OPS.tx(days[d])) + '</text>';
+            r.forEach((v, h) => {
+                const col = v ? RAMP[Math.min(RAMP.length - 1, 2 + Math.round((RAMP.length - 3) * v / max))] : '#f1f5f9';
+                s += '<rect x="' + (pl + h * cw + 1) + '" y="' + (pt + d * ch + 1) + '" width="' + (cw - 2) + '" height="' + (ch - 2) + '" rx="3" fill="' + col +
+                    '" class="ops-hit" data-tip="' + OPS.esc(OPS.tx(days[d]) + ' ' + OPS.pad(h) + ':00 · ' + OPS.tx('{n} sessions', {n: v})) + '"/>';
+            });
+        });
+        for (let h = 0; h < 24; h += 3) s += '<text x="' + (pl + h * cw + cw / 2) + '" y="' + (H - 6) + '" text-anchor="middle" class="ops-ax">' + OPS.pad(h) + '</text>';
+        return '<svg class="ops-chart" viewBox="0 0 ' + W + ' ' + H + '" role="img">' + s + '</svg>' +
+            '<div class="ops-ramp"><span>' + OPS.t('fewer') + '</span>' + RAMP.slice(2).map(c => '<i style="background:' + c + '"></i>').join('') + '<span>' + OPS.t('more') + '</span></div>';
+    };
+
+    function monthStr(offset) {
+        const d = new Date(Date.now() + 6 * 3600 * 1000);
+        const m = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + (offset || 0), 1));
+        return m.getUTCFullYear() + '-' + OPS.pad(m.getUTCMonth() + 1);
+    }
+
+    function build(v) {
+        v.dataset.built = '1';
+        const presets = [['month', 'This month'], ['last', 'Last month'], ['d7', 'Last 7 days'], ['d30', 'Last 30 days']];
+        v.innerHTML =
+            '<section class="pay-panel ops-panel ops-kbar"><div class="ops-head"><h3 id="kTitle">' + OPS.t('📈 KPIs & reports') + '</h3>' +
+            '<div class="ops-actions ops-filters"><span class="ops-seg" id="kPresets">' + presets.map(p => '<button class="chip" data-p="' + p[0] + '">' + OPS.t(p[1]) + '</button>').join('') +
+            '</span><input class="tb-inp" type="month" id="kMonth" value="' + monthStr(0) + '">' +
+            '<button class="tb-btn" id="kXlsx">' + OPS.t('📥 Excel') + '</button><button class="tb-btn" id="kCsv">' + OPS.t('📥 CSV') + '</button>' +
+            '<button class="tb-btn primary" id="kPrint">' + OPS.t('🖨️ Report for DoST') + '</button></div></div>' +
+            '<div class="muted" id="kPeriod"></div></section>' +
+            '<section class="kpis ops-kpis" id="kTiles"></section>' +
+            '<div class="ops-charts">' +
+            ['kcEnergy:Energy per day (kWh)', 'kcSessions:Sessions per day', 'kcUptime:Network uptime per day', 'kcUpCp:Uptime by charger',
+                'kcHeat:When charging starts (sessions by hour)', 'kcEnCp:Energy by charger (kWh)'].map(x => {
+                const p = x.split(':');
+                return '<section class="pay-panel ops-panel ops-chartbox"><h4>' + OPS.t(p[1]) + '</h4><div id="' + p[0] + '"></div></section>';
+            }).join('') + '</div>' +
+            '<section class="pay-panel ops-panel"><div class="ops-head"><h3>' + OPS.t('🏢 Chargers report') + '</h3></div>' +
+            '<div class="ops-table-wrap"><table class="fleet-table ops-table ops-cards" id="kChargers"></table></div>' +
+            '<details><summary><b>' + OPS.t('Connectors') + '</b></summary><div class="ops-table-wrap"><table class="fleet-table ops-table" id="kConns"></table></div></details>' +
+            '<details id="kSessBox"><summary><b>' + OPS.t('Sessions') + '</b></summary><div class="ops-table-wrap ops-tall"><table class="fleet-table ops-table" id="kSess"></table></div></details>' +
+            '<details><summary><b>' + OPS.t('How the figures are calculated') + '</b></summary><div id="kDefs" class="pay-help"></div></details>' +
+            '<details id="kCfgBox"><summary><b>' + OPS.t('⚙️ KPI settings') + '</b></summary><div id="kCfg"></div></details></section>';
+        OPS.$('kPresets').onclick = e => {
+            const b = e.target.closest('[data-p]');
+            if (!b) return;
+            K.preset = b.dataset.p;
+            K.q = K.preset === 'month' ? {month: monthStr(0)} : K.preset === 'last' ? {month: monthStr(-1)} : {days: K.preset === 'd7' ? 7 : 30};
+            if (K.q.month) OPS.$('kMonth').value = K.q.month;
+            load();
+        };
+        OPS.$('kMonth').onchange = () => { K.preset = ''; K.q = {month: OPS.$('kMonth').value}; load(); };
+        OPS.$('kXlsx').onclick = () => { window.location.href = OPS.csvLink('/api/ops/report.xlsx', K.q); };
+        OPS.$('kCsv').onclick = () => { window.location.href = OPS.csvLink('/api/ops/report.csv', Object.assign({level: 'chargers'}, K.q)); };
+        OPS.$('kPrint').onclick = () => { window.open(OPS.csvLink('/ops/report/print', K.q), '_blank', 'noopener'); };
+        OPS.$('kSessBox').addEventListener('toggle', () => { if (OPS.$('kSessBox').open) loadSessions(); });
+        OPS.$('kCfgBox').addEventListener('toggle', () => { if (OPS.$('kCfgBox').open) loadCfg(); });
+        K.q = {days: 30};
+    }
+
+    async function load() {
+        document.querySelectorAll('#kPresets [data-p]').forEach(b => b.classList.toggle('active', b.dataset.p === K.preset));
+        try { K.data = await OPS.api(OPS.csvLink('/api/ops/kpi', K.q)); } catch (e) { return OPS.fail(e); }
+        render();
+        if (OPS.$('kSessBox').open) loadSessions();
+    }
+
+    function tile(cls, label, value, sub) {
+        return '<div class="kpi ' + cls + ' static"><span class="kpi-label">' + OPS.t(label) + '</span><span class="kpi-value">' + value +
+            '</span><span class="kpi-sub">' + (sub || '') + '</span></div>';
+    }
+
+    function render() {
+        const d = K.data, t = d.totals;
+        const lm = /^last (\d+) days$/.exec(d.period.label || '');
+        OPS.$('kPeriod').innerHTML = OPS.t('Period: {p} · until {u} (Bhutan Time) · data coverage {c}', {p: lm ? OPS.tx('last {n} days', {n: lm[1]}) : d.period.label,
+            u: OPS.fmt(d.period.until), c: t.coverage == null ? '—' : OPS.num(t.coverage, 1) + '%'});
+        const up = t.uptime == null ? '—' : OPS.num(t.uptime, 2) + '%';
+        const upCls = t.uptime == null ? 'info' : t.uptime >= t.target_uptime ? 'good' : 'warn';
+        OPS.$('kTiles').innerHTML =
+            tile(upCls, 'Network uptime', up, OPS.t('target {p}% · {n} below', {p: t.target_uptime, n: t.below_target})) +
+            tile('info', 'Energy delivered', OPS.num(t.kwh, 1) + ' <small>kWh</small>', OPS.t('{n} kWh per session', {n: t.avg_kwh == null ? '—' : OPS.num(t.avg_kwh, 1)})) +
+            tile('info', 'Charging sessions', OPS.num(t.sessions, 0), OPS.t('{n} users · {s} short', {n: t.users, s: t.short})) +
+            tile('info', 'Utilisation', OPS.num(t.util, 1) + '%', OPS.t('of connector time in use')) +
+            tile(t.outage_h > 0 ? 'warn' : 'good', 'Outage hours', OPS.num(t.outage_h, 1), OPS.t('{n} outages · {f} faults', {n: t.outages, f: t.faults})) +
+            tile('info', 'Prepaid revenue', OPS.esc(t.revenue.symbol) + ' ' + OPS.num(t.revenue.amount, 0), OPS.t('{n} payments', {n: t.revenue.payments})) +
+            tile('good', 'CO₂ avoided (estimate)', OPS.num(t.co2_kg / 1000, 2) + ' <small>t</small>', OPS.t('{km} electric km · {l} L petrol saved', {km: OPS.num(t.km, 0), l: OPS.num(t.petrol_l, 0)})) +
+            (d.extra_tiles || []).map(x => tile(x.cls || 'info', x.label, x.value, x.sub || '')).join('');
+        const lab = s => s.slice(5).replace('-', '/');
+        const wOf = id => { const el = OPS.$(id); return el && el.clientWidth ? el.clientWidth : 640; };
+        OPS.$('kcEnergy').innerHTML = OPS.vbars(d.daily.map(r => ({label: lab(r.day), value: r.kwh, tip: r.day + ' · ' + OPS.num(r.kwh, 1) + ' kWh'})), {aria: OPS.tx('Energy per day (kWh)'), w: wOf('kcEnergy')});
+        OPS.$('kcSessions').innerHTML = OPS.vbars(d.daily.map(r => ({label: lab(r.day), value: r.sessions, tip: r.day + ' · ' + OPS.tx('{n} sessions', {n: r.sessions})})), {aria: OPS.tx('Sessions per day'), w: wOf('kcSessions')});
+        OPS.$('kcUptime').innerHTML = OPS.vline(d.daily.map(r => ({label: lab(r.day), value: r.uptime})), {target: t.target_uptime, floor: 90, w: wOf('kcUptime')});
+        const upItems = d.chargers.filter(c => c.uptime != null).sort((a, b) => a.uptime - b.uptime).slice(0, 25)
+            .map(c => ({label: c.cp, value: c.uptime, text: OPS.num(c.uptime, 1) + '%', tip: c.cp + (c.name ? ' · ' + c.name : '') + ' · ' + OPS.num(c.uptime, 2) + '% · ' + OPS.tx('{h} outage hours', {h: c.outage_h})}));
+        OPS.$('kcUpCp').innerHTML = upItems.length ? OPS.hbars(upItems, {max: 100, target: t.target_uptime, w: wOf('kcUpCp')}) : '<div class="muted">' + OPS.t('No data yet') + '</div>';
+        OPS.$('kcHeat').innerHTML = OPS.heatmap(d.heatmap, {w: wOf('kcHeat')});
+        const enItems = d.chargers.filter(c => c.kwh > 0).sort((a, b) => b.kwh - a.kwh).slice(0, 25)
+            .map(c => ({label: c.cp, value: c.kwh, text: OPS.num(c.kwh, 1), tip: c.cp + ' · ' + OPS.num(c.kwh, 1) + ' kWh · ' + OPS.tx('{n} sessions', {n: c.sessions})}));
+        OPS.$('kcEnCp').innerHTML = enItems.length ? OPS.hbars(enItems, {w: wOf('kcEnCp')}) : '<div class="muted">' + OPS.t('No sessions in this period') + '</div>';
+        const td = OPS.td, pct = v => (v == null ? '—' : OPS.num(v, 2) + '%');
+        OPS.$('kChargers').innerHTML = '<thead><tr><th>' + OPS.t('Charger') + '</th><th>' + OPS.t('Uptime') + '</th><th>' + OPS.t('Outage hours') +
+            '</th><th>' + OPS.t('Sessions') + '</th><th>' + OPS.t('Energy kWh') + '</th><th>' + OPS.t('kWh per session') + '</th><th>' + OPS.t('Utilisation') +
+            '</th><th>' + OPS.t('Faults') + '</th><th>' + OPS.t('Coverage') + '</th></tr></thead><tbody>' + d.chargers.map(c => '<tr>' +
+            td('Charger', OPS.cpLabel(c.cp, c.name)) +
+            td('Uptime', '<b class="' + (c.uptime == null ? '' : c.uptime >= t.target_uptime ? 'ops-ok' : 'ops-bad') + '">' + pct(c.uptime) + '</b>') +
+            td('Outage hours', OPS.num(c.outage_h, 1) + ' <span class="muted">(' + c.outages + ')</span>') + td('Sessions', c.sessions) +
+            td('Energy kWh', OPS.num(c.kwh, 1)) + td('kWh per session', c.avg_kwh == null ? '—' : OPS.num(c.avg_kwh, 1)) +
+            td('Utilisation', OPS.num(c.util, 1) + '%') + td('Faults', c.faults) + td('Coverage', c.coverage == null ? '—' : OPS.num(c.coverage, 0) + '%') + '</tr>').join('') + '</tbody>';
+        OPS.$('kConns').innerHTML = '<thead><tr><th>' + OPS.t('Charger') + '</th><th>#</th><th>' + OPS.t('Uptime') + '</th><th>' + OPS.t('Outage hours') +
+            '</th><th>' + OPS.t('Excluded hours') + '</th><th>' + OPS.t('Sessions') + '</th><th>' + OPS.t('Energy kWh') + '</th><th>' + OPS.t('Utilisation') + '</th></tr></thead><tbody>' +
+            d.connectors.map(c => '<tr><td>' + OPS.esc(c.cp) + '</td><td>' + c.c + '</td><td>' + pct(c.uptime) + '</td><td>' + OPS.num(c.outage_h, 1) + '</td><td>' +
+                OPS.num(c.excluded_h, 1) + '</td><td>' + c.sessions + '</td><td>' + OPS.num(c.kwh, 1) + '</td><td>' + OPS.num(c.util, 1) + '%</td></tr>').join('') + '</tbody>';
+        OPS.$('kDefs').innerHTML = (d.definitions || []).map(x => '<p><b>' + OPS.t(x[0]) + '.</b> ' + OPS.esc(OPS.tx(x[1])) + '</p>').join('') +
+            (d.unavailable_counts_as_down ? '' : '<p>' + OPS.t('Unavailable time is currently not counted as downtime (Health › Detection settings).') + '</p>');
+    }
+
+    async function loadSessions() {
+        let j;
+        try { j = await OPS.api(OPS.csvLink('/api/ops/sessions', Object.assign({limit: 300}, K.q))); } catch (e) { return OPS.fail(e); }
+        OPS.$('kSess').innerHTML = '<thead><tr><th>' + OPS.t('Charger') + '</th><th>#</th><th>' + OPS.t('Start (BTT)') + '</th><th>' + OPS.t('Duration') +
+            '</th><th>' + OPS.t('Energy kWh') + '</th><th>' + OPS.t('Peak kW') + '</th><th>idTag</th><th>' + OPS.t('Stop reason') + '</th></tr></thead><tbody>' +
+            (j.items || []).map(s => '<tr><td>' + OPS.esc(s.cp) + '</td><td>' + s.c + '</td><td class="ops-nowrap">' + OPS.fmt(s.start) + '</td><td>' + OPS.dur(s.dur) +
+                '</td><td>' + OPS.num(s.kwh, 2) + (s.suspect ? ' ⚠️' : '') + '</td><td>' + OPS.num(s.max_kw, 1) + '</td><td>' + OPS.esc(s.tag) + '</td><td>' + OPS.esc(s.reason) + '</td></tr>').join('') +
+            '</tbody>' + ((j.total || 0) > (j.items || []).length ? '<caption class="muted">' + OPS.t('Showing {n} of {t} entries', {n: j.items.length, t: j.total}) + '</caption>' : '');
+    }
+
+    const CFG = {target_uptime: ['Uptime target', '%'], km_per_kwh: ['EV km per kWh', 'km'], petrol_co2_kg_per_km: ['Petrol car CO₂ per km', 'kg'],
+        petrol_km_per_litre: ['Petrol car km per litre', 'km'], grid_co2_kg_per_kwh: ['Grid CO₂ per kWh', 'kg'],
+        short_session_s: ['Short session: less than', 's'], short_session_kwh: ['… or less than', 'kWh']};
+    async function loadCfg() {
+        let j;
+        try { j = await OPS.api('/api/ops/kpi/config'); } catch (e) { return OPS.fail(e); }
+        const ro = OPS.can('config') ? '' : ' disabled';
+        OPS.$('kCfg').innerHTML = '<div class="ops-form ops-cfg">' + Object.keys(CFG).map(k => '<label>' + OPS.t(CFG[k][0]) +
+            '<span class="ops-inline"><input class="tb-inp" type="number" min="0" step="any" data-k="' + k + '" value="' + OPS.esc(j.config[k]) + '"' + ro +
+            '><span class="muted">' + OPS.esc(CFG[k][1]) + '</span></span></label>').join('') + '</div>' +
+            (OPS.can('config') ? '<div class="pay-form-row"><button class="tb-btn primary" id="kCfgSave">' + OPS.t('💾 Save settings') + '</button></div>' : '');
+        const b = OPS.$('kCfgSave');
+        if (b) b.onclick = async () => {
+            const body = {};
+            OPS.$('kCfg').querySelectorAll('[data-k]').forEach(i => { body[i.dataset.k] = i.value; });
+            try { await OPS.post('/api/ops/kpi/config', body); OPS.toast(OPS.tx('Saved'), 'success'); load(); } catch (e) { OPS.fail(e); }
+        };
+    }
+
+    OPS.register({tab: 'kpi', perm: 'view', every: 60,
+        show() { const v = OPS.$('view-kpi'); if (!v) return; if (!v.dataset.built) build(v); load(); },
+        refresh() { if (K.preset === 'month' || K.preset === 'd7' || K.preset === 'd30') load(); },
+        relang() { if (K.data) render(); }});
+
+    OPS.addI18n({
+        '📈 KPIs & reports': ['📈 KPI དང་སྙན་ཞུ་', '📈 KPI และรายงาน'], 'This month': ['', 'เดือนนี้'], 'Last month': ['', 'เดือนที่แล้ว'],
+        'Last 7 days': ['', '7 วันล่าสุด'], 'Last 30 days': ['', '30 วันล่าสุด'], '📥 Excel': ['', '📥 Excel'], '📥 CSV': ['', '📥 CSV'],
+        '🖨️ Report for DoST': ['', '🖨️ รายงานสำหรับ DoST'], 'Energy per day (kWh)': ['', 'พลังงานต่อวัน (kWh)'], 'Sessions per day': ['', 'จำนวนการชาร์จต่อวัน'],
+        'Network uptime per day': ['', 'ความพร้อมใช้งานของเครือข่ายรายวัน'], 'Uptime by charger': ['', 'ความพร้อมใช้งานรายตู้'],
+        'When charging starts (sessions by hour)': ['', 'ช่วงเวลาที่เริ่มชาร์จ (ตามชั่วโมง)'], 'Energy by charger (kWh)': ['', 'พลังงานรายตู้ (kWh)'],
+        '🏢 Chargers report': ['', '🏢 รายงานรายตู้'], 'Sessions': ['', 'การชาร์จ'], 'How the figures are calculated': ['', 'วิธีคำนวณตัวเลข'],
+        '⚙️ KPI settings': ['', '⚙️ ตั้งค่า KPI'], 'Period: {p} · until {u} (Bhutan Time) · data coverage {c}': ['', 'ช่วง: {p} · ถึง {u} (เวลาภูฏาน) · ความครอบคลุมข้อมูล {c}'],
+        'Network uptime': ['', 'ความพร้อมใช้งานของเครือข่าย'], 'target {p}% · {n} below': ['', 'เป้าหมาย {p}% · ต่ำกว่าเป้า {n} ตู้'],
+        'Energy delivered': ['', 'พลังงานที่จ่าย'], '{n} kWh per session': ['', '{n} kWh ต่อครั้ง'], 'Charging sessions': ['', 'จำนวนการชาร์จ'],
+        '{n} users · {s} short': ['', 'ผู้ใช้ {n} · สั้นผิดปกติ {s}'], 'Utilisation': ['', 'อัตราการใช้งาน'], 'of connector time in use': ['', 'ของเวลาหัวชาร์จที่ถูกใช้'],
+        'Outage hours': ['', 'ชั่วโมงที่ขัดข้อง'], '{n} outages · {f} faults': ['', 'ขัดข้อง {n} ครั้ง · fault {f} ครั้ง'], 'Prepaid revenue': ['', 'รายได้แบบเติมเงิน'],
+        '{n} payments': ['', '{n} รายการ'], 'CO₂ avoided (estimate)': ['', 'ลด CO₂ ได้ (ประมาณ)'], '{km} electric km · {l} L petrol saved': ['', 'วิ่งไฟฟ้า {km} กม. · ประหยัดน้ำมัน {l} ลิตร'],
+        'Target {p}%': ['', 'เป้าหมาย {p}%'], '{n} sessions': ['', '{n} ครั้ง'], '{h} outage hours': ['', 'ขัดข้อง {h} ชั่วโมง'], 'No data yet': ['', 'ยังไม่มีข้อมูล'],
+        'No sessions in this period': ['', 'ไม่มีการชาร์จในช่วงนี้'], 'Uptime': ['', 'ความพร้อมใช้งาน'], 'Energy kWh': ['', 'พลังงาน kWh'],
+        'kWh per session': ['', 'kWh ต่อครั้ง'], 'Faults': ['', 'Fault'], 'Coverage': ['', 'ความครอบคลุม'], 'Excluded hours': ['', 'ชั่วโมงที่ยกเว้น'],
+        'Start (BTT)': ['', 'เริ่ม (BTT)'], 'Duration': ['', 'ระยะเวลา'], 'Peak kW': ['', 'kW สูงสุด'], 'Stop reason': ['', 'เหตุผลที่หยุด'],
+        'fewer': ['', 'น้อย'], 'more': ['', 'มาก'], 'Mon': ['', 'จ.'], 'Tue': ['', 'อ.'], 'Wed': ['', 'พ.'], 'Thu': ['', 'พฤ.'], 'Fri': ['', 'ศ.'], 'Sat': ['', 'ส.'], 'Sun': ['', 'อา.'],
+        'Uptime target': ['', 'เป้าหมายความพร้อมใช้งาน'], 'EV km per kWh': ['', 'รถ EV วิ่งได้ (กม./kWh)'], 'Petrol car CO₂ per km': ['', 'CO₂ ของรถน้ำมันต่อ กม.'],
+        'Petrol car km per litre': ['', 'รถน้ำมันวิ่งได้ (กม./ลิตร)'], 'Grid CO₂ per kWh': ['', 'CO₂ ของไฟฟ้าต่อ kWh'], 'Short session: less than': ['', 'ชาร์จสั้นผิดปกติ: น้อยกว่า'],
+        '… or less than': ['', '… หรือน้อยกว่า'], 'Unavailable time is currently not counted as downtime (Health › Detection settings).': ['', 'ขณะนี้ไม่นับเวลา Unavailable เป็นเวลาหยุดทำงาน (สุขภาพเครือข่าย › ตั้งค่าการตรวจจับ)'],
+        'Time zone': ['', 'เขตเวลา'], 'last {n} days': ['', '{n} วันล่าสุด'], 'Short sessions': ['', 'การชาร์จสั้นผิดปกติ'], 'Sessions / energy': ['', 'การชาร์จ / พลังงาน']
+    });
+    Object.assign(OPS.actionLabels, {'/api/ops/kpi/config': 'KPI settings changed'});
+    OPS.addI18n({'KPI settings changed': ['', 'เปลี่ยนการตั้งค่า KPI']});
+})();
+''')
+
+
+# ---- [OPS] v1.4 alert engine: rules on health issues, acknowledge / resolve, escalation, email / Telegram / SMS / webhook
+OPS_FEATURES.append('alerts')
+ops_alerts = OpsDocStore('alerts', 'ops_alerts')
+OPS_NOTIFY = OpsEventLog('notify', 'ops_notify', keep_days=40)
+OPS_SEV_LABEL = {'critical': 'CRITICAL', 'major': 'MAJOR', 'minor': 'MINOR', 'info': 'INFO'}
+OPS_SEV_ICON = {'critical': '🔴', 'major': '🟠', 'minor': '🟡', 'info': '🔵'}
+OPS_ISSUE_TITLES = {'offline': 'Charger offline', 'heartbeat_missing': 'Heartbeat missing', 'faulted': 'Connector faulted',
+                    'error_code': 'Error code reported', 'unavailable': 'Connector unavailable', 'stuck_session': 'Stuck session',
+                    'meter_gap': 'Meter values missing', 'boot_loop': 'Reboot loop', 'flapping': 'Connection flapping',
+                    'not_accepted': 'Not accepted'}
+OPS_ALERT_RULES_DEFAULT = {
+    'offline': {'on': True, 'sev': 'major', 'delay_min': 0, 'notify': True, 'ticket': True},
+    'heartbeat_missing': {'on': True, 'sev': 'major', 'delay_min': 0, 'notify': True, 'ticket': False},
+    'faulted': {'on': True, 'sev': 'auto', 'delay_min': 0, 'notify': True, 'ticket': True},
+    'error_code': {'on': False, 'sev': 'minor', 'delay_min': 0, 'notify': False, 'ticket': False},
+    'unavailable': {'on': True, 'sev': 'minor', 'delay_min': 0, 'notify': False, 'ticket': False},
+    'stuck_session': {'on': True, 'sev': 'major', 'delay_min': 0, 'notify': True, 'ticket': False},
+    'meter_gap': {'on': False, 'sev': 'minor', 'delay_min': 0, 'notify': False, 'ticket': False},
+    'boot_loop': {'on': True, 'sev': 'major', 'delay_min': 0, 'notify': True, 'ticket': True},
+    'flapping': {'on': True, 'sev': 'minor', 'delay_min': 0, 'notify': False, 'ticket': False},
+    'not_accepted': {'on': False, 'sev': 'info', 'delay_min': 0, 'notify': False, 'ticket': False},
+}
+OPS_ALERT_ESC_DEFAULT = {
+    'levels': [{'after_min': 0, 'users': [], 'emails': '', 'phones': '', 'telegram': '', 'channels': ['email', 'telegram', 'sms', 'webhook']},
+               {'after_min': 30, 'users': [], 'emails': '', 'phones': '', 'telegram': '', 'channels': ['email', 'telegram', 'sms']},
+               {'after_min': 120, 'users': [], 'emails': '', 'phones': '', 'telegram': '', 'channels': ['email', 'telegram', 'sms']}],
+    'repeat_min': 0, 'notify_resolved': True, 'min_sev': 'major', 'public_url': '', 'keep_days': 90,
+}
+OPS_CHANNELS_DEFAULT = {
+    'email': {'on': False, 'host': '', 'port': 587, 'security': 'starttls', 'user': '', 'password': '', 'from': ''},
+    'telegram': {'on': False, 'token': '', 'api': 'https://api.telegram.org'},
+    'sms': {'on': False, 'method': 'POST', 'url': '', 'headers': '', 'body': '{"to": "{to}", "message": "{text}"}',
+            'content_type': 'application/json'},
+    'webhook': {'on': False, 'url': '', 'secret': ''},
+}
+OPS_CHANNEL_SECRETS = {'email': ['password'], 'telegram': ['token'], 'sms': ['headers'], 'webhook': ['secret']}
+for _p, _perm in (('/api/ops/alerts/ack', 'alerts'), ('/api/ops/alerts/resolve', 'alerts'), ('/api/ops/alerts/rules', 'config'),
+                  ('/api/ops/alerts/config', 'admin'), ('/api/ops/alerts/test', 'admin')):
+    ops_perm_rule('POST', _p, _perm)
+ops_perm_rule('GET', '/api/ops/alerts/config', 'config')
+OPS_TAB_PERMS['alerts'] = 'view'
+_OPS_ALERT_Q: Optional[asyncio.Queue] = None
+_OPS_SUPPRESSED: Dict[str, float] = {}          # issue id -> issue 'opened' time resolved by hand (no new alert for it)
+
+
+def ops_alert_rules() -> dict:
+    d = ops_cfg('alert_rules', {})
+    for k, v in OPS_ALERT_RULES_DEFAULT.items():
+        r = d.setdefault(k, dict(v))
+        for kk, vv in v.items():
+            r.setdefault(kk, vv)
+    return d
+
+
+def ops_alert_esc() -> dict:
+    d = ops_cfg('alert_escalation', OPS_ALERT_ESC_DEFAULT)
+    if not isinstance(d.get('levels'), list) or not d['levels']:
+        d['levels'] = json.loads(json.dumps(OPS_ALERT_ESC_DEFAULT['levels']))
+    return d
+
+
+def ops_alert_channels() -> dict:
+    d = ops_cfg('alert_channels', {})
+    for k, v in OPS_CHANNELS_DEFAULT.items():
+        c = d.setdefault(k, dict(v))
+        for kk, vv in v.items():
+            c.setdefault(kk, vv)
+    return d
+
+
+def ops_next_id(prefix: str) -> str:
+    seq = ops_cfg('_seq', {})
+    seq[prefix] = int(seq.get(prefix) or 0) + 1
+    return f"{prefix}-{ops_dt().strftime('%y%m')}-{seq[prefix]:04d}"
+
+
+def ops_public_url() -> str:
+    return (ops_alert_esc().get('public_url') or os.environ.get('CSMS_PUBLIC_URL') or '').strip().rstrip('/')
+
+
+def _ops_mask_to(channel: str, to: str) -> str:
+    to = str(to or '')
+    if channel == 'email' and '@' in to:
+        name, dom = to.split('@', 1)
+        return (name[:2] + '***@' + dom) if len(name) > 2 else ('***@' + dom)
+    if channel in ('sms', 'telegram') and len(to) > 4:
+        return to[:4] + '***' + to[-3:]
+    return to[:40]
+
+
+# ---- engine ---------------------------------------------------------------------------------------------------------
+def _ops_alert_sev(iss: dict, rule: dict) -> str:
+    sev = rule.get('sev') or 'auto'
+    return iss.get('sev', 'major') if sev == 'auto' else sev
+
+
+def ops_alert_text(a: dict, kind: str = 'open', now: float = None) -> tuple:
+    now = now or ops_now()
+    where = a['cp'] + (f" #{a['conn']}" if a.get('conn') else '')
+    name = ops_cp_name(a['cp'])
+    if kind == 'resolved':
+        subject = f"[BPC CSMS] RESOLVED {where} - {a['title']}"
+        body = (f"✅ RESOLVED · {where}{' · ' + name if name else ''} · {a['title']}\n"
+                f"after {ops_dur_text((a.get('resolved_at') or now) - a['opened'])} · {a['id']}")
+        return subject, body
+    tag = {'escalate': ' (escalated)', 'repeat': ' (reminder)', 'test': ''}.get(kind, '')
+    subject = f"[BPC CSMS] {OPS_SEV_LABEL.get(a['sev'], a['sev'])}{tag} {where} - {a['title']}"
+    lines = [f"{OPS_SEV_ICON.get(a['sev'], '')} {OPS_SEV_LABEL.get(a['sev'], '')}{tag} · {where}{' · ' + name if name else ''}",
+             f"{a['title']}: {a.get('text', '')}"]
+    if a.get('hint'):
+        lines.append('What to do: ' + a['hint'])
+    lines.append(f"Since {ops_dt(a.get('since') or a['opened']).strftime('%Y-%m-%d %H:%M')} BTT · {a['id']}")
+    url = ops_public_url()
+    if url:
+        lines.append(f'Open: {url}/#alerts')
+    return subject, '\n'.join(lines)
+
+
+def _ops_alert_new(iss: dict, rule: dict, now: float) -> dict:
+    hint = ''
+    if iss['kind'] in ('faulted', 'error_code'):
+        inf = ops_error_info(iss['vars'].get('code'), iss['vars'].get('ve'), (OPS_CP.get(iss['cp']) or {}).get('vendor'))
+        hint = inf.get('vendor_action') or inf.get('action') or ''
+    a = {'id': ops_next_id('A'), 'key': iss['id'], 'kind': iss['kind'], 'cp': iss['cp'], 'conn': iss['conn'],
+         'sev': _ops_alert_sev(iss, rule), 'title': OPS_ISSUE_TITLES.get(iss['kind'], iss['kind']), 'text': ops_issue_text(iss, now),
+         'msg': iss.get('msg'), 'vars': iss.get('vars') or {}, 'hint': hint, 'since': iss.get('since') or now,
+         'issue_opened': iss.get('opened') or now, 'opened': now, 'state': 'open', 'level': 0, 'last_notify': 0,
+         'notify': bool(rule.get('notify')), 'history': [{'t': round(now), 'by': 'system', 'what': 'opened'}], 'sent': []}
+    return a
+
+
+def _ops_alert_queue(job: dict):
+    if _OPS_ALERT_Q is not None:
+        try:
+            _OPS_ALERT_Q.put_nowait(job)
+        except Exception as e:
+            logger.error(f"ops: alert queue full ({e})")
+
+
+def _ops_sev_ok(sev: str) -> bool:
+    return OPS_SEV_ORDER.get(sev, 9) <= OPS_SEV_ORDER.get(ops_alert_esc().get('min_sev') or 'major', 1)
+
+
+@ops_on('issues')
+def ops_alert_sync(issues=None, now=None, **kw):
+    now = now or ops_now()
+    rules, esc = ops_alert_rules(), ops_alert_esc()
+    changed = False
+    open_by_key = {a['key']: a for a in ops_alerts.data.values() if a.get('state') in ('open', 'acked')}
+    for iid, iss in (issues or {}).items():
+        rule = rules.get(iss['kind']) or {}
+        if not rule.get('on') or iid in open_by_key:
+            if iid in open_by_key:                         # keep the text / duration of a live alert current
+                open_by_key[iid]['text'] = ops_issue_text(iss, now)
+                open_by_key[iid]['notify'] = bool(rule.get('notify'))   # rule changes apply to open alerts too
+            continue
+        if _OPS_SUPPRESSED.get(iid) == iss.get('opened'):
+            continue
+        if now - (iss.get('opened') or now) < float(rule.get('delay_min') or 0) * 60:
+            continue
+        a = _ops_alert_new(iss, rule, now)
+        ops_alerts.data[a['id']] = a
+        open_by_key[iid] = a
+        changed = True
+        ops_emit('alert_open', alert=a)
+    for a in list(open_by_key.values()):
+        if a['key'] not in (issues or {}):
+            a.update(state='resolved', resolved_at=round(now, 1), resolved_by='system')
+            a['history'].append({'t': round(now), 'by': 'system', 'what': 'resolved', 'note': 'condition cleared'})
+            changed = True
+            ops_emit('alert_resolved', alert=a)
+            if a.get('notify') and a.get('sent') and esc.get('notify_resolved', True):
+                _ops_alert_queue({'alert': a['id'], 'kind': 'resolved', 'level': max(0, a.get('level', 1) - 1)})
+            continue
+        if not a.get('notify') or not _ops_sev_ok(a['sev']):
+            continue
+        levels = esc.get('levels') or []
+        if a['state'] == 'open':
+            for i, lv in enumerate(levels):
+                if i >= a.get('level', 0) and now - a['opened'] >= float(lv.get('after_min') or 0) * 60:
+                    a['level'] = i + 1
+                    a['last_notify'] = now
+                    a['history'].append({'t': round(now), 'by': 'system', 'what': 'notified' if i == 0 else 'escalated', 'note': f'level {i + 1}'})
+                    _ops_alert_queue({'alert': a['id'], 'kind': 'open' if i == 0 else 'escalate', 'level': i})
+                    changed = True
+            rep = float(esc.get('repeat_min') or 0)
+            if rep > 0 and a.get('level') and now - (a.get('last_notify') or now) >= rep * 60:
+                a['last_notify'] = now
+                _ops_alert_queue({'alert': a['id'], 'kind': 'repeat', 'level': a['level'] - 1})
+                changed = True
+    if changed:
+        _ops_alerts_prune(now)
+        ops_alerts.save()
+
+
+def _ops_alerts_prune(now: float):
+    keep = float(ops_alert_esc().get('keep_days') or 90) * 86400
+    old = [k for k, a in ops_alerts.data.items() if a.get('state') == 'resolved' and now - (a.get('resolved_at') or now) > keep]
+    for k in old:
+        ops_alerts.data.pop(k, None)
+    done = sorted((a for a in ops_alerts.data.values() if a.get('state') == 'resolved'), key=lambda a: a.get('resolved_at') or 0)
+    for a in done[:max(0, len(done) - 3000)]:
+        ops_alerts.data.pop(a['id'], None)
+
+
+# ---- delivery -------------------------------------------------------------------------------------------------------
+def _ops_split(s) -> List[str]:
+    if isinstance(s, list):
+        return [str(x).strip() for x in s if str(x).strip()]
+    return [x.strip() for x in _ops_re.split(r'[,;\s]+', str(s or '')) if x.strip()]
+
+
+def ops_level_targets(level: dict) -> dict:
+    out = {'email': [], 'sms': [], 'telegram': []}
+    for uname in level.get('users') or []:
+        u = ops_users.data.get(uname) or {}
+        if u.get('disabled'):
+            continue
+        if u.get('email'):
+            out['email'].append(u['email'])
+        if u.get('phone'):
+            out['sms'].append(u['phone'])
+        if u.get('telegram'):
+            out['telegram'].append(u['telegram'])
+    out['email'] += _ops_split(level.get('emails'))
+    out['sms'] += _ops_split(level.get('phones'))
+    out['telegram'] += _ops_split(level.get('telegram'))
+    return {k: list(dict.fromkeys(v)) for k, v in out.items()}
+
+
+def _ops_send_email_sync(cfg: dict, to: List[str], subject: str, text: str):
+    import smtplib
+    import ssl
+    from email.message import EmailMessage
+    msg = EmailMessage()
+    msg['Subject'] = subject
+    msg['From'] = cfg.get('from') or cfg.get('user') or 'csms@localhost'
+    msg['To'] = ', '.join(to)
+    msg.set_content(text)
+    sec = cfg.get('security') or 'starttls'
+    port = int(cfg.get('port') or (465 if sec == 'ssl' else 587))
+    ctx = ssl.create_default_context()
+    if sec == 'ssl':
+        s = smtplib.SMTP_SSL(cfg['host'], port, timeout=20, context=ctx)
+    else:
+        s = smtplib.SMTP(cfg['host'], port, timeout=20)
+        s.ehlo()
+        if sec == 'starttls':
+            s.starttls(context=ctx)
+            s.ehlo()
+    try:
+        if cfg.get('user'):
+            s.login(cfg['user'], cfg.get('password') or '')
+        s.send_message(msg)
+    finally:
+        try:
+            s.quit()
+        except Exception:
+            pass
+
+
+async def _ops_http(method: str, url: str, **kw):
+    import aiohttp
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as sess:
+        async with sess.request(method, url, **kw) as r:
+            body = (await r.text())[:300]
+            if r.status >= 300:
+                raise RuntimeError(f'HTTP {r.status}: {body}')
+            return body
+
+
+async def ops_send(channel: str, to: str, subject: str, text: str, payload: dict = None):
+    """Send one message; raises on failure. 'to' = email list (comma) / phone / chat id / '' for the webhook."""
+    ch = ops_alert_channels().get(channel) or {}
+    if channel == 'email':
+        if not ch.get('host'):
+            raise RuntimeError('SMTP server not set')
+        await asyncio.to_thread(_ops_send_email_sync, ch, _ops_split(to), subject, text)
+    elif channel == 'telegram':
+        if not ch.get('token'):
+            raise RuntimeError('Telegram bot token not set')
+        api = (ch.get('api') or 'https://api.telegram.org').rstrip('/')
+        await _ops_http('POST', f"{api}/bot{ch['token']}/sendMessage", json={'chat_id': to, 'text': text, 'disable_web_page_preview': True})
+    elif channel == 'sms':
+        if not ch.get('url'):
+            raise RuntimeError('SMS gateway URL not set')
+        from urllib.parse import quote
+        url = ch['url'].replace('{to}', quote(str(to))).replace('{text}', quote(text))
+        headers = {}
+        raw_h = (ch.get('headers') or '').strip()
+        if raw_h:
+            try:
+                headers = {str(k): str(v) for k, v in json.loads(raw_h).items()}
+            except (ValueError, AttributeError):
+                for line in raw_h.splitlines():
+                    if ':' in line:
+                        k, v = line.split(':', 1)
+                        headers[k.strip()] = v.strip()
+        method = (ch.get('method') or 'POST').upper()
+        if method == 'GET':
+            await _ops_http('GET', url, headers=headers)
+        else:
+            body = (ch.get('body') or '').replace('{to}', json.dumps(str(to))[1:-1]).replace('{text}', json.dumps(text)[1:-1])
+            headers.setdefault('Content-Type', ch.get('content_type') or 'application/json')
+            await _ops_http('POST', url, data=body.encode('utf-8'), headers=headers)
+    elif channel == 'webhook':
+        if not ch.get('url'):
+            raise RuntimeError('Webhook URL not set')
+        import hmac as _h
+        import hashlib as _hl
+        data = json.dumps(payload or {'text': text, 'subject': subject}, ensure_ascii=False, default=str).encode('utf-8')
+        headers = {'Content-Type': 'application/json'}
+        if ch.get('secret'):
+            headers['X-CSMS-Signature'] = 'sha256=' + _h.new(ch['secret'].encode('utf-8'), data, _hl.sha256).hexdigest()
+        await _ops_http('POST', ch['url'], data=data, headers=headers)
+    else:
+        raise RuntimeError('unknown channel')
+
+
+async def _ops_deliver(job: dict):
+    a = ops_alerts.data.get(job.get('alert'))
+    if not a:
+        return
+    esc, chans = ops_alert_esc(), ops_alert_channels()
+    levels = esc.get('levels') or []
+    lv = levels[min(int(job.get('level') or 0), len(levels) - 1)] if levels else {}
+    targets = ops_level_targets(lv)
+    subject, text = ops_alert_text(a, job.get('kind', 'open'))
+    sends = []
+    for channel in lv.get('channels') or []:
+        if not (chans.get(channel) or {}).get('on'):
+            continue
+        if channel == 'email' and targets['email']:
+            sends.append((channel, ', '.join(targets['email'])))
+        elif channel in ('sms', 'telegram'):
+            sends += [(channel, t) for t in targets[channel]]
+        elif channel == 'webhook':
+            sends.append((channel, ''))
+    payload = {'event': 'alert_' + job.get('kind', 'open'), 'alert': {k: a.get(k) for k in ('id', 'kind', 'cp', 'conn', 'sev', 'title', 'text', 'state', 'opened', 'level')}}
+    for channel, to in sends:
+        ok, err = True, ''
+        try:
+            await ops_send(channel, to, subject, text, payload)
+        except Exception as e:
+            ok, err = False, str(e)[:200]
+            logger.warning(f"ops: {channel} notification for {a['id']} failed: {err}")
+        rec = {'alert': a['id'], 'cp': a['cp'], 'kind': job.get('kind'), 'level': int(job.get('level') or 0) + 1, 'channel': channel,
+               'to': ', '.join(_ops_mask_to(channel, x) for x in _ops_split(to)) if to else channel, 'ok': ok}
+        if err:
+            rec['err'] = err
+        OPS_NOTIFY.add(rec)
+        a.setdefault('sent', []).append({'t': round(ops_now()), 'channel': channel, 'ok': ok, 'level': rec['level'], 'kind': job.get('kind')})
+        a['sent'] = a['sent'][-40:]
+    if not sends:
+        OPS_NOTIFY.add({'alert': a['id'], 'cp': a['cp'], 'kind': job.get('kind'), 'level': int(job.get('level') or 0) + 1,
+                        'channel': '-', 'to': '', 'ok': False, 'err': 'no recipients / channels configured for this level'})
+        a.setdefault('sent', []).append({'t': round(ops_now()), 'channel': 'none', 'ok': False, 'level': int(job.get('level') or 0) + 1, 'kind': job.get('kind')})
+        a['sent'] = a['sent'][-40:]
+    ops_alerts.save()
+
+
+async def ops_alert_worker():
+    global _OPS_ALERT_Q
+    _OPS_ALERT_Q = asyncio.Queue(maxsize=5000)
+    while True:
+        job = await _OPS_ALERT_Q.get()
+        try:
+            await _ops_deliver(job)
+        except Exception as e:
+            logger.error(f"ops: alert delivery failed: {e}")
+
+
+OPS_TASKS.append(ops_alert_worker)
+
+
+# ---- API ------------------------------------------------------------------------------------------------------------
+def _ops_alert_public(a: dict, now: float) -> dict:
+    d = {k: v for k, v in a.items() if k not in ('key',)}
+    d['name'] = ops_cp_name(a['cp'])
+    if a.get('state') in ('open', 'acked'):
+        live = OPS_ISSUES.get(a['key'])
+        if live:
+            d['text'] = ops_issue_text(live, now)
+    return d
+
+
+async def ops_api_alerts(request):
+    q = request.query
+    now = ops_now()
+    days = ops_int(q.get('days'), 7, 1, 400)
+    items = [a for a in ops_alerts.data.values()
+             if a.get('state') in ('open', 'acked') or (a.get('resolved_at') or 0) >= now - days * 86400]
+    items.sort(key=lambda a: (a.get('state') == 'resolved', OPS_SEV_ORDER.get(a.get('sev'), 9), -(a.get('opened') or 0)))
+    log = OPS_NOTIFY.query(now - days * 86400, now + 1, None, 200, True)
+    t_day = ops_day_start(ops_dt(now).strftime('%Y-%m-%d'))
+    today = [n for n in log if n['t'] >= t_day]
+    act = [a for a in items if a.get('state') in ('open', 'acked')]
+    counts = {'open': len(act), 'unacked': sum(1 for a in act if a['state'] == 'open'),
+              'critical': sum(1 for a in act if a['sev'] == 'critical'), 'escalated': sum(1 for a in act if (a.get('level') or 0) >= 2),
+              'sent_today': sum(1 for n in today if n.get('ok')), 'failed_today': sum(1 for n in today if not n.get('ok'))}
+    return ops_json({'now': now, 'alerts': [_ops_alert_public(a, now) for a in items[:ops_int(q.get('limit'), 500, 1, 5000)]],
+                     'counts': counts, 'log': log})
+
+
+async def ops_api_alerts_summary(request):
+    act = [a for a in ops_alerts.data.values() if a.get('state') in ('open', 'acked')]
+    newest = sorted((a for a in act if a['state'] == 'open'), key=lambda a: -a['opened'])[:5]
+    return ops_json({'open': len(act), 'unacked': sum(1 for a in act if a['state'] == 'open'),
+                     'critical': sum(1 for a in act if a['sev'] == 'critical' and a['state'] == 'open'),
+                     'newest': [{'id': a['id'], 'sev': a['sev'], 'cp': a['cp'], 'title': a['title'], 'opened': a['opened']} for a in newest]})
+
+
+async def _ops_alert_action(request, what: str):
+    d = await ops_body(request)
+    a = ops_alerts.data.get(str(d.get('id') or ''))
+    if not a:
+        return ops_err('No such alert', 404)
+    me = ops_request_user(request).get('username', '?')
+    now = ops_now()
+    note = str(d.get('note') or '').strip()[:300]
+    if what == 'ack':
+        if a['state'] != 'open':
+            return ops_err('Only open alerts can be acknowledged', 409)
+        a.update(state='acked', acked_by=me, acked_at=round(now, 1))
+    else:
+        if a['state'] == 'resolved':
+            return ops_err('Already resolved', 409)
+        a.update(state='resolved', resolved_by=me, resolved_at=round(now, 1))
+        live = OPS_ISSUES.get(a['key'])
+        if live:
+            _OPS_SUPPRESSED[a['key']] = live.get('opened')
+        ops_emit('alert_resolved', alert=a)
+    a['history'].append({'t': round(now), 'by': me, 'what': 'acknowledged' if what == 'ack' else 'resolved', 'note': note})
+    ops_alerts.save()
+    return ops_json({'ok': True, 'alert': _ops_alert_public(a, now)})
+
+
+async def ops_api_alerts_ack(request):
+    return await _ops_alert_action(request, 'ack')
+
+
+async def ops_api_alerts_resolve(request):
+    return await _ops_alert_action(request, 'resolve')
+
+
+def _ops_channels_public() -> dict:
+    out = {}
+    for k, v in ops_alert_channels().items():
+        c = dict(v)
+        for s in OPS_CHANNEL_SECRETS.get(k, []):
+            c[s + '_set'] = bool(c.get(s))
+            c[s] = ''
+        if k == 'sms' and c.get('url') and '?' in c['url']:
+            c['url'] = c['url'].split('?', 1)[0] + '?***'
+        out[k] = c
+    return out
+
+
+async def ops_api_alerts_config(request):
+    if request.method == 'POST':
+        d = await ops_body(request)
+        if isinstance(d.get('escalation'), dict):
+            e, cur = d['escalation'], ops_alert_esc()
+            levels = []
+            for lv in (e.get('levels') or [])[:5]:
+                levels.append({'after_min': max(0.0, float(lv.get('after_min') or 0)),
+                               'users': [str(u) for u in (lv.get('users') or []) if str(u) in ops_users.data][:50],
+                               'emails': str(lv.get('emails') or '')[:1000], 'phones': str(lv.get('phones') or '')[:1000],
+                               'telegram': str(lv.get('telegram') or '')[:1000],
+                               'channels': [c for c in (lv.get('channels') or []) if c in OPS_CHANNELS_DEFAULT]})
+            if levels:
+                cur['levels'] = levels
+            for k in ('repeat_min', 'keep_days'):
+                if k in e:
+                    cur[k] = max(0.0, float(e.get(k) or 0))
+            if 'notify_resolved' in e:
+                cur['notify_resolved'] = bool(e['notify_resolved'])
+            if e.get('min_sev') in OPS_SEV_ORDER:
+                cur['min_sev'] = e['min_sev']
+            if 'public_url' in e:
+                cur['public_url'] = str(e.get('public_url') or '').strip()[:200]
+        if isinstance(d.get('channels'), dict):
+            chans = ops_alert_channels()
+            for name, vals in d['channels'].items():
+                if name not in chans or not isinstance(vals, dict):
+                    continue
+                c = chans[name]
+                for k, v in vals.items():
+                    if k not in OPS_CHANNELS_DEFAULT[name]:
+                        continue
+                    if k in OPS_CHANNEL_SECRETS.get(name, []):
+                        if vals.get(k + '_clear'):
+                            c[k] = ''
+                        elif v:
+                            c[k] = str(v)[:2000]            # empty = keep the stored secret
+                    elif k == 'on':
+                        c[k] = bool(v)
+                    elif name == 'sms' and k == 'url' and str(v or '').endswith('?***'):
+                        continue                               # the masked address came back unchanged
+                    elif k == 'port':
+                        c[k] = ops_int(v, 587, 1, 65535)
+                    else:
+                        c[k] = str(v or '').strip()[:2000]
+                for s in OPS_CHANNEL_SECRETS.get(name, []):
+                    if vals.get(s + '_clear'):
+                        c[s] = ''
+        ops_settings.save()
+    out = {'rules': ops_alert_rules(), 'titles': OPS_ISSUE_TITLES}
+    if 'admin' in ops_role_perms(ops_request_user(request).get('role') or 'viewer'):
+        users = [{'username': n, 'name': u.get('name') or n, 'role': u.get('role'), 'email': bool(u.get('email')),
+                  'phone': bool(u.get('phone')), 'telegram': bool(u.get('telegram'))} for n, u in sorted(ops_users.data.items()) if not u.get('disabled')]
+        out.update(escalation=ops_alert_esc(), channels=_ops_channels_public(), users=users,
+                   public_url_env=bool(os.environ.get('CSMS_PUBLIC_URL')))
+    return ops_json(out)
+
+
+async def ops_api_alerts_rules(request):
+    d = await ops_body(request)
+    rules = ops_alert_rules()
+    for kind, vals in (d.get('rules') or {}).items():
+        if kind not in rules or not isinstance(vals, dict):
+            continue
+        r = rules[kind]
+        for k in ('on', 'notify', 'ticket'):
+            if k in vals:
+                r[k] = bool(vals[k])
+        if vals.get('sev') in ('auto', 'critical', 'major', 'minor', 'info'):
+            r['sev'] = vals['sev']
+        if 'delay_min' in vals:
+            try:
+                r['delay_min'] = max(0.0, float(vals['delay_min']))
+            except (TypeError, ValueError):
+                return ops_err('Not a number: delay')
+    ops_settings.save()
+    return ops_json({'ok': True, 'rules': rules})
+
+
+async def ops_api_alerts_test(request):
+    d = await ops_body(request)
+    channel = str(d.get('channel') or '')
+    to = str(d.get('to') or '').strip()
+    if channel not in OPS_CHANNELS_DEFAULT:
+        return ops_err('Unknown channel')
+    if channel != 'webhook' and not to:
+        return ops_err('Enter where to send the test')
+    subject = '[BPC CSMS] Test message'
+    text = f"✅ Test message from the BPC CSMS ({ops_dt().strftime('%Y-%m-%d %H:%M')} BTT). Alerts will arrive like this."
+    ok, err = True, ''
+    try:
+        await ops_send(channel, to, subject, text, {'event': 'test', 'text': text})
+    except Exception as e:
+        ok, err = False, str(e)[:300]
+    OPS_NOTIFY.add({'alert': 'test', 'cp': '', 'kind': 'test', 'level': 0, 'channel': channel,
+                    'to': ', '.join(_ops_mask_to(channel, x) for x in _ops_split(to)) if to else channel, 'ok': ok, **({'err': err} if err else {})})
+    return ops_json({'ok': ok, 'error': err}, status=200 if ok else 502)
+
+
+OPS_ROUTES += [
+    ('GET', '/api/ops/alerts', ops_api_alerts), ('GET', '/api/ops/alerts/summary', ops_api_alerts_summary),
+    ('POST', '/api/ops/alerts/ack', ops_api_alerts_ack), ('POST', '/api/ops/alerts/resolve', ops_api_alerts_resolve),
+    ('GET', '/api/ops/alerts/config', ops_api_alerts_config), ('POST', '/api/ops/alerts/config', ops_api_alerts_config),
+    ('POST', '/api/ops/alerts/rules', ops_api_alerts_rules), ('POST', '/api/ops/alerts/test', ops_api_alerts_test),
+]
+
+OPS_CSS_PARTS.append(r'''/* [OPS] v1.4 alerts */
+.ops-level, .ops-chgrid fieldset { border: 1px solid var(--border); border-radius: 10px; padding: 0.5rem 0.8rem 0.7rem; margin: 0.6rem 0; }
+.ops-level legend, .ops-chgrid legend { font-weight: 700; font-size: 0.8rem; padding: 0 0.3rem; }
+.ops-chips { display: flex; flex-wrap: wrap; gap: 0.3rem 0.8rem; font-weight: 500; }
+.ops-chgrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 1rem; }
+.ops-num { width: 90px; }
+.tb-btn.primary.ops-mini { color: #fff; }
+@media (max-width: 900px) { .ops-chgrid { grid-template-columns: 1fr; } }
+''')
+OPS_JS_PARTS.append(r'''/* [OPS] 🔔 Alerts tab (v1.4): active alerts, acknowledge / resolve, notification log, rules, escalation, channels */
+(function () {
+    'use strict';
+    const OPS = window.OPS;
+    if (!OPS) return;
+    const A = {data: null, cfg: null, seen: null};
+    const CH = {email: '📧 Email', telegram: '✈️ Telegram', sms: '💬 SMS', webhook: '🔗 Webhook'};
+    const SEC = 'class="tb-inp db-secret" type="text" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" data-lpignore="true" data-1p-ignore';
+
+    function build(v) {
+        v.dataset.built = '1';
+        v.innerHTML =
+            '<section class="kpis ops-kpis">' + OPS.kpi('warn', 'Open alerts', 'aKpiOpen', '') + OPS.kpi('warn', 'Not acknowledged', 'aKpiUnack', '') +
+            OPS.kpi('warn', 'Critical', 'aKpiCrit', 'open now') + OPS.kpi('info', 'Escalated', 'aKpiEsc', 'level 2 or higher') +
+            OPS.kpi('good', 'Notifications today', 'aKpiSent', '') + '</section>' +
+            '<section class="pay-panel ops-panel"><div class="ops-head"><h3>' + OPS.t('🔔 Active alerts') + '</h3><div class="ops-actions">' +
+            '<button class="tb-btn" id="alReload">' + OPS.t('🔄 Refresh') + '</button></div></div>' +
+            '<div class="ops-table-wrap"><table class="fleet-table ops-table ops-cards" id="alActive"></table></div></section>' +
+            '<section class="pay-panel ops-panel"><div class="ops-head"><h3>' + OPS.t('✅ Resolved (7 days)') + '</h3></div>' +
+            '<div class="ops-table-wrap ops-tall"><table class="fleet-table ops-table" id="alDone"></table></div></section>' +
+            '<section class="pay-panel ops-panel"><div class="ops-head"><h3>' + OPS.t('📨 Notification log') + '</h3></div>' +
+            '<div class="ops-table-wrap ops-tall"><table class="fleet-table ops-table" id="alLog"></table></div></section>' +
+            '<section class="pay-panel ops-panel" id="alCfgBox"><details id="alRulesBox"><summary><b>' + OPS.t('📏 Alert rules') + '</b></summary><div id="alRules"></div></details>' +
+            '<details id="alEscBox"><summary><b>' + OPS.t('📶 Escalation & recipients') + '</b></summary><div id="alEsc"></div></details>' +
+            '<details id="alChBox"><summary><b>' + OPS.t('📡 Channels (email, Telegram, SMS, webhook)') + '</b></summary><div id="alCh"></div></details></section>';
+        OPS.$('alReload').onclick = load;
+        ['alRulesBox', 'alEscBox', 'alChBox'].forEach(id => OPS.$(id).addEventListener('toggle', () => { if (OPS.$(id).open) loadCfg(); }));
+        OPS.$('alCfgBox').style.display = OPS.can('config') ? '' : 'none';
+        v.addEventListener('click', e => {
+            const b = e.target.closest('[data-aact]');
+            if (b) act(b.dataset.aact, b.dataset.id);
+            const tst = e.target.closest('[data-test]');
+            if (tst) testChannel(tst.dataset.test);
+            const tk = e.target.closest('[data-tkopen]');
+            if (tk && OPS.ticketOpen) { e.preventDefault(); OPS.ticketOpen(tk.dataset.tkopen); }
+        });
+    }
+
+    async function load() {
+        try { A.data = await OPS.api('/api/ops/alerts?days=7'); } catch (e) { return OPS.fail(e); }
+        render();
+    }
+
+    function stateCell(a) {
+        if (a.state === 'acked') return '<span class="ops-info">👁️ ' + OPS.t('Acknowledged') + '</span><br><span class="muted">' + OPS.esc(a.acked_by || '') + ' · ' + OPS.fmt(a.acked_at) + '</span>';
+        if (a.state === 'resolved') return '<span class="ops-ok">✅ ' + OPS.t('Resolved') + '</span><br><span class="muted">' + OPS.esc(a.resolved_by === 'system' ? OPS.tx('automatically') : a.resolved_by || '') + '</span>';
+        return '<span class="ops-bad">● ' + OPS.t('Open') + '</span>';
+    }
+
+    function sentCell(a) {
+        const s = a.sent || [];
+        if (!a.notify) return '<span class="muted">' + OPS.t('board only') + '</span>';
+        if (!s.length) return '<span class="muted">' + (a.level ? OPS.t('sending…') : '—') + '</span>';
+        if (s.every(x => x.channel === 'none')) return '<span class="ops-warn">⚠️ ' + OPS.t('nobody to notify - set recipients') + '</span>';
+        const by = {};
+        s.forEach(x => { by[x.channel] = by[x.channel] || [0, 0]; by[x.channel][x.ok ? 0 : 1]++; });
+        return OPS.t('Level {n}', {n: a.level || 1}) + '<br>' + Object.keys(by).map(c => '<span class="' + (by[c][1] ? 'ops-bad' : 'ops-ok') + '">' +
+            OPS.esc(CH[c] || c) + ' ' + by[c][0] + (by[c][1] ? '/✕' + by[c][1] : '') + '</span>').join(' ');
+    }
+
+    function render() {
+        const d = A.data, c = d.counts, now = d.now, td = OPS.td;
+        OPS.$('aKpiOpen').textContent = c.open;
+        OPS.$('aKpiUnack').textContent = c.unacked;
+        OPS.$('aKpiCrit').textContent = c.critical;
+        OPS.$('aKpiEsc').textContent = c.escalated;
+        OPS.$('aKpiSent').textContent = c.sent_today;
+        OPS.$('aKpiSentSub').innerHTML = c.failed_today ? '<span class="ops-bad">' + OPS.t('{n} failed', {n: c.failed_today}) + '</span>' : OPS.t('all delivered');
+        const canA = OPS.can('alerts');
+        const act = d.alerts.filter(a => a.state !== 'resolved');
+        OPS.$('alActive').innerHTML = '<thead><tr><th>' + OPS.t('Severity') + '</th><th>' + OPS.t('Alert') + '</th><th>' + OPS.t('Charger') + '</th><th>' +
+            OPS.t('Opened') + '</th><th>' + OPS.t('Notified') + '</th><th>' + OPS.t('State') + '</th><th></th></tr></thead><tbody>' +
+            (act.map(a => '<tr class="ops-sevrow-' + OPS.esc(a.sev) + '">' + td('Severity', OPS.sevPill(a.sev)) +
+                td('Alert', '<b>' + OPS.t(a.title) + '</b><br>' + (a.msg ? OPS.issueMsg({msg: a.msg, vars: a.vars, since: a.since}, now) : OPS.esc(a.text)) +
+                    (a.hint ? '<div class="ops-hint muted">👉 ' + OPS.esc(OPS.tx(a.hint)) + '</div>' : '') + '<div class="muted">' + OPS.esc(a.id) +
+                    (a.ticket && OPS.ticketOpen ? ' · <a href="#" data-tkopen="' + OPS.esc(a.ticket) + '">🛠️ ' + OPS.esc(a.ticket) + '</a>' : '') + '</div>') +
+                td('Charger', OPS.cpLabel(a.cp, a.name) + (a.conn ? '<br>#' + a.conn : '')) +
+                td('Opened', OPS.fmt(a.opened) + '<br><span class="muted">' + OPS.dur(now - a.opened) + '</span>', 'ops-nowrap') +
+                td('Notified', sentCell(a)) + td('State', stateCell(a)) +
+                td('', canA ? (a.state === 'open' ? '<button class="tb-btn ops-mini primary" data-aact="ack" data-id="' + OPS.esc(a.id) + '">' + OPS.t('👁️ Acknowledge') + '</button>' : '') +
+                    '<button class="tb-btn ops-mini" data-aact="resolve" data-id="' + OPS.esc(a.id) + '">' + OPS.t('✅ Resolve') + '</button>' +
+                    '<button class="tb-btn ops-mini" data-aact="hist" data-id="' + OPS.esc(a.id) + '">' + OPS.t('🕒 History') + '</button>' : '') + '</tr>').join('') ||
+                '<tr><td colspan="7" class="ops-ok">✓ ' + OPS.t('No active alerts') + '</td></tr>') + '</tbody>';
+        const done = d.alerts.filter(a => a.state === 'resolved');
+        OPS.$('alDone').innerHTML = '<thead><tr><th>' + OPS.t('Severity') + '</th><th>' + OPS.t('Alert') + '</th><th>' + OPS.t('Charger') + '</th><th>' + OPS.t('Opened') +
+            '</th><th>' + OPS.t('Duration') + '</th><th>' + OPS.t('State') + '</th><th></th></tr></thead><tbody>' + (done.map(a => '<tr><td>' + OPS.sevPill(a.sev) + '</td><td><b>' +
+            OPS.t(a.title) + '</b><br><span class="muted">' + OPS.esc(a.id) + '</span></td><td>' + OPS.esc(a.cp) + (a.conn ? ' #' + a.conn : '') + '</td><td class="ops-nowrap">' + OPS.fmt(a.opened) +
+            '</td><td>' + OPS.dur((a.resolved_at || now) - a.opened) + '</td><td>' + stateCell(a) + '</td><td><button class="tb-btn ops-mini" data-aact="hist" data-id="' + OPS.esc(a.id) + '">' +
+            OPS.t('🕒 History') + '</button></td></tr>').join('') || '<tr><td colspan="7" class="muted">' + OPS.t('No entries') + '</td></tr>') + '</tbody>';
+        OPS.$('alLog').innerHTML = '<thead><tr><th>' + OPS.t('Time (BTT)') + '</th><th>' + OPS.t('Alert') + '</th><th>' + OPS.t('Channel') + '</th><th>' + OPS.t('To') + '</th><th>' +
+            OPS.t('Result') + '</th></tr></thead><tbody>' + (d.log.map(n => '<tr><td class="ops-nowrap">' + OPS.fmt(n.t, true) + '</td><td>' + OPS.esc(n.alert) +
+            (n.kind && n.kind !== 'open' ? ' <span class="muted">' + OPS.esc(OPS.tx(n.kind)) + '</span>' : '') + (n.level ? ' <span class="muted">L' + n.level + '</span>' : '') + '</td><td>' + OPS.esc(CH[n.channel] || n.channel) +
+            '</td><td>' + OPS.esc(n.to || '') + '</td><td>' + (n.ok ? '<span class="ops-ok">✓ ' + OPS.t('sent') + '</span>' : '<span class="ops-bad">✕ ' + OPS.esc(n.err || '') + '</span>') + '</td></tr>').join('') ||
+            '<tr><td colspan="5" class="muted">' + OPS.t('No entries') + '</td></tr>') + '</tbody>';
+        badgeSet(c.unacked);
+    }
+
+    async function act(what, id) {
+        const a = (A.data.alerts || []).find(x => x.id === id);
+        if (!a) return;
+        if (what === 'hist') {
+            OPS.modal('Alert {u}', '<table class="fleet-table ops-table"><tbody>' + (a.history || []).map(h => '<tr><td class="ops-nowrap">' + OPS.fmt(h.t, true) + '</td><td><b>' +
+                OPS.esc(h.by) + '</b></td><td>' + OPS.t(h.what) + (h.note ? ' <span class="muted">' + OPS.esc(h.note) + '</span>' : '') + '</td></tr>').join('') + '</tbody></table>' +
+                ((a.sent || []).length ? '<h4>' + OPS.t('Notifications') + '</h4>' + a.sent.map(s => '<div>' + OPS.fmt(s.t, true) + ' · ' + OPS.esc(CH[s.channel] || s.channel) + ' · L' + s.level +
+                    ' · ' + (s.ok ? '✓' : '✕') + '</div>').join('') : ''), [{label: 'Close'}], {vars: {u: a.id}});
+            return;
+        }
+        OPS.modal(what === 'ack' ? 'Acknowledge alert {u}' : 'Resolve alert {u}',
+            '<div class="ops-form"><label class="wide">' + OPS.t('Note (optional)') + '<textarea class="tb-inp" id="alNote" maxlength="300"></textarea></label></div>' +
+            (what === 'resolve' && a.state !== 'resolved' ? '<div class="pay-help">' + OPS.t('If the problem is still there, no new alert is raised for it until it clears and comes back.') + '</div>' : ''),
+            [{label: 'Cancel'}, {label: what === 'ack' ? '👁️ Acknowledge' : '✅ Resolve', cls: 'primary', run: async b => {
+                await OPS.post('/api/ops/alerts/' + what, {id, note: OPS.val(b, '#alNote')});
+                OPS.toast(OPS.tx(what === 'ack' ? 'Alert acknowledged' : 'Alert resolved'), 'success');
+                load();
+                return true;
+            }}], {vars: {u: id}});
+    }
+
+    // ---- settings
+    async function loadCfg() {
+        try { A.cfg = await OPS.api('/api/ops/alerts/config'); } catch (e) { return OPS.fail(e); }
+        renderRules();
+        renderEsc();
+        renderChannels();
+    }
+
+    function renderRules() {
+        const r = A.cfg.rules, ro = OPS.can('config') ? '' : ' disabled', maint = OPS.has('maint');
+        const sevs = ['auto', 'critical', 'major', 'minor', 'info'];
+        OPS.$('alRules').innerHTML = '<div class="pay-help">' + OPS.t('Each rule turns an open health issue into an alert. Thresholds (how long before a charger counts as offline, …) are set in Health › Detection settings.') + '</div>' +
+            '<div class="ops-table-wrap"><table class="fleet-table ops-table"><thead><tr><th>' + OPS.t('Issue') + '</th><th class="c">' + OPS.t('Alert') + '</th><th>' + OPS.t('Severity') +
+            '</th><th>' + OPS.t('Extra delay (min)') + '</th><th class="c">' + OPS.t('Notify') + '</th>' + (maint ? '<th class="c">' + OPS.t('Work order') + '</th>' : '') + '</tr></thead><tbody>' +
+            Object.keys(r).map(k => '<tr data-rule="' + k + '"><td><b>' + OPS.t(A.cfg.titles[k] || k) + '</b></td><td class="c"><input type="checkbox" data-f="on"' + (r[k].on ? ' checked' : '') + ro + '></td>' +
+                '<td><select class="tb-sel" data-f="sev"' + ro + '>' + sevs.map(s => OPS.opt(s, s === 'auto' ? 'From the fault code' : (OPS.SEV[s] || ['', s])[1], r[k].sev === s)).join('') + '</select></td>' +
+                '<td><input class="tb-inp ops-num" type="number" min="0" step="any" data-f="delay_min" value="' + OPS.esc(r[k].delay_min) + '"' + ro + '></td>' +
+                '<td class="c"><input type="checkbox" data-f="notify"' + (r[k].notify ? ' checked' : '') + ro + '></td>' +
+                (maint ? '<td class="c"><input type="checkbox" data-f="ticket"' + (r[k].ticket ? ' checked' : '') + ro + '></td>' : '') + '</tr>').join('') + '</tbody></table></div>' +
+            (OPS.can('config') ? '<div class="pay-form-row"><button class="tb-btn primary" id="alRulesSave">' + OPS.t('💾 Save rules') + '</button></div>' : '');
+        const b = OPS.$('alRulesSave');
+        if (b) b.onclick = async () => {
+            const rules = {};
+            OPS.$('alRules').querySelectorAll('[data-rule]').forEach(tr => {
+                const o = {};
+                tr.querySelectorAll('[data-f]').forEach(i => { o[i.dataset.f] = i.type === 'checkbox' ? i.checked : i.value; });
+                rules[tr.dataset.rule] = o;
+            });
+            try { await OPS.post('/api/ops/alerts/rules', {rules}); OPS.toast(OPS.tx('Saved'), 'success'); } catch (e) { OPS.fail(e); }
+        };
+    }
+
+    function renderEsc() {
+        const box = OPS.$('alEsc');
+        if (!A.cfg.escalation) { box.innerHTML = '<div class="muted">' + OPS.t('Only administrators can change recipients and channels.') + '</div>'; return; }
+        const e = A.cfg.escalation, users = A.cfg.users || [];
+        const lv = (l, i) => '<fieldset class="ops-level" data-level="' + i + '"><legend>' + OPS.t('Level {n}', {n: i + 1}) + '</legend><div class="ops-form">' +
+            '<label>' + OPS.t('Notify after (minutes without acknowledgement)') + '<input class="tb-inp" type="number" min="0" step="any" data-f="after_min" value="' + OPS.esc(l.after_min) + '"' + (i === 0 ? ' readonly' : '') + '></label>' +
+            '<label class="wide">' + OPS.t('Users') + '<span class="ops-chips">' + (users.map(u => '<label class="ops-check"><input type="checkbox" data-user="' + OPS.esc(u.username) + '"' +
+                ((l.users || []).includes(u.username) ? ' checked' : '') + '> ' + OPS.esc(u.name) + ' <span class="muted">' + [u.email ? '📧' : '', u.telegram ? '✈️' : '', u.phone ? '💬' : ''].join('') +
+                '</span></label>').join('') || '<span class="muted">' + OPS.t('Add users with contact details in the Users tab') + '</span>') + '</span></label>' +
+            '<label>' + OPS.t('More emails') + '<input class="tb-inp" data-f="emails" autocomplete="off" value="' + OPS.esc(l.emails || '') + '" placeholder="noc@bpc.bt"></label>' +
+            '<label>' + OPS.t('More phone numbers (SMS)') + '<input class="tb-inp" data-f="phones" autocomplete="off" value="' + OPS.esc(l.phones || '') + '" placeholder="+975…"></label>' +
+            '<label>' + OPS.t('More Telegram chat IDs') + '<input class="tb-inp" data-f="telegram" autocomplete="off" value="' + OPS.esc(l.telegram || '') + '"></label>' +
+            '<label class="wide">' + OPS.t('Channels') + '<span class="ops-chips">' + Object.keys(CH).map(c => '<label class="ops-check"><input type="checkbox" data-ch="' + c + '"' +
+                ((l.channels || []).includes(c) ? ' checked' : '') + '> ' + OPS.esc(CH[c]) + '</label>').join('') + '</span></label></div></fieldset>';
+        box.innerHTML = '<div class="pay-help">' + OPS.t('Level 1 is told at once. If nobody acknowledges the alert, the next level is told after its delay.') + '</div>' +
+            (e.levels || []).map(lv).join('') + '<div class="ops-form">' +
+            '<label>' + OPS.t('Remind every (minutes, 0 = never)') + '<input class="tb-inp" type="number" min="0" step="any" id="alRep" value="' + OPS.esc(e.repeat_min) + '"></label>' +
+            '<label>' + OPS.t('Notify from severity') + '<select class="tb-sel" id="alMinSev">' + ['critical', 'major', 'minor', 'info'].map(s => OPS.opt(s, OPS.SEV[s][1], e.min_sev === s)).join('') + '</select></label>' +
+            '<label class="ops-check"><input type="checkbox" id="alNotRes"' + (e.notify_resolved ? ' checked' : '') + '> ' + OPS.t('Also tell when an alert is resolved') + '</label>' +
+            '<label class="wide">' + OPS.t('Address of this CSMS for links in messages') + '<input class="tb-inp" id="alUrl" autocomplete="off" value="' + OPS.esc(e.public_url || '') + '" placeholder="https://bpc-csms.onrender.com"></label></div>' +
+            '<div class="pay-form-row"><button class="tb-btn primary" id="alEscSave">' + OPS.t('💾 Save escalation') + '</button></div>';
+        OPS.$('alEscSave').onclick = async () => {
+            const levels = Array.from(box.querySelectorAll('[data-level]')).map(fs => ({
+                after_min: fs.querySelector('[data-f=after_min]').value, emails: fs.querySelector('[data-f=emails]').value,
+                phones: fs.querySelector('[data-f=phones]').value, telegram: fs.querySelector('[data-f=telegram]').value,
+                users: Array.from(fs.querySelectorAll('[data-user]:checked')).map(x => x.dataset.user),
+                channels: Array.from(fs.querySelectorAll('[data-ch]:checked')).map(x => x.dataset.ch)}));
+            try {
+                await OPS.post('/api/ops/alerts/config', {escalation: {levels, repeat_min: OPS.$('alRep').value, min_sev: OPS.$('alMinSev').value,
+                    notify_resolved: OPS.$('alNotRes').checked, public_url: OPS.$('alUrl').value}});
+                OPS.toast(OPS.tx('Saved'), 'success');
+            } catch (er) { OPS.fail(er); }
+        };
+    }
+
+    function secretField(ch, k, label, c) {
+        return '<label>' + OPS.t(label) + '<input ' + SEC + ' data-ch="' + ch + '" data-k="' + k + '" placeholder="' +
+            OPS.esc(c[k + '_set'] ? OPS.tx('stored - type to replace') : '') + '"><label class="ops-check"><input type="checkbox" data-ch="' + ch + '" data-k="' + k + '_clear"> ' +
+            OPS.t('remove') + '</label></label>';
+    }
+    function field(ch, k, label, c, ph) {
+        return '<label>' + OPS.t(label) + '<input class="tb-inp" data-ch="' + ch + '" data-k="' + k + '" autocomplete="off" value="' + OPS.esc(c[k] == null ? '' : c[k]) + '" placeholder="' + OPS.esc(ph || '') + '"></label>';
+    }
+    function onBox(ch, c) {
+        return '<label class="ops-check wide"><input type="checkbox" data-ch="' + ch + '" data-k="on"' + (c.on ? ' checked' : '') + '> ' + OPS.t('Use this channel') + '</label>';
+    }
+    function testRow(ch, ph) {
+        return '<div class="pay-form-row ops-inline"><input class="tb-inp" id="alTest_' + ch + '" autocomplete="off" placeholder="' + OPS.esc(OPS.tx(ph)) + '"' + (ch === 'webhook' ? ' disabled' : '') +
+            '><button class="tb-btn" data-test="' + ch + '">' + OPS.t('📤 Send test') + '</button></div>';
+    }
+
+    function renderChannels() {
+        const box = OPS.$('alCh');
+        if (!A.cfg.channels) { box.innerHTML = '<div class="muted">' + OPS.t('Only administrators can change recipients and channels.') + '</div>'; return; }
+        const c = A.cfg.channels;
+        box.innerHTML = '<div class="pay-help">' + OPS.t('Passwords and tokens are never shown again after saving. Leave a secret field empty to keep the stored value.') + '</div><div class="ops-chgrid">' +
+            '<fieldset><legend>' + CH.email + '</legend><div class="ops-form">' + onBox('email', c.email) + field('email', 'host', 'SMTP server', c.email, 'smtp.office365.com') +
+            field('email', 'port', 'Port', c.email, '587') + '<label>' + OPS.t('Security') + '<select class="tb-sel" data-ch="email" data-k="security">' +
+            [['starttls', 'STARTTLS (587)'], ['ssl', 'SSL/TLS (465)'], ['none', 'None']].map(o => OPS.opt(o[0], o[1], c.email.security === o[0])).join('') + '</select></label>' +
+            field('email', 'user', 'User name', c.email, 'noc@bpc.bt') + secretField('email', 'password', 'Password', c.email) + field('email', 'from', 'From address', c.email, 'BPC CSMS <noc@bpc.bt>') +
+            '</div>' + testRow('email', 'Send a test to (email)') + '</fieldset>' +
+            '<fieldset><legend>' + CH.telegram + '</legend><div class="ops-form">' + onBox('telegram', c.telegram) + secretField('telegram', 'token', 'Bot token', c.telegram) +
+            field('telegram', 'api', 'API address', c.telegram, 'https://api.telegram.org') + '</div>' +
+            '<div class="pay-help">' + OPS.t('Create a bot with @BotFather, add it to the NOC group, then put the group chat ID in the recipients.') + '</div>' + testRow('telegram', 'Send a test to (chat ID)') + '</fieldset>' +
+            '<fieldset><legend>' + CH.sms + '</legend><div class="ops-form">' + onBox('sms', c.sms) + '<label>' + OPS.t('Method') + '<select class="tb-sel" data-ch="sms" data-k="method">' +
+            ['POST', 'GET'].map(m => OPS.opt(m, m, c.sms.method === m)).join('') + '</select></label>' + field('sms', 'url', 'Gateway URL ({to} {text})', c.sms, 'https://sms.example.bt/send') +
+            secretField('sms', 'headers', 'Headers (JSON, e.g. API key)', c.sms) + field('sms', 'content_type', 'Content type', c.sms, 'application/json') +
+            '<label class="wide">' + OPS.t('Body template ({to} {text})') + '<input class="tb-inp" data-ch="sms" data-k="body" autocomplete="off" value="' + OPS.esc(c.sms.body || '') + '"></label></div>' +
+            testRow('sms', 'Send a test to (phone)') + '</fieldset>' +
+            '<fieldset><legend>' + CH.webhook + '</legend><div class="ops-form">' + onBox('webhook', c.webhook) + field('webhook', 'url', 'URL', c.webhook, 'https://…') +
+            secretField('webhook', 'secret', 'Signing secret (optional)', c.webhook) + '</div>' + testRow('webhook', '') + '</fieldset></div>' +
+            '<div class="pay-form-row"><button class="tb-btn primary" id="alChSave">' + OPS.t('💾 Save channels') + '</button></div>';
+        OPS.$('alChSave').onclick = saveChannels;
+    }
+
+    function channelValues() {
+        const out = {};
+        OPS.$('alCh').querySelectorAll('[data-ch][data-k]').forEach(i => {
+            out[i.dataset.ch] = out[i.dataset.ch] || {};
+            out[i.dataset.ch][i.dataset.k] = i.type === 'checkbox' ? i.checked : i.value;
+        });
+        return out;
+    }
+    async function saveChannels() {
+        try { await OPS.post('/api/ops/alerts/config', {channels: channelValues()}); OPS.toast(OPS.tx('Saved'), 'success'); loadCfg(); } catch (e) { OPS.fail(e); }
+    }
+    async function testChannel(ch) {
+        try {
+            await OPS.post('/api/ops/alerts/config', {channels: channelValues()});
+            const to = (OPS.$('alTest_' + ch) || {}).value || '';
+            await OPS.post('/api/ops/alerts/test', {channel: ch, to});
+            OPS.toast(OPS.tx('Test sent'), 'success');
+        } catch (e) { OPS.fail(e); }
+        load();
+        loadCfg();
+    }
+
+    // ---- tab badge + a toast for new alerts, from any tab
+    function badgeSet(n) {
+        const b = OPS.$('alertsBadge');
+        if (b) { b.textContent = n || ''; b.classList.toggle('show', !!n); }
+    }
+    async function poll() {
+        if (!OPS.me) return;
+        let s;
+        try { s = await OPS.api('/api/ops/alerts/summary'); } catch (e) { return; }
+        badgeSet(s.unacked);
+        const ids = (s.newest || []).map(a => a.id);
+        if (A.seen) s.newest.filter(a => !A.seen.includes(a.id) && (a.sev === 'critical' || a.sev === 'major')).forEach(a =>
+            OPS.toast((OPS.SEV[a.sev] || ['🔔'])[0] + ' ' + a.cp + ' · ' + OPS.tx(a.title), 'error'));
+        A.seen = ids.concat(A.seen || []).slice(0, 50);
+    }
+    document.addEventListener('ops-ready', () => { poll(); setInterval(() => { if (!document.hidden) poll(); }, 30000); });
+
+    OPS.register({tab: 'alerts', perm: 'view', every: 10,
+        show() { const v = OPS.$('view-alerts'); if (!v) return; if (!v.dataset.built) build(v); load(); },
+        refresh() { load(); },
+        relang() { if (A.data) render(); if (A.cfg) { renderRules(); renderEsc(); renderChannels(); } }});
+
+    Object.assign(OPS.actionLabels, {'/api/ops/alerts/ack': 'Alert acknowledged', '/api/ops/alerts/resolve': 'Alert resolved',
+        '/api/ops/alerts/rules': 'Alert rules changed', '/api/ops/alerts/config': 'Alert recipients / channels changed', '/api/ops/alerts/test': 'Test notification sent'});
+    OPS.addI18n({
+        '🔔 Alerts': ['🔔 ཉེན་བརྡ་', '🔔 การแจ้งเตือน'], 'Open alerts': ['', 'การแจ้งเตือนที่เปิดอยู่'], 'Not acknowledged': ['', 'ยังไม่มีผู้รับทราบ'], 'open now': ['', 'เปิดอยู่ตอนนี้'],
+        'Escalated': ['', 'ยกระดับแล้ว'], 'level 2 or higher': ['', 'ระดับ 2 ขึ้นไป'], 'Notifications today': ['', 'ส่งแจ้งเตือนวันนี้'], '{n} failed': ['', 'ล้มเหลว {n}'],
+        'all delivered': ['', 'ส่งสำเร็จทั้งหมด'], '🔔 Active alerts': ['', '🔔 การแจ้งเตือนที่ยังเปิดอยู่'], '✅ Resolved (7 days)': ['', '✅ แก้ไขแล้ว (7 วัน)'],
+        '📨 Notification log': ['', '📨 บันทึกการส่งแจ้งเตือน'], '📏 Alert rules': ['', '📏 กฎการแจ้งเตือน'], '📶 Escalation & recipients': ['', '📶 การยกระดับและผู้รับ'],
+        '📡 Channels (email, Telegram, SMS, webhook)': ['', '📡 ช่องทาง (อีเมล, Telegram, SMS, webhook)'], 'Acknowledged': ['', 'รับทราบแล้ว'], 'Resolved': ['', 'แก้ไขแล้ว'],
+        'automatically': ['', 'อัตโนมัติ'], 'Open': ['', 'เปิด'], 'board only': ['', 'แสดงบนหน้าจอเท่านั้น'], 'sending…': ['', 'กำลังส่ง…'], 'Level {n}': ['', 'ระดับ {n}'],
+        'Alert': ['', 'การแจ้งเตือน'], 'Opened': ['', 'เปิดเมื่อ'], 'Notified': ['', 'แจ้งแล้ว'], 'State': ['', 'สถานะ'], '👁️ Acknowledge': ['', '👁️ รับทราบ'],
+        '✅ Resolve': ['', '✅ ปิดงาน'], 'No active alerts': ['', 'ไม่มีการแจ้งเตือนที่เปิดอยู่'], 'Channel': ['', 'ช่องทาง'], 'To': ['', 'ถึง'], 'sent': ['', 'ส่งแล้ว'],
+        'Alert {u}': ['', 'การแจ้งเตือน {u}'], 'Notifications': ['', 'การส่งแจ้งเตือน'], 'Acknowledge alert {u}': ['', 'รับทราบการแจ้งเตือน {u}'], 'Resolve alert {u}': ['', 'ปิดการแจ้งเตือน {u}'],
+        'Note (optional)': ['', 'หมายเหตุ (ไม่บังคับ)'], 'If the problem is still there, no new alert is raised for it until it clears and comes back.': ['', 'ถ้าปัญหายังอยู่ ระบบจะไม่แจ้งซ้ำจนกว่าปัญหาจะหายและกลับมาใหม่'],
+        'Alert acknowledged': ['', 'รับทราบการแจ้งเตือนแล้ว'], 'Alert resolved': ['', 'ปิดการแจ้งเตือนแล้ว'], 'opened': ['', 'เปิด'], 'notified': ['', 'แจ้งแล้ว'], 'escalated': ['', 'ยกระดับ'],
+        'acknowledged': ['', 'รับทราบ'], 'resolved': ['', 'ปิดแล้ว'], 'escalate': ['', 'ยกระดับ'], 'repeat': ['', 'เตือนซ้ำ'], 'test': ['', 'ทดสอบ'],
+        'Each rule turns an open health issue into an alert. Thresholds (how long before a charger counts as offline, …) are set in Health › Detection settings.': ['', 'กฎแต่ละข้อเปลี่ยนปัญหาสุขภาพเครือข่ายให้เป็นการแจ้งเตือน ส่วนเกณฑ์เวลา (เช่น นานเท่าไรจึงนับว่าออฟไลน์) ตั้งที่ สุขภาพเครือข่าย › ตั้งค่าการตรวจจับ'],
+        'Extra delay (min)': ['', 'หน่วงเพิ่ม (นาที)'], 'Notify': ['', 'ส่งแจ้งเตือน'], 'Work order': ['', 'ใบงาน'], 'From the fault code': ['', 'ตามรหัสความผิดปกติ'], '💾 Save rules': ['', '💾 บันทึกกฎ'],
+        'Only administrators can change recipients and channels.': ['', 'เฉพาะผู้ดูแลระบบที่เปลี่ยนผู้รับและช่องทางได้'], 'Notify after (minutes without acknowledgement)': ['', 'แจ้งหลังจาก (นาที ที่ยังไม่มีผู้รับทราบ)'],
+        'Users': ['', 'ผู้ใช้'], 'Add users with contact details in the Users tab': ['', 'เพิ่มผู้ใช้พร้อมข้อมูลติดต่อในแท็บผู้ใช้'], 'More emails': ['', 'อีเมลเพิ่มเติม'],
+        'More phone numbers (SMS)': ['', 'เบอร์โทรเพิ่มเติม (SMS)'], 'More Telegram chat IDs': ['', 'Telegram chat ID เพิ่มเติม'], 'Channels': ['', 'ช่องทาง'],
+        'Level 1 is told at once. If nobody acknowledges the alert, the next level is told after its delay.': ['', 'ระดับ 1 ได้รับแจ้งทันที ถ้าไม่มีใครรับทราบ ระดับถัดไปจะได้รับแจ้งเมื่อครบเวลาที่ตั้งไว้'],
+        'Remind every (minutes, 0 = never)': ['', 'เตือนซ้ำทุก (นาที, 0 = ไม่เตือน)'], 'Notify from severity': ['', 'แจ้งตั้งแต่ระดับ'], 'Also tell when an alert is resolved': ['', 'แจ้งด้วยเมื่อปัญหาได้รับการแก้ไข'],
+        'Address of this CSMS for links in messages': ['', 'ที่อยู่ของ CSMS นี้สำหรับลิงก์ในข้อความ'], '💾 Save escalation': ['', '💾 บันทึกการยกระดับ'], 'stored - type to replace': ['', 'บันทึกไว้แล้ว - พิมพ์ใหม่เพื่อเปลี่ยน'],
+        'remove': ['', 'ลบ'], 'Use this channel': ['', 'ใช้ช่องทางนี้'], '📤 Send test': ['', '📤 ส่งทดสอบ'],
+        'Passwords and tokens are never shown again after saving. Leave a secret field empty to keep the stored value.': ['', 'รหัสผ่านและ token จะไม่แสดงอีกหลังบันทึก เว้นช่องว่างไว้เพื่อใช้ค่าเดิม'],
+        'SMTP server': ['', 'เซิร์ฟเวอร์ SMTP'], 'Port': ['', 'พอร์ต'], 'Security': ['', 'ความปลอดภัย'], 'User name': ['', 'ชื่อผู้ใช้'], 'From address': ['', 'ที่อยู่ผู้ส่ง'],
+        'Send a test to (email)': ['', 'ส่งทดสอบไปที่ (อีเมล)'], 'Bot token': ['', 'Bot token'], 'API address': ['', 'ที่อยู่ API'],
+        'Create a bot with @BotFather, add it to the NOC group, then put the group chat ID in the recipients.': ['', 'สร้างบอทด้วย @BotFather เพิ่มบอทเข้ากลุ่ม NOC แล้วใส่ chat ID ของกลุ่มในผู้รับ'],
+        'Send a test to (chat ID)': ['', 'ส่งทดสอบไปที่ (chat ID)'], 'Method': ['', 'วิธีส่ง'], 'Gateway URL ({to} {text})': ['', 'URL ของ gateway ({to} {text})'],
+        'Headers (JSON, e.g. API key)': ['', 'Headers (JSON เช่น API key)'], 'Content type': ['', 'Content type'], 'Body template ({to} {text})': ['', 'รูปแบบข้อความ ({to} {text})'],
+        'Send a test to (phone)': ['', 'ส่งทดสอบไปที่ (เบอร์โทร)'], 'Signing secret (optional)': ['', 'Signing secret (ไม่บังคับ)'], '💾 Save channels': ['', '💾 บันทึกช่องทาง'],
+        'Test sent': ['', 'ส่งทดสอบแล้ว'], 'Alert acknowledged ': ['', ''], 'Alert rules changed': ['', 'เปลี่ยนกฎการแจ้งเตือน'], 'Alert recipients / channels changed': ['', 'เปลี่ยนผู้รับ / ช่องทางแจ้งเตือน'],
+        'Test notification sent': ['', 'ส่งแจ้งเตือนทดสอบ'], 'nobody to notify - set recipients': ['', 'ยังไม่มีผู้รับ - กรุณาตั้งผู้รับ'], 'No such alert': ['', 'ไม่พบการแจ้งเตือนนี้'], 'Only open alerts can be acknowledged': ['', 'รับทราบได้เฉพาะการแจ้งเตือนที่เปิดอยู่'],
+        'Already resolved': ['', 'ปิดไปแล้ว'], 'Enter where to send the test': ['', 'กรุณาระบุปลายทางของการทดสอบ']
+    });
+})();
+''')
+
+
+# ---- [OPS] v1.5 maintenance: work orders (tickets) from alerts, SLA timers, preventive maintenance plans, /tech phone view
+OPS_FEATURES.append('maint')
+ops_tickets = OpsDocStore('tickets', 'ops_tickets')
+ops_pm_plans = OpsDocStore('pm_plans', 'ops_pm')
+OPS_TICKET_STATES = ['open', 'assigned', 'in_progress', 'waiting_parts', 'resolved', 'closed', 'cancelled']
+OPS_TICKET_ACTIVE = {'open', 'assigned', 'in_progress', 'waiting_parts'}
+OPS_TICKET_FLOW = {
+    'open': {'assigned', 'in_progress', 'cancelled', 'resolved'},
+    'assigned': {'open', 'in_progress', 'cancelled', 'resolved'},
+    'in_progress': {'waiting_parts', 'resolved', 'assigned', 'cancelled'},
+    'waiting_parts': {'in_progress', 'resolved', 'cancelled'},
+    'resolved': {'closed', 'in_progress', 'open'},
+    'closed': {'open'},
+    'cancelled': {'open'},
+}
+OPS_PRIORITIES = ['P1', 'P2', 'P3', 'P4']
+OPS_CATEGORIES = ['fault', 'preventive', 'inspection', 'complaint', 'other']
+OPS_MAINT_DEFAULTS = {
+    'sla': {'P1': {'respond_h': 1, 'resolve_h': 8}, 'P2': {'respond_h': 4, 'resolve_h': 24},
+            'P3': {'respond_h': 8, 'resolve_h': 72}, 'P4': {'respond_h': 24, 'resolve_h': 168}},
+    'auto_priority': {'critical': 'P1', 'major': 'P2', 'minor': 'P3', 'info': 'P4'},
+    'pause_waiting_parts': True, 'auto_assign': '', 'notify_assignee': True, 'pm_grace_days': 3, 'pm_check_min': 10,
+}
+for _p in ('/api/ops/tickets/save', '/api/ops/tickets/status', '/api/ops/tickets/note', '/api/ops/tickets/part',
+           '/api/ops/tickets/check'):
+    ops_perm_rule('POST', _p, 'tickets')
+for _p in ('/api/ops/pm/save', '/api/ops/pm/delete', '/api/ops/maint/config'):
+    ops_perm_rule('POST', _p, 'config')
+OPS_TAB_PERMS['maint'] = 'view'
+
+
+def ops_maint_cfg() -> dict:
+    d = ops_cfg('maint', OPS_MAINT_DEFAULTS)
+    for p, v in OPS_MAINT_DEFAULTS['sla'].items():
+        d['sla'].setdefault(p, dict(v))
+    return d
+
+
+def ops_ticket_sla(t: dict, now: float = None) -> dict:
+    """Live SLA state: due times (resolve clock stops while waiting for parts) and breaches."""
+    now = now or ops_now()
+    sla = t.get('sla') or {}
+    paused = float(sla.get('paused_s') or 0)
+    if sla.get('paused_since'):
+        paused += now - sla['paused_since']
+    respond_by = sla.get('respond_by')
+    resolve_by = (sla.get('resolve_by') + paused) if sla.get('resolve_by') else None
+    done_t = t.get('resolved_at') or (now if t.get('status') in OPS_TICKET_ACTIVE else t.get('closed_at') or now)
+    responded = sla.get('responded_at')
+    out = {'respond_by': respond_by, 'resolve_by': resolve_by, 'responded_at': responded, 'paused_s': round(paused),
+           'respond_breach': bool(respond_by and (responded or now) > respond_by and (responded or t.get('status') in OPS_TICKET_ACTIVE)),
+           'resolve_breach': bool(resolve_by and done_t > resolve_by)}
+    if t.get('status') in OPS_TICKET_ACTIVE and resolve_by:
+        out['left_s'] = round(resolve_by - now)
+    return out
+
+
+def _ops_ticket_public(t: dict, now: float = None) -> dict:
+    d = dict(t)
+    d['sla_live'] = ops_ticket_sla(t, now)
+    d['name'] = ops_cp_name(t.get('cp') or '')
+    u = ops_users.data.get(t.get('assignee') or '') or {}
+    d['assignee_name'] = u.get('name') or t.get('assignee') or ''
+    return d
+
+
+def _ops_ticket_hist(t: dict, by: str, what: str, **kw):
+    t.setdefault('history', []).append(dict({'t': round(ops_now()), 'by': by, 'what': what}, **kw))
+    t['history'] = t['history'][-200:]
+    t['updated_at'] = round(ops_now())
+
+
+def ops_ticket_create(title: str, cp: str = '', conn: int = 0, category: str = 'fault', priority: str = 'P3', by: str = 'system',
+                      description: str = '', source: dict = None, assignee: str = '', checklist: List[str] = None,
+                      planned: bool = False, resolve_by: float = None) -> dict:
+    now = ops_now()
+    cfg = ops_maint_cfg()
+    priority = priority if priority in OPS_PRIORITIES else 'P3'
+    sla_p = cfg['sla'].get(priority) or {'respond_h': 8, 'resolve_h': 72}
+    t = {'id': ops_next_id('T'), 'title': str(title or '')[:140], 'cp': cp or '', 'conn': int(conn or 0),
+         'category': category if category in OPS_CATEGORIES else 'other', 'priority': priority, 'status': 'open',
+         'assignee': '', 'created_at': round(now, 1), 'created_by': by, 'source': source or {'type': 'manual'},
+         'alerts': [], 'description': str(description or '')[:2000], 'planned': bool(planned),
+         'sla': {'respond_by': round(now + float(sla_p['respond_h']) * 3600, 1),
+                 'resolve_by': round(resolve_by if resolve_by else now + float(sla_p['resolve_h']) * 3600, 1), 'paused_s': 0},
+         'checklist': [{'text': str(x)[:200], 'done': False} for x in (checklist or []) if str(x).strip()][:60],
+         'parts': [], 'notes': [], 'history': [{'t': round(now), 'by': by, 'what': 'created'}], 'updated_at': round(now)}
+    ops_tickets.data[t['id']] = t
+    who = assignee or cfg.get('auto_assign') or ''
+    if who and who in ops_users.data:
+        _ops_ticket_assign(t, who, by)
+    ops_tickets.save()
+    ops_emit('ticket_open', ticket=t)
+    return t
+
+
+def _ops_ticket_assign(t: dict, who: str, by: str):
+    if t.get('assignee') == who:
+        return
+    prev = t.get('assignee') or ''
+    t['assignee'] = who
+    if who and t['status'] == 'open':
+        t['status'] = 'assigned'
+    if not who and t['status'] == 'assigned':
+        t['status'] = 'open'
+    _ops_ticket_hist(t, by, 'assigned', to=who, **({'from': prev} if prev else {}))
+    if who and ops_maint_cfg().get('notify_assignee', True):
+        _ops_ticket_tell(t, who)
+
+
+def _ops_ticket_tell(t: dict, who: str):
+    """Tell the technician about a new job through the alert channels (fire-and-forget)."""
+    u = ops_users.data.get(who) or {}
+    if not u or 'ops_send' not in globals():
+        return
+    sla = ops_ticket_sla(t)
+    url = ops_public_url() if 'ops_public_url' in globals() else ''
+    text = (f"🛠️ New job {t['id']} ({t['priority']}): {t['title']}\n"
+            + (f"{t['cp']}{' #' + str(t['conn']) if t.get('conn') else ''} {ops_cp_name(t['cp'])}\n" if t.get('cp') else '')
+            + (f"Resolve by {ops_dt(sla['resolve_by']).strftime('%Y-%m-%d %H:%M')} BTT\n" if sla.get('resolve_by') else '')
+            + (f"Open: {url}/tech" if url else ''))
+    chans = ops_alert_channels()
+    jobs = []
+    if chans['email'].get('on') and u.get('email'):
+        jobs.append(('email', u['email']))
+    if chans['telegram'].get('on') and u.get('telegram'):
+        jobs.append(('telegram', u['telegram']))
+    if chans['sms'].get('on') and u.get('phone'):
+        jobs.append(('sms', u['phone']))
+
+    async def go():
+        for ch, to in jobs:
+            ok, err = True, ''
+            try:
+                await ops_send(ch, to, f"[BPC CSMS] New job {t['id']} - {t['title']}", text)
+            except Exception as e:
+                ok, err = False, str(e)[:200]
+            OPS_NOTIFY.add({'alert': t['id'], 'cp': t.get('cp', ''), 'kind': 'job', 'level': 0, 'channel': ch,
+                            'to': _ops_mask_to(ch, to), 'ok': ok, **({'err': err} if err else {})})
+    if jobs:
+        try:
+            asyncio.get_running_loop().create_task(go())
+        except RuntimeError:
+            pass
+
+
+def ops_ticket_set_status(t: dict, status: str, by: str, note: str = '', cause: str = '', action: str = '') -> str:
+    """'' on success, else the reason."""
+    cur = t.get('status')
+    if status == cur:
+        return ''
+    if status not in OPS_TICKET_FLOW.get(cur, set()):
+        return f'Cannot go from {cur} to {status}'
+    now = ops_now()
+    sla = t.setdefault('sla', {})
+    cfg = ops_maint_cfg()
+    if cur == 'waiting_parts' and sla.get('paused_since'):
+        sla['paused_s'] = float(sla.get('paused_s') or 0) + now - sla.pop('paused_since')
+    if status == 'waiting_parts' and cfg.get('pause_waiting_parts', True):
+        sla['paused_since'] = now
+    if status == 'in_progress':
+        sla.setdefault('responded_at', round(now, 1))
+        t.setdefault('work_started', round(now, 1))
+        if not t.get('assignee') and by in ops_users.data:
+            t['assignee'] = by
+    if status in ('resolved', 'closed') and not t.get('resolved_at'):
+        t['resolved_at'] = round(now, 1)
+        sla.setdefault('responded_at', round(now, 1))
+        t['resolution'] = {'cause': str(cause or '')[:500], 'action': str(action or '')[:500], 'by': by, 't': round(now)}
+    if status == 'closed':
+        t['closed_at'] = round(now, 1)
+    if status in ('open', 'in_progress', 'assigned') and cur in ('resolved', 'closed', 'cancelled'):
+        t.pop('resolved_at', None)
+        t.pop('closed_at', None)
+        _ops_ticket_hist(t, by, 'reopened')
+    t['status'] = status
+    _ops_ticket_hist(t, by, 'status', **{'from': cur, 'to': status}, **({'note': note[:300]} if note else {}))
+    if note:
+        t.setdefault('notes', []).append({'t': round(now), 'by': by, 'text': note[:1000]})
+    if status in ('resolved', 'closed') and t.get('category') == 'preventive':
+        plan = ops_pm_plans.data.get((t.get('source') or {}).get('ref') or '')
+        if plan is not None and t.get('cp'):
+            plan.setdefault('last', {})[t['cp']] = round(t['resolved_at'], 1)
+            ops_pm_plans.save()
+    ops_tickets.save()
+    ops_emit('ticket_status', ticket=t, previous=cur)
+    return ''
+
+
+# ---- automatic work orders from alerts ------------------------------------------------------------------------------
+@ops_on('alert_open')
+def _ops_m_alert_open(alert=None, **kw):
+    if not alert:
+        return
+    rule = (ops_alert_rules().get(alert.get('kind')) or {}) if 'ops_alert_rules' in globals() else {}
+    if not rule.get('ticket'):
+        return
+    for t in ops_tickets.data.values():                     # one job per charger connector: add the alert to it
+        if t.get('status') in OPS_TICKET_ACTIVE and t.get('cp') == alert['cp'] and int(t.get('conn') or 0) == int(alert.get('conn') or 0) \
+                and t.get('category') == 'fault':
+            if alert['id'] not in t.setdefault('alerts', []):
+                t['alerts'].append(alert['id'])
+                t.setdefault('notes', []).append({'t': round(ops_now()), 'by': 'system', 'text': f"{alert['id']}: {alert['title']} - {alert.get('text', '')}"})
+                _ops_ticket_hist(t, 'system', 'alert added', ref=alert['id'])
+                ops_tickets.save()
+            alert['ticket'] = t['id']
+            return
+    prio = ops_maint_cfg()['auto_priority'].get(alert.get('sev'), 'P3')
+    where = alert['cp'] + (f" #{alert['conn']}" if alert.get('conn') else '')
+    desc = alert.get('text', '') + (('\nWhat to do: ' + alert['hint']) if alert.get('hint') else '')
+    t = ops_ticket_create(f"{alert['title']} - {where}", alert['cp'], alert.get('conn') or 0, 'fault', prio, 'system', desc,
+                          {'type': 'alert', 'ref': alert['id']})
+    t['alerts'].append(alert['id'])
+    alert['ticket'] = t['id']
+    ops_tickets.save()
+
+
+@ops_on('alert_resolved')
+def _ops_m_alert_resolved(alert=None, **kw):
+    if not alert or not alert.get('ticket'):
+        return
+    t = ops_tickets.data.get(alert['ticket'])
+    if t and t.get('status') in OPS_TICKET_ACTIVE:
+        t.setdefault('notes', []).append({'t': round(ops_now()), 'by': 'system',
+                                          'text': f"{alert['id']} cleared ({alert.get('resolved_by') or 'system'}) - check before closing the job"})
+        _ops_ticket_hist(t, 'system', 'alert cleared', ref=alert['id'])
+        ops_tickets.save()
+
+
+# ---- preventive maintenance -----------------------------------------------------------------------------------------
+def ops_pm_matches(plan: dict, cp_id: str) -> bool:
+    ap = plan.get('applies') or {}
+    s = OPS_CP.get(cp_id) or {}
+    data = app_state.cp_data.get(cp_id)
+    model = (s.get('model') or getattr(data, 'model', '') or '').lower()
+    vendor = (s.get('vendor') or getattr(data, 'vendor', '') or '').lower()
+    if ap.get('chargers') and cp_id not in ap['chargers']:
+        return False
+    if ap.get('models') and model not in [m.lower() for m in ap['models']]:
+        return False
+    if ap.get('vendors') and vendor not in [v.lower() for v in ap['vendors']]:
+        return False
+    return True
+
+
+def ops_pm_due(plan: dict, cp_id: str) -> float:
+    last = (plan.get('last') or {}).get(cp_id)
+    if last:
+        return float(last) + float(plan.get('interval_days') or 90) * 86400
+    return float(plan.get('start') or plan.get('created_at') or ops_now())
+
+
+def ops_pm_schedule(now: float = None) -> List[dict]:
+    """Create the preventive-maintenance jobs that are due (within the lead time) and not opened yet."""
+    now = now or ops_now()
+    made = []
+    open_pm = {((t.get('source') or {}).get('ref'), t.get('cp')) for t in ops_tickets.data.values()
+               if t.get('category') == 'preventive' and t.get('status') in OPS_TICKET_ACTIVE}
+    for plan in ops_pm_plans.data.values():
+        if not plan.get('enabled', True):
+            continue
+        for cp_id in ops_known_chargers():
+            if not ops_pm_matches(plan, cp_id) or (plan['id'], cp_id) in open_pm:
+                continue
+            due = ops_pm_due(plan, cp_id)
+            if now < due - float(plan.get('lead_days') or 0) * 86400:
+                continue
+            t = ops_ticket_create(f"{plan.get('name') or 'Preventive maintenance'} - {cp_id}", cp_id, 0, 'preventive',
+                                  plan.get('priority') or 'P3', 'system',
+                                  f"Preventive maintenance due {ops_dt(due).strftime('%Y-%m-%d')} (every {plan.get('interval_days')} days).",
+                                  {'type': 'pm', 'ref': plan['id']}, plan.get('assignee') or '', plan.get('checklist') or [],
+                                  planned=True, resolve_by=due + float(ops_maint_cfg().get('pm_grace_days') or 3) * 86400)
+            t['due'] = round(due, 1)
+            made.append(t)
+            open_pm.add((plan['id'], cp_id))
+    if made:
+        ops_tickets.save()
+    return made
+
+
+async def ops_pm_loop():
+    await asyncio.sleep(min(10.0, OPS_TICK * 3))
+    while True:
+        try:
+            ops_pm_schedule()
+        except Exception as e:
+            logger.error(f"ops: preventive maintenance scheduler failed: {e}")
+        await asyncio.sleep(max(OPS_TICK, float(ops_maint_cfg().get('pm_check_min') or 10) * 60 if OPS_TICK >= 30 else OPS_TICK * 2))
+
+
+OPS_TASKS.append(ops_pm_loop)
+
+
+# ---- planned work does not count as downtime; maintenance figures in the KPI report -----------------------------------
+def _ops_m_exclusions(cp_id, connector, t0, t1):
+    out = []
+    for t in ops_tickets.data.values():
+        if t.get('cp') != cp_id or not t.get('planned'):
+            continue
+        if int(t.get('conn') or 0) not in (0, int(connector or 0)):
+            continue
+        a = t.get('planned_from') or t.get('work_started')
+        b = t.get('planned_to') or t.get('resolved_at') or (ops_now() if t.get('status') in ('in_progress', 'waiting_parts') else None)
+        if a and b and b > t0 and a < t1:
+            out.append((max(a, t0), min(b, t1), t['id']))
+    return out
+
+
+OPS_EXCLUSIONS.append(_ops_m_exclusions)
+
+
+def _ops_m_kpi(t0, t1, res):
+    done = [t for t in ops_tickets.data.values() if t.get('resolved_at') and t0 <= t['resolved_at'] < t1 + 1]   # +1 s: rounded times
+    faults = [t for t in done if t.get('category') == 'fault']
+    mttr = sum(t['resolved_at'] - t['created_at'] for t in faults) / len(faults) / 3600.0 if faults else None
+    resp = [t for t in done if (t.get('sla') or {}).get('responded_at')]
+    mtta = sum(t['sla']['responded_at'] - t['created_at'] for t in resp) / len(resp) / 3600.0 if resp else None
+    sla_ok = [t for t in done if not ops_ticket_sla(t)['resolve_breach']]
+    pm = [t for t in done if t.get('category') == 'preventive']
+    pm_ok = [t for t in pm if t['resolved_at'] <= (t.get('sla') or {}).get('resolve_by', t['resolved_at'])]
+    active = [t for t in ops_tickets.data.values() if t.get('status') in OPS_TICKET_ACTIVE]
+    m = {'resolved': len(done), 'faults_resolved': len(faults), 'mttr_h': round(mttr, 2) if mttr is not None else None,
+         'mtta_h': round(mtta, 2) if mtta is not None else None,
+         'sla_pct': round(100.0 * len(sla_ok) / len(done), 1) if done else None, 'pm_done': len(pm),
+         'pm_on_time_pct': round(100.0 * len(pm_ok) / len(pm), 1) if pm else None, 'open': len(active),
+         'overdue': sum(1 for t in active if ops_ticket_sla(t)['resolve_breach'])}
+    res['maintenance'] = m
+    res.setdefault('extra_tiles', []).append({'cls': 'info', 'label': 'MTTR (repair time)',
+                                              'value': '—' if m['mttr_h'] is None else f"{m['mttr_h']:.1f} <small>h</small>",
+                                              'sub': f"{m['faults_resolved']} repairs · SLA met {'—' if m['sla_pct'] is None else str(m['sla_pct']) + '%'}"})
+    res.setdefault('extra_summary', []).extend([
+        ('Work orders resolved', m['resolved']), ('Mean time to repair (h)', m['mttr_h']), ('Mean time to respond (h)', m['mtta_h']),
+        ('Resolved within SLA %', m['sla_pct']), ('Preventive maintenance done', m['pm_done']),
+        ('Preventive maintenance on time %', m['pm_on_time_pct']), ('Open work orders', m['open']), ('Overdue work orders', m['overdue'])])
+
+
+OPS_KPI_EXTRA.append(_ops_m_kpi)
+
+
+def ops_landing(username: str) -> str:                     # technicians start on the phone view
+    u = ops_users.data.get(username) or {}
+    return '/tech' if u.get('role') == 'technician' else '/'
+
+
+# ---- API ------------------------------------------------------------------------------------------------------------
+def _ops_tech_list() -> List[dict]:
+    out = []
+    for n, u in sorted(ops_users.data.items()):
+        if u.get('disabled'):
+            continue
+        if 'tickets' in ops_role_perms(u.get('role') or 'viewer'):
+            out.append({'username': n, 'name': u.get('name') or n, 'role': u.get('role')})
+    return out
+
+
+async def ops_api_tickets(request):
+    q = request.query
+    now = ops_now()
+    me = ops_request_user(request).get('username')
+    scope = q.get('status') or 'active'
+    days = ops_int(q.get('days'), 30, 1, 3660)
+    text = (q.get('q') or '').strip().lower()
+    items = []
+    for t in ops_tickets.data.values():
+        st = t.get('status')
+        if scope == 'active' and st not in OPS_TICKET_ACTIVE:
+            continue
+        if scope == 'done' and (st in OPS_TICKET_ACTIVE or (t.get('updated_at') or 0) < now - days * 86400):
+            continue
+        if scope == 'all' and st not in OPS_TICKET_ACTIVE and (t.get('updated_at') or 0) < now - days * 86400:
+            continue
+        if q.get('mine') and t.get('assignee') != me:
+            continue
+        if q.get('unassigned') and t.get('assignee'):
+            continue
+        if q.get('cp') and t.get('cp') != q.get('cp'):
+            continue
+        if text and text not in ' '.join(str(t.get(k, '')) for k in ('id', 'title', 'cp', 'description', 'assignee')).lower():
+            continue
+        items.append(_ops_ticket_public(t, now))
+    order = {p: i for i, p in enumerate(OPS_PRIORITIES)}
+    items.sort(key=lambda t: (t['status'] not in OPS_TICKET_ACTIVE, order.get(t.get('priority'), 9),
+                              (t['sla_live'].get('resolve_by') or 9e12)))
+    act = [t for t in ops_tickets.data.values() if t.get('status') in OPS_TICKET_ACTIVE]
+    soon = []
+    for plan in ops_pm_plans.data.values():
+        if not plan.get('enabled', True):
+            continue
+        for cp_id in ops_known_chargers():
+            if ops_pm_matches(plan, cp_id):
+                due = ops_pm_due(plan, cp_id)
+                if due <= now + 30 * 86400:
+                    soon.append({'plan': plan['id'], 'name': plan.get('name'), 'cp': cp_id, 'due': due})
+    soon.sort(key=lambda x: x['due'])
+    t30 = now - 30 * 86400
+    mk = {}
+    _ops_m_kpi(t30, now, mk)
+    counts = {'active': len(act), 'mine': sum(1 for t in act if t.get('assignee') == me),
+              'unassigned': sum(1 for t in act if not t.get('assignee')),
+              'overdue': sum(1 for t in act if ops_ticket_sla(t, now)['resolve_breach']),
+              'waiting_parts': sum(1 for t in act if t.get('status') == 'waiting_parts'),
+              'pm_due14': sum(1 for x in soon if x['due'] <= now + 14 * 86400), 'mttr_h': mk['maintenance']['mttr_h'],
+              'sla_pct': mk['maintenance']['sla_pct']}
+    return ops_json({'now': now, 'tickets': items[:ops_int(q.get('limit'), 500, 1, 5000)], 'counts': counts,
+                     'technicians': _ops_tech_list(), 'pm_soon': soon[:50], 'me': me})
+
+
+async def ops_api_ticket(request):
+    t = ops_tickets.data.get(request.query.get('id') or '')
+    if not t:
+        return ops_err('No such work order', 404)
+    d = _ops_ticket_public(t)
+    s = OPS_CP.get(t.get('cp') or '') or {}
+    data = app_state.cp_data.get(t.get('cp') or '')
+    d['charger'] = {'online': bool(s.get('online') and data is not None), 'conns': {str(c): v.get('status') for c, v in (s.get('conn') or {}).items()},
+                    'model': s.get('model', ''), 'fw': s.get('fw', '')}
+    if 'ops_alerts' in globals():
+        d['alert_items'] = [ops_alerts.data[a] for a in t.get('alerts') or [] if a in ops_alerts.data]
+    return ops_json(d)
+
+
+async def ops_api_tickets_save(request):
+    d = await ops_body(request)
+    me = ops_request_user(request).get('username', '?')
+    tid = str(d.get('id') or '')
+    if not tid:
+        if not str(d.get('title') or '').strip():
+            return ops_err('Give the work order a title')
+        t = ops_ticket_create(d.get('title'), str(d.get('cp') or '').strip(), ops_int(d.get('conn'), 0, 0, 99),
+                              d.get('category') or 'fault', d.get('priority') or 'P3', me, d.get('description') or '',
+                              {'type': 'manual'}, str(d.get('assignee') or ''), _ops_split_lines(d.get('checklist')),
+                              bool(d.get('planned')))
+        return ops_json({'ok': True, 'ticket': _ops_ticket_public(t)})
+    t = ops_tickets.data.get(tid)
+    if not t:
+        return ops_err('No such work order', 404)
+    changes = {}
+    for k, n in (('title', 140), ('description', 2000), ('cp', 80)):
+        if k in d and str(d[k] or '') != str(t.get(k) or ''):
+            changes[k] = str(d[k] or '')[:n]
+    if 'conn' in d:
+        c = ops_int(d['conn'], 0, 0, 99)
+        if c != int(t.get('conn') or 0):
+            changes['conn'] = c
+    if d.get('category') in OPS_CATEGORIES and d['category'] != t.get('category'):
+        changes['category'] = d['category']
+    if d.get('priority') in OPS_PRIORITIES and d['priority'] != t.get('priority'):
+        cfg = ops_maint_cfg()['sla'][d['priority']]
+        t['sla']['respond_by'] = round(t['created_at'] + float(cfg['respond_h']) * 3600, 1)
+        if t.get('category') != 'preventive':
+            t['sla']['resolve_by'] = round(t['created_at'] + float(cfg['resolve_h']) * 3600, 1)
+        changes['priority'] = d['priority']
+    if 'planned' in d and bool(d['planned']) != bool(t.get('planned')):
+        changes['planned'] = bool(d['planned'])
+    for k in ('planned_from', 'planned_to'):
+        if k in d:
+            v = d[k]
+            ts = _ops_parse_ts(v) if isinstance(v, str) and v else (float(v) if isinstance(v, (int, float)) else None)
+            if ts != t.get(k):
+                changes[k] = ts
+    for k, v in changes.items():
+        t[k] = v
+    if changes:
+        _ops_ticket_hist(t, me, 'edited', fields=sorted(changes))
+    if 'assignee' in d and str(d.get('assignee') or '') != (t.get('assignee') or ''):
+        who = str(d.get('assignee') or '')
+        if who and who not in ops_users.data:
+            return ops_err('No such user', 404)
+        _ops_ticket_assign(t, who, me)
+    ops_tickets.save()
+    return ops_json({'ok': True, 'ticket': _ops_ticket_public(t)})
+
+
+def _ops_split_lines(v) -> List[str]:
+    if isinstance(v, list):
+        return [str(x).strip() for x in v if str(x).strip()]
+    return [x.strip() for x in str(v or '').splitlines() if x.strip()]
+
+
+async def ops_api_tickets_status(request):
+    d = await ops_body(request)
+    t = ops_tickets.data.get(str(d.get('id') or ''))
+    if not t:
+        return ops_err('No such work order', 404)
+    me = ops_request_user(request).get('username', '?')
+    st = str(d.get('status') or '')
+    if st == 'take':
+        if t.get('status') not in OPS_TICKET_ACTIVE:
+            return ops_err('This work order is not active', 409)
+        _ops_ticket_assign(t, me, me)
+        ops_tickets.save()
+        return ops_json({'ok': True, 'ticket': _ops_ticket_public(t)})
+    if st not in OPS_TICKET_STATES:
+        return ops_err('Unknown status')
+    if st in ('resolved', 'closed') and t.get('checklist') and not all(c.get('done') for c in t['checklist']) and not d.get('force'):
+        return ops_err('Tick every checklist item first', 409, kind='checklist')
+    err = ops_ticket_set_status(t, st, me, str(d.get('note') or ''), str(d.get('cause') or ''), str(d.get('action') or ''))
+    if err:
+        return ops_err(err, 409)
+    return ops_json({'ok': True, 'ticket': _ops_ticket_public(t)})
+
+
+async def ops_api_tickets_note(request):
+    d = await ops_body(request)
+    t = ops_tickets.data.get(str(d.get('id') or ''))
+    if not t:
+        return ops_err('No such work order', 404)
+    text = str(d.get('text') or '').strip()
+    if not text:
+        return ops_err('Write the note first')
+    me = ops_request_user(request).get('username', '?')
+    t.setdefault('notes', []).append({'t': round(ops_now()), 'by': me, 'text': text[:1000]})
+    if t.get('status') in OPS_TICKET_ACTIVE and me == t.get('assignee'):
+        t['sla'].setdefault('responded_at', round(ops_now(), 1))
+    _ops_ticket_hist(t, me, 'note')
+    ops_tickets.save()
+    return ops_json({'ok': True, 'ticket': _ops_ticket_public(t)})
+
+
+async def ops_api_tickets_part(request):
+    d = await ops_body(request)
+    t = ops_tickets.data.get(str(d.get('id') or ''))
+    if not t:
+        return ops_err('No such work order', 404)
+    me = ops_request_user(request).get('username', '?')
+    if d.get('remove') is not None:
+        i = ops_int(d.get('remove'), -1)
+        if 0 <= i < len(t.get('parts') or []):
+            gone = t['parts'].pop(i)
+            _ops_ticket_hist(t, me, 'part removed', part=gone.get('part'))
+    else:
+        part = str(d.get('part') or '').strip()
+        if not part:
+            return ops_err('Enter the part')
+        try:
+            qty = max(0.0, float(d.get('qty') or 1))
+        except (TypeError, ValueError):
+            qty = 1.0
+        t.setdefault('parts', []).append({'part': part[:120], 'qty': qty, 'note': str(d.get('note') or '')[:200], 'by': me, 't': round(ops_now())})
+        _ops_ticket_hist(t, me, 'part used', part=part[:120], qty=qty)
+    ops_tickets.save()
+    return ops_json({'ok': True, 'ticket': _ops_ticket_public(t)})
+
+
+async def ops_api_tickets_check(request):
+    d = await ops_body(request)
+    t = ops_tickets.data.get(str(d.get('id') or ''))
+    if not t:
+        return ops_err('No such work order', 404)
+    me = ops_request_user(request).get('username', '?')
+    if d.get('add'):
+        t.setdefault('checklist', []).append({'text': str(d['add'])[:200], 'done': False})
+    else:
+        i = ops_int(d.get('index'), -1)
+        if not 0 <= i < len(t.get('checklist') or []):
+            return ops_err('No such checklist item', 404)
+        item = t['checklist'][i]
+        item['done'] = bool(d.get('done'))
+        item['by'], item['t'] = (me, round(ops_now())) if item['done'] else ('', 0)
+    t['updated_at'] = round(ops_now())
+    ops_tickets.save()
+    return ops_json({'ok': True, 'ticket': _ops_ticket_public(t)})
+
+
+async def ops_api_pm(request):
+    now = ops_now()
+    plans = []
+    for p in sorted(ops_pm_plans.data.values(), key=lambda p: p.get('name') or ''):
+        d = dict(p)
+        cps = [c for c in ops_known_chargers() if ops_pm_matches(p, c)]
+        d['chargers_now'] = cps
+        d['next_due'] = min([ops_pm_due(p, c) for c in cps] or [None]) if cps else None
+        plans.append(d)
+    models = sorted({(s.get('model') or '') for s in OPS_CP.values() if s.get('model')})
+    vendors = sorted({(s.get('vendor') or '') for s in OPS_CP.values() if s.get('vendor')})
+    return ops_json({'plans': plans, 'models': models, 'vendors': vendors, 'chargers': ops_known_chargers(), 'now': now,
+                     'technicians': _ops_tech_list()})
+
+
+async def ops_api_pm_save(request):
+    d = await ops_body(request)
+    pid = str(d.get('id') or '')
+    p = ops_pm_plans.data.get(pid) if pid else None
+    if pid and p is None:
+        return ops_err('No such plan', 404)
+    if p is None:
+        seq = ops_cfg('_seq', {})
+        seq['PM'] = int(seq.get('PM') or 0) + 1
+        p = {'id': f"PM-{seq['PM']:03d}", 'created_at': round(ops_now(), 1), 'last': {}}
+    if not str(d.get('name') or p.get('name') or '').strip():
+        return ops_err('Give the plan a name')
+    p['name'] = str(d.get('name') or p.get('name'))[:120]
+    p['interval_days'] = max(1, ops_int(d.get('interval_days'), p.get('interval_days') or 90))
+    p['lead_days'] = max(0, ops_int(d.get('lead_days'), p.get('lead_days') or 7))
+    p['priority'] = d.get('priority') if d.get('priority') in OPS_PRIORITIES else p.get('priority', 'P3')
+    p['checklist'] = _ops_split_lines(d.get('checklist')) if 'checklist' in d else p.get('checklist', [])
+    p['assignee'] = str(d.get('assignee') or '') if str(d.get('assignee') or '') in ops_users.data or not d.get('assignee') else p.get('assignee', '')
+    p['enabled'] = bool(d.get('enabled', True))
+    ap = d.get('applies') if isinstance(d.get('applies'), dict) else p.get('applies') or {}
+    p['applies'] = {k: _ops_split(ap.get(k)) for k in ('models', 'vendors', 'chargers')}
+    if d.get('start'):
+        ts = _ops_parse_ts(str(d['start'])[:10] + 'T00:00:00+06:00')
+        if ts:
+            p['start'] = ts
+    p.setdefault('start', round(ops_now(), 1))
+    ops_pm_plans.data[p['id']] = p
+    ops_pm_plans.save()
+    made = ops_pm_schedule()
+    return ops_json({'ok': True, 'plan': p, 'created': [t['id'] for t in made]})
+
+
+async def ops_api_pm_delete(request):
+    d = await ops_body(request)
+    if ops_pm_plans.data.pop(str(d.get('id') or ''), None) is None:
+        return ops_err('No such plan', 404)
+    ops_pm_plans.save()
+    return ops_json({'ok': True})
+
+
+async def ops_api_maint_config(request):
+    cfg = ops_maint_cfg()
+    if request.method == 'POST':
+        d = await ops_body(request)
+        for p in OPS_PRIORITIES:
+            v = (d.get('sla') or {}).get(p) or {}
+            for k in ('respond_h', 'resolve_h'):
+                if k in v:
+                    try:
+                        cfg['sla'][p][k] = max(0.0001, float(v[k]))
+                    except (TypeError, ValueError):
+                        return ops_err(f'Not a number: {p} {k}')
+        for sev, p in (d.get('auto_priority') or {}).items():
+            if sev in OPS_SEV_ORDER and p in OPS_PRIORITIES:
+                cfg['auto_priority'][sev] = p
+        for k in ('pause_waiting_parts', 'notify_assignee'):
+            if k in d:
+                cfg[k] = bool(d[k])
+        if 'auto_assign' in d:
+            who = str(d.get('auto_assign') or '')
+            cfg['auto_assign'] = who if who in ops_users.data else ''
+        if 'pm_grace_days' in d:
+            cfg['pm_grace_days'] = max(0, ops_int(d.get('pm_grace_days'), 3))
+        ops_settings.save()
+    return ops_json({'config': cfg, 'technicians': _ops_tech_list()})
+
+
+async def ops_tech_page(request):
+    return web.Response(text=OPS_TECH_HTML, content_type='text/html')
+
+
+OPS_ROUTES += [
+    ('GET', '/api/ops/tickets', ops_api_tickets), ('GET', '/api/ops/ticket', ops_api_ticket),
+    ('POST', '/api/ops/tickets/save', ops_api_tickets_save), ('POST', '/api/ops/tickets/status', ops_api_tickets_status),
+    ('POST', '/api/ops/tickets/note', ops_api_tickets_note), ('POST', '/api/ops/tickets/part', ops_api_tickets_part),
+    ('POST', '/api/ops/tickets/check', ops_api_tickets_check),
+    ('GET', '/api/ops/pm', ops_api_pm), ('POST', '/api/ops/pm/save', ops_api_pm_save), ('POST', '/api/ops/pm/delete', ops_api_pm_delete),
+    ('GET', '/api/ops/maint/config', ops_api_maint_config), ('POST', '/api/ops/maint/config', ops_api_maint_config),
+    ('GET', '/tech', ops_tech_page),
+]
+
+OPS_TECH_HTML = r'''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0a7a3c">
+<title>BPC field jobs</title>
+<link rel="icon" href="/favicon.ico">
+<style>
+:root { --g: #0a7a3c; --g2: #1f9d49; --bg: #f1f5f4; --card: #fff; --ink: #1e293b; --dim: #64748b; --line: #e2e8f0; --bad: #dc2626; --warn: #d97706; --ok: #16a34a; }
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--ink); font-family: Inter, 'Segoe UI', Roboto, 'Noto Sans Thai', Arial, sans-serif; font-size: 15px; }
+header { position: sticky; top: 0; z-index: 5; background: linear-gradient(135deg, #22a94f, #0a7a3c); color: #fff; padding: 10px 14px calc(10px); padding-top: max(10px, env(safe-area-inset-top)); }
+.hrow { display: flex; align-items: center; gap: 10px; }
+.hrow img { height: 34px; background: #fff; border-radius: 8px; padding: 2px; }
+.hrow h1 { font-size: 16px; margin: 0; flex: 1; }
+.hrow small { display: block; font-weight: 500; opacity: 0.85; font-size: 12px; }
+.hbtn { color: #fff; background: rgba(255,255,255,0.18); border: 0; border-radius: 8px; padding: 6px 9px; font-size: 13px; text-decoration: none; cursor: pointer; }
+nav { display: flex; gap: 6px; margin-top: 10px; overflow-x: auto; }
+nav button { flex: 1 0 auto; border: 0; border-radius: 999px; padding: 7px 12px; background: rgba(255,255,255,0.2); color: #fff; font-weight: 600; font-size: 13px; }
+nav button.on { background: #fff; color: var(--g); }
+main { padding: 12px 12px 90px; max-width: 760px; margin: 0 auto; }
+.card { background: var(--card); border-radius: 14px; padding: 12px 14px; margin-bottom: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); border-left: 5px solid #94a3b8; }
+.card.P1 { border-left-color: #dc2626; } .card.P2 { border-left-color: #f97316; } .card.P3 { border-left-color: #2563eb; } .card.P4 { border-left-color: #94a3b8; }
+.card h3 { margin: 0 0 4px; font-size: 15px; }
+.meta { color: var(--dim); font-size: 13px; }
+.row { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-top: 6px; flex-wrap: wrap; }
+.chip { display: inline-block; border-radius: 6px; padding: 2px 8px; color: #fff; font-size: 12px; font-weight: 700; }
+.prio { display: inline-block; border-radius: 6px; padding: 1px 7px; font-size: 12px; font-weight: 800; background: #e2e8f0; }
+.prio.P1 { background: #fee2e2; color: #b91c1c; } .prio.P2 { background: #ffedd5; color: #c2410c; } .prio.P3 { background: #dbeafe; color: #1d4ed8; }
+.bad { color: var(--bad); font-weight: 700; } .warn { color: var(--warn); font-weight: 700; } .ok { color: var(--ok); font-weight: 700; }
+.btns { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; margin: 10px 0; }
+.btn { border: 0; border-radius: 12px; padding: 13px 12px; font-size: 15px; font-weight: 700; background: #e2e8f0; color: var(--ink); cursor: pointer; }
+.btn.pri { background: var(--g2); color: #fff; } .btn.warnb { background: #fef3c7; color: #92400e; } .btn.small { padding: 8px 10px; font-size: 13px; }
+h4 { margin: 16px 0 6px; font-size: 14px; color: var(--g); }
+.chk { display: flex; gap: 10px; align-items: flex-start; padding: 9px 0; border-bottom: 1px solid var(--line); }
+.chk input { width: 22px; height: 22px; flex: 0 0 22px; }
+input.t, textarea.t, select.t { width: 100%; border: 1px solid var(--line); border-radius: 10px; padding: 10px; font: inherit; background: #fff; }
+textarea.t { min-height: 70px; }
+.line { display: flex; gap: 6px; margin-top: 6px; }
+.note { padding: 8px 0; border-bottom: 1px solid var(--line); font-size: 14px; }
+.empty { text-align: center; color: var(--dim); padding: 40px 10px; }
+.toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); background: #0f172a; color: #fff; padding: 10px 16px; border-radius: 10px; font-size: 14px; display: none; z-index: 20; max-width: 90vw; }
+.back { background: none; border: 0; color: var(--g); font-weight: 700; font-size: 15px; padding: 4px 0 10px; cursor: pointer; }
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; font-size: 14px; }
+.kv b { color: var(--dim); font-weight: 600; }
+.lang button { background: transparent; border: 0; color: #fff; opacity: 0.7; font-weight: 700; padding: 4px; }
+.lang button.on { opacity: 1; text-decoration: underline; }
+</style>
+</head>
+<body>
+<header>
+  <div class="hrow"><img src="/static/bpc_logo.png" alt="BPC"><h1><span data-t="Field jobs">Field jobs</span><small id="who"></small></h1>
+    <span class="lang"><button data-lang="en">EN</button><button data-lang="th">ไทย</button></span>
+    <a class="hbtn" href="/" data-t="Console">Console</a><a class="hbtn" href="/logout" title="Logout">🚪</a></div>
+  <nav id="tabs"><button data-v="mine" class="on"><span data-t="My jobs">My jobs</span> <span id="c_mine"></span></button>
+    <button data-v="open"><span data-t="Unassigned">Unassigned</span> <span id="c_open"></span></button>
+    <button data-v="all"><span data-t="All active">All active</span></button></nav>
+</header>
+<main id="main"><div class="empty">…</div></main>
+<div class="toast" id="toast"></div>
+<script>
+(function () {
+  'use strict';
+  const TH = {'Field jobs': 'งานภาคสนาม', 'Console': 'หน้าหลัก', 'My jobs': 'งานของฉัน', 'Unassigned': 'ยังไม่มีผู้รับ', 'All active': 'ทั้งหมด',
+    'No jobs here': 'ไม่มีงาน', 'Take this job': 'รับงานนี้', 'Start work': 'เริ่มงาน', 'Waiting for parts': 'รออะไหล่', 'Resolved': 'แก้ไขเสร็จ',
+    'Back': 'กลับ', 'Checklist': 'รายการตรวจ', 'Parts used': 'อะไหล่ที่ใช้', 'Notes': 'บันทึก', 'Add': 'เพิ่ม', 'Part': 'อะไหล่', 'Qty': 'จำนวน',
+    'Write a note…': 'เขียนบันทึก…', 'Cause found': 'สาเหตุที่พบ', 'What was done': 'สิ่งที่ทำ', 'Save': 'บันทึก', 'Charger': 'ตู้ชาร์จ', 'Priority': 'ความสำคัญ',
+    'Status': 'สถานะ', 'Due': 'กำหนด', 'left': 'เหลือ', 'overdue': 'เกินกำหนด', 'paused': 'หยุดนับเวลา', 'Online': 'ออนไลน์', 'Offline': 'ออฟไลน์',
+    'Soft reset': 'รีเซ็ตแบบ soft', 'Unlock connector': 'ปลดล็อกหัวชาร์จ', 'Charger commands': 'สั่งงานตู้', 'Sent': 'ส่งแล้ว', 'Saved': 'บันทึกแล้ว',
+    'Open': 'เปิด', 'Assigned': 'มอบหมายแล้ว', 'In progress': 'กำลังดำเนินการ', 'Closed': 'ปิดงาน', 'Cancelled': 'ยกเลิก', 'Description': 'รายละเอียด',
+    'Assignee': 'ผู้รับผิดชอบ', 'nobody': 'ยังไม่มี', 'Tick every checklist item first': 'กรุณาติ๊กรายการตรวจให้ครบก่อน', 'Done anyway': 'บันทึกเลย',
+    'Send this command to the charger?': 'ส่งคำสั่งนี้ไปที่ตู้?', 'Not allowed for your role': 'บทบาทของคุณไม่มีสิทธิ์', 'Connector': 'หัวชาร์จ'};
+  let lang = 'en';
+  try { lang = localStorage.getItem('csms_lang') === 'th' ? 'th' : 'en'; } catch (e) {}
+  const t = k => (lang === 'th' && TH[k]) || k;
+  const esc = s => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  const ST = {open: ['Open', '#64748b'], assigned: ['Assigned', '#2563eb'], in_progress: ['In progress', '#7c3aed'], waiting_parts: ['Waiting for parts', '#d97706'],
+    resolved: ['Resolved', '#16a34a'], closed: ['Closed', '#166534'], cancelled: ['Cancelled', '#94a3b8']};
+  const chip = s => '<span class="chip" style="background:' + (ST[s] || ['', '#94a3b8'])[1] + '">' + esc(t((ST[s] || [s])[0])) + '</span>';
+  const pad = n => String(n).padStart(2, '0');
+  const fmt = v => { if (!v) return '—'; const d = new Date(v * 1000 + 6 * 3600 * 1000); return pad(d.getUTCDate()) + '/' + pad(d.getUTCMonth() + 1) + ' ' + pad(d.getUTCHours()) + ':' + pad(d.getUTCMinutes()); };
+  const dur = s => { s = Math.abs(Math.round(s)); const m = Math.floor(s / 60), h = Math.floor(m / 60), d = Math.floor(h / 24); return d ? d + ' d ' + (h % 24) + ' h' : h ? h + ' h ' + (m % 60) + ' min' : m + ' min'; };
+  const $ = id => document.getElementById(id);
+  let view = 'mine', me = null, cur = null, timer = null;
+  function toast(m) { const el = $('toast'); el.textContent = m; el.style.display = 'block'; clearTimeout(toast.h); toast.h = setTimeout(() => { el.style.display = 'none'; }, 2600); }
+  async function api(url, body) {
+    const r = await fetch(url, body === undefined ? {credentials: 'same-origin'} : {method: 'POST', credentials: 'same-origin', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+    if (r.status === 401) { location.href = '/login'; throw new Error('signed out'); }
+    let j = null; try { j = await r.json(); } catch (e) {}
+    if (!r.ok) { const e = new Error((j && j.error) || ('HTTP ' + r.status)); e.status = r.status; e.data = j; throw e; }
+    return j;
+  }
+  const fail = e => toast(e.status === 403 ? t('Not allowed for your role') : t(e.message));
+  function sla(tk) {
+    const s = tk.sla_live || {};
+    if (!['open', 'assigned', 'in_progress', 'waiting_parts'].includes(tk.status) || s.left_s == null) return '';
+    if (tk.status === 'waiting_parts') return '<span class="warn">⏸ ' + t('paused') + '</span>';
+    return s.left_s < 0 ? '<span class="bad">⚠ ' + dur(s.left_s) + ' ' + t('overdue') + '</span>' : '<span class="' + (s.left_s < 3600 ? 'warn' : 'ok') + '">' + dur(s.left_s) + ' ' + t('left') + '</span>';
+  }
+  function applyLang() {
+    document.documentElement.lang = lang;
+    document.querySelectorAll('[data-t]').forEach(el => { el.textContent = t(el.dataset.t); });
+    document.querySelectorAll('.lang button').forEach(b => b.classList.toggle('on', b.dataset.lang === lang));
+  }
+  async function list() {
+    cur = null;
+    const q = view === 'mine' ? '?mine=1' : view === 'open' ? '?unassigned=1' : '';
+    let d;
+    try { d = await api('/api/ops/tickets' + q); } catch (e) { return fail(e); }
+    me = d.me;
+    $('who').textContent = me || '';
+    $('c_mine').textContent = d.counts.mine ? '(' + d.counts.mine + ')' : '';
+    $('c_open').textContent = d.counts.unassigned ? '(' + d.counts.unassigned + ')' : '';
+    $('main').innerHTML = d.tickets.map(tk => '<div class="card ' + esc(tk.priority) + '" data-id="' + esc(tk.id) + '"><h3>' + esc(tk.title) + '</h3>' +
+      '<div class="meta">' + esc(tk.id) + (tk.cp ? ' · ' + esc(tk.cp) + (tk.conn ? ' #' + tk.conn : '') + (tk.name ? ' · ' + esc(tk.name) : '') : '') + '</div>' +
+      '<div class="row"><span><span class="prio ' + esc(tk.priority) + '">' + esc(tk.priority) + '</span> ' + chip(tk.status) + '</span>' + sla(tk) + '</div>' +
+      (view !== 'mine' && tk.assignee ? '<div class="meta">👤 ' + esc(tk.assignee_name || tk.assignee) + '</div>' : '') + '</div>').join('') || '<div class="empty">✓ ' + t('No jobs here') + '</div>';
+  }
+  async function detail(id) {
+    let tk;
+    try { tk = await api('/api/ops/ticket?id=' + encodeURIComponent(id)); } catch (e) { return fail(e); }
+    cur = tk;
+    const st = tk.status, mine = tk.assignee === me, act = ['open', 'assigned', 'in_progress', 'waiting_parts'].includes(st);
+    let b = '';
+    if (act && !mine) b += '<button class="btn pri" data-st="take">🙋 ' + t('Take this job') + '</button>';
+    if (['open', 'assigned', 'waiting_parts'].includes(st)) b += '<button class="btn pri" data-st="in_progress">▶️ ' + t('Start work') + '</button>';
+    if (st === 'in_progress') b += '<button class="btn warnb" data-st="waiting_parts">⏸️ ' + t('Waiting for parts') + '</button>';
+    if (act) b += '<button class="btn" data-st="resolved">✅ ' + t('Resolved') + '</button>';
+    const ch = tk.charger || {};
+    const conns = Object.keys(ch.conns || {}).filter(c => c !== '0');
+    $('main').innerHTML = '<button class="back" id="back">‹ ' + t('Back') + '</button><div class="card ' + esc(tk.priority) + '"><h3>' + esc(tk.title) + '</h3>' +
+      '<div class="kv"><b>' + t('Status') + '</b><span>' + chip(st) + ' ' + sla(tk) + '</span><b>' + t('Priority') + '</b><span class="prio ' + esc(tk.priority) + '">' + esc(tk.priority) + '</span>' +
+      '<b>' + t('Charger') + '</b><span>' + esc(tk.cp || '—') + (tk.conn ? ' #' + tk.conn : '') + (tk.name ? '<br>' + esc(tk.name) : '') + '<br>' + (ch.online ? '<span class="ok">● ' + t('Online') + '</span>' : '<span class="bad">● ' + t('Offline') + '</span>') +
+      ' ' + conns.map(c => '#' + c + ' ' + esc(ch.conns[c])).join(' · ') + '</span><b>' + t('Due') + '</b><span>' + fmt((tk.sla_live || {}).resolve_by) + '</span>' +
+      '<b>' + t('Assignee') + '</b><span>' + esc(tk.assignee_name || tk.assignee || t('nobody')) + '</span></div>' +
+      (tk.description ? '<h4>' + t('Description') + '</h4><div style="white-space:pre-wrap">' + esc(tk.description) + '</div>' : '') + '</div>' +
+      '<div class="btns">' + b + '</div>' +
+      ((tk.checklist || []).length ? '<h4>' + t('Checklist') + '</h4>' + tk.checklist.map((c, i) => '<label class="chk"><input type="checkbox" data-ci="' + i + '"' + (c.done ? ' checked' : '') + '><span>' + esc(c.text) + '</span></label>').join('') : '') +
+      '<h4>' + t('Parts used') + '</h4>' + (tk.parts || []).map(p => '<div class="note">' + esc(p.part) + ' × ' + p.qty + (p.note ? ' <span class="meta">' + esc(p.note) + '</span>' : '') + '</div>').join('') +
+      '<div class="line"><input class="t" id="part" placeholder="' + t('Part') + '"><input class="t" id="qty" type="number" min="0" step="any" value="1" style="max-width:80px"><button class="btn small" id="addPart">' + t('Add') + '</button></div>' +
+      '<h4>' + t('Notes') + '</h4>' + (tk.notes || []).slice().reverse().map(n => '<div class="note"><span class="meta">' + fmt(n.t) + ' · ' + esc(n.by) + '</span><br>' + esc(n.text) + '</div>').join('') +
+      '<textarea class="t" id="note" placeholder="' + t('Write a note…') + '"></textarea><div class="line"><button class="btn small pri" id="addNote">' + t('Add') + '</button></div>' +
+      (tk.cp ? '<h4>' + t('Charger commands') + '</h4><div class="btns"><button class="btn small" data-cmd="reset">🔁 ' + t('Soft reset') + '</button>' +
+        (tk.conn ? '<button class="btn small" data-cmd="unlock">🔓 ' + t('Unlock connector') + ' #' + tk.conn + '</button>' : '') + '</div>' : '');
+    $('back').onclick = () => { list(); };
+    document.querySelectorAll('[data-st]').forEach(x => x.onclick = () => setStatus(tk, x.dataset.st));
+    document.querySelectorAll('[data-ci]').forEach(x => x.onchange = async () => { try { await api('/api/ops/tickets/check', {id: tk.id, index: +x.dataset.ci, done: x.checked}); } catch (e) { fail(e); } });
+    $('addPart').onclick = async () => { const p = $('part').value.trim(); if (!p) return; try { await api('/api/ops/tickets/part', {id: tk.id, part: p, qty: $('qty').value}); toast(t('Saved')); detail(tk.id); } catch (e) { fail(e); } };
+    $('addNote').onclick = async () => { const n = $('note').value.trim(); if (!n) return; try { await api('/api/ops/tickets/note', {id: tk.id, text: n}); toast(t('Saved')); detail(tk.id); } catch (e) { fail(e); } };
+    document.querySelectorAll('[data-cmd]').forEach(x => x.onclick = async () => {
+      if (!confirm(t('Send this command to the charger?'))) return;
+      const body = x.dataset.cmd === 'reset' ? {cp_id: tk.cp, command: 'reset', params: {type: 'Soft'}} : {cp_id: tk.cp, command: 'unlock', params: {connector_id: tk.conn}};
+      try { await api('/api/command', body); toast(t('Sent')); } catch (e) { fail(e); }
+    });
+    window.scrollTo(0, 0);
+  }
+  async function setStatus(tk, st) {
+    if (st === 'resolved') {
+      $('main').insertAdjacentHTML('afterbegin', '<div class="card" id="rs"><h4>' + t('Resolved') + '</h4><input class="t" id="cause" placeholder="' + t('Cause found') + '"><div style="height:6px"></div>' +
+        '<textarea class="t" id="action" placeholder="' + t('What was done') + '"></textarea><div class="btns"><button class="btn pri" id="rsGo">' + t('Save') + '</button></div></div>');
+      window.scrollTo(0, 0);
+      $('rsGo').onclick = async () => {
+        try { await api('/api/ops/tickets/status', {id: tk.id, status: 'resolved', cause: $('cause').value, action: $('action').value}); toast(t('Saved')); list(); }
+        catch (e) {
+          if (e.data && e.data.kind === 'checklist' && confirm(t('Tick every checklist item first') + ' - ' + t('Done anyway') + '?')) {
+            try { await api('/api/ops/tickets/status', {id: tk.id, status: 'resolved', cause: $('cause').value, action: $('action').value, force: true}); toast(t('Saved')); list(); } catch (e2) { fail(e2); }
+          } else fail(e);
+        }
+      };
+      return;
+    }
+    try { await api('/api/ops/tickets/status', {id: tk.id, status: st}); toast(t('Saved')); detail(tk.id); } catch (e) { fail(e); }
+  }
+  $('tabs').onclick = e => { const b = e.target.closest('[data-v]'); if (!b) return; view = b.dataset.v; document.querySelectorAll('#tabs button').forEach(x => x.classList.toggle('on', x === b)); list(); };
+  $('main').onclick = e => { const c = e.target.closest('.card[data-id]'); if (c && !cur) detail(c.dataset.id); };
+  document.querySelectorAll('.lang button').forEach(b => b.onclick = () => { lang = b.dataset.lang; try { localStorage.setItem('csms_lang', lang); } catch (e) {} applyLang(); cur ? detail(cur.id) : list(); });
+  applyLang();
+  list();
+  timer = setInterval(() => { if (!cur && !document.hidden) list(); }, 30000);
+})();
+</script>
+</body>
+</html>
+'''
+
+OPS_CSS_PARTS.append(r'''/* [OPS] v1.5 maintenance */
+.ops-prio { display: inline-block; padding: 0.1rem 0.45rem; border-radius: 6px; font-size: 0.7rem; font-weight: 800; background: #e2e8f0; color: #334155; }
+.ops-prio-P1 { background: #fee2e2; color: #b91c1c; } .ops-prio-P2 { background: #ffedd5; color: #c2410c; } .ops-prio-P3 { background: #dbeafe; color: #1d4ed8; }
+.fleet-table tr.ops-prow-P1 td:first-child { border-left: 4px solid #ef4444; }
+.fleet-table tr.ops-prow-P2 td:first-child { border-left: 4px solid #f97316; }
+.fleet-table tr.ops-prow-P3 td:first-child { border-left: 4px solid #3b82f6; }
+.fleet-table tr.ops-prow-P4 td:first-child { border-left: 4px solid #94a3b8; }
+.ops-tk-head { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; margin-bottom: 0.5rem; }
+.ops-sla-line { width: 100%; font-size: 0.8rem; }
+.ops-flow { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0.3rem 0 0.8rem; }
+.ops-notes { max-height: 220px; overflow-y: auto; font-size: 0.8rem; }
+.ops-notes > div { padding: 0.35rem 0; border-bottom: 1px solid var(--border); white-space: pre-wrap; }
+.ops-chk { display: flex !important; padding: 0.2rem 0; }
+.ops-tallarea { min-height: 140px !important; }
+.ops-cnt { font-size: 0.7em; opacity: 0.8; }
+.ops-modal-body h4 { margin: 0.9rem 0 0.35rem; font-size: 0.82rem; color: var(--accent2); }
+@media (max-width: 700px) { table.ops-cards tr.row { cursor: pointer; } }
+''')
+OPS_JS_PARTS.append(r'''/* [OPS] 🛠️ Maintenance tab (v1.5): work orders, SLA, preventive maintenance plans, settings */
+(function () {
+    'use strict';
+    const OPS = window.OPS;
+    if (!OPS) return;
+    const M = {data: null, scope: 'active', q: '', pm: null, cfg: null};
+    OPS.TK_STATES = {open: ['Open', '#64748b'], assigned: ['Assigned', '#2563eb'], in_progress: ['In progress', '#7c3aed'],
+        waiting_parts: ['Waiting for parts', '#d97706'], resolved: ['Resolved', '#16a34a'], closed: ['Closed', '#166534'], cancelled: ['Cancelled', '#94a3b8']};
+    OPS.TK_FLOW = {open: ['in_progress', 'resolved', 'cancelled'], assigned: ['in_progress', 'resolved', 'cancelled'],
+        in_progress: ['waiting_parts', 'resolved', 'cancelled'], waiting_parts: ['in_progress', 'resolved', 'cancelled'],
+        resolved: ['closed', 'in_progress', 'open'], closed: ['open'], cancelled: ['open']};
+    OPS.TK_ACT = {in_progress: '▶️ Start work', waiting_parts: '⏸️ Waiting for parts', resolved: '✅ Resolved', closed: '🔒 Close',
+        cancelled: '✖️ Cancel', open: '↩️ Reopen'};
+    const CATS = {fault: 'Fault', preventive: 'Preventive', inspection: 'Inspection', complaint: 'Customer complaint', other: 'Other'};
+    const PRIO = {P1: 'P1 · Critical', P2: 'P2 · High', P3: 'P3 · Normal', P4: 'P4 · Low'};
+    OPS.tkChip = s => '<span class="ops-st" style="--c:' + ((OPS.TK_STATES[s] || [])[1] || '#94a3b8') + '">' + OPS.t((OPS.TK_STATES[s] || [s])[0]) + '</span>';
+    OPS.prioPill = p => '<span class="ops-prio ops-prio-' + OPS.esc(p) + '">' + OPS.esc(p) + '</span>';
+    OPS.slaCell = function (t, now) {
+        const s = t.sla_live || {};
+        if (!['open', 'assigned', 'in_progress', 'waiting_parts'].includes(t.status)) {
+            return s.resolve_breach ? '<span class="ops-bad">' + OPS.t('late') + '</span>' : '<span class="ops-ok">' + OPS.t('on time') + '</span>';
+        }
+        if (t.status === 'waiting_parts' && s.left_s != null) return '<span class="ops-warn">⏸ ' + OPS.t('paused') + '</span><br><span class="muted">' + OPS.dur(Math.abs(s.left_s)) + '</span>';
+        if (s.left_s == null) return '—';
+        if (s.left_s < 0) return '<span class="ops-bad">⚠️ ' + OPS.t('{d} overdue', {d: OPS.dur(-s.left_s)}) + '</span>';
+        return '<span class="' + (s.left_s < 3600 ? 'ops-warn' : 'ops-ok') + '">' + OPS.t('{d} left', {d: OPS.dur(s.left_s)}) + '</span>' +
+            (s.respond_breach ? '<br><span class="ops-bad">' + OPS.t('no response yet') + '</span>' : '');
+    };
+
+    function build(v) {
+        v.dataset.built = '1';
+        const scopes = [['active', 'Active'], ['mine', 'Mine'], ['unassigned', 'Unassigned'], ['done', 'Done (30 days)'], ['all', 'All']];
+        v.innerHTML = '<section class="kpis ops-kpis">' + OPS.kpi('info', 'Active work orders', 'mKpiAct', '') + OPS.kpi('warn', 'Overdue', 'mKpiLate', 'past the SLA') +
+            OPS.kpi('warn', 'Waiting for parts', 'mKpiParts', '') + OPS.kpi('info', 'Preventive due', 'mKpiPm', 'next 14 days') +
+            OPS.kpi('info', 'MTTR (30 days)', 'mKpiMttr', 'mean time to repair') + OPS.kpi('good', 'SLA met (30 days)', 'mKpiSla', '') + '</section>' +
+            '<section class="pay-panel ops-panel"><div class="ops-head"><h3>' + OPS.t('🛠️ Work orders') + '</h3><div class="ops-actions ops-filters">' +
+            '<span class="ops-seg" id="mScope">' + scopes.map(s => '<button class="chip" data-s="' + s[0] + '">' + OPS.t(s[1]) + ' <span class="ops-cnt" id="mCnt_' + s[0] + '"></span></button>').join('') + '</span>' +
+            '<input class="tb-inp" type="search" id="mQ" autocomplete="off" data-i18n-placeholder="Search…" placeholder="' + OPS.esc(OPS.tx('Search…')) + '">' +
+            '<a class="tb-btn" href="/tech" target="_blank" rel="noopener">' + OPS.t('📱 Phone view') + '</a>' +
+            (OPS.can('tickets') ? '<button class="tb-btn primary" id="mNew">' + OPS.t('➕ New work order') + '</button>' : '') + '</div></div>' +
+            '<div class="ops-table-wrap"><table class="fleet-table ops-table ops-cards" id="mTable"></table></div></section>' +
+            '<section class="pay-panel ops-panel"><div class="ops-head"><h3>' + OPS.t('🗓️ Preventive maintenance') + '</h3><div class="ops-actions">' +
+            (OPS.can('config') ? '<button class="tb-btn" id="mPmNew">' + OPS.t('➕ New plan') + '</button>' : '') + '</div></div>' +
+            '<div class="ops-grid2"><div><h4>' + OPS.t('Plans') + '</h4><div class="ops-table-wrap"><table class="fleet-table ops-table" id="mPm"></table></div></div>' +
+            '<div><h4>' + OPS.t('Due in the next 30 days') + '</h4><div class="ops-table-wrap ops-tall"><table class="fleet-table ops-table" id="mPmDue"></table></div></div></div></section>' +
+            '<section class="pay-panel ops-panel"><details id="mCfgBox"><summary><b>' + OPS.t('⚙️ SLA & work-order settings') + '</b></summary><div id="mCfg"></div></details></section>';
+        OPS.$('mScope').onclick = e => { const b = e.target.closest('[data-s]'); if (b) { M.scope = b.dataset.s; load(); } };
+        OPS.$('mQ').addEventListener('input', () => { M.q = OPS.$('mQ').value; render(); });
+        if (OPS.$('mNew')) OPS.$('mNew').onclick = () => newTicket();
+        if (OPS.$('mPmNew')) OPS.$('mPmNew').onclick = () => planEdit(null);
+        OPS.$('mCfgBox').addEventListener('toggle', () => { if (OPS.$('mCfgBox').open) loadCfg(); });
+        v.addEventListener('click', e => {
+            const r = e.target.closest('[data-tk]');
+            if (r) OPS.ticketOpen(r.dataset.tk);
+            const p = e.target.closest('[data-pm]');
+            if (p) planEdit(p.dataset.pm);
+        });
+    }
+
+    async function load() {
+        document.querySelectorAll('#mScope [data-s]').forEach(b => b.classList.toggle('active', b.dataset.s === M.scope));
+        const q = {status: M.scope === 'mine' || M.scope === 'unassigned' ? 'active' : M.scope};
+        if (M.scope === 'mine') q.mine = 1;
+        if (M.scope === 'unassigned') q.unassigned = 1;
+        try { M.data = await OPS.api(OPS.csvLink('/api/ops/tickets', q)); } catch (e) { return OPS.fail(e); }
+        render();
+        loadPm();
+    }
+
+    function render() {
+        const d = M.data, c = d.counts, now = d.now, td = OPS.td;
+        OPS.$('mKpiAct').textContent = c.active;
+        OPS.$('mKpiActSub').innerHTML = OPS.t('{m} mine · {u} unassigned', {m: c.mine, u: c.unassigned});
+        OPS.$('mKpiLate').textContent = c.overdue;
+        OPS.$('mKpiParts').textContent = c.waiting_parts;
+        OPS.$('mKpiPm').textContent = c.pm_due14;
+        OPS.$('mKpiMttr').innerHTML = c.mttr_h == null ? '—' : OPS.num(c.mttr_h, 1) + ' <small>h</small>';
+        OPS.$('mKpiSla').textContent = c.sla_pct == null ? '—' : OPS.num(c.sla_pct, 0) + '%';
+        [['active', c.active], ['mine', c.mine], ['unassigned', c.unassigned]].forEach(x => { const el = OPS.$('mCnt_' + x[0]); if (el) el.textContent = x[1] || ''; });
+        const q = (M.q || '').toLowerCase();
+        const rows = d.tickets.filter(t => !q || (t.id + ' ' + t.title + ' ' + t.cp + ' ' + (t.assignee || '')).toLowerCase().includes(q));
+        OPS.$('mTable').innerHTML = '<thead><tr><th>' + OPS.t('Priority') + '</th><th>' + OPS.t('Work order') + '</th><th>' + OPS.t('Charger') + '</th><th>' + OPS.t('Status') +
+            '</th><th>' + OPS.t('Assignee') + '</th><th>' + OPS.t('SLA') + '</th><th>' + OPS.t('Updated') + '</th></tr></thead><tbody>' +
+            (rows.map(t => '<tr class="row ops-prow-' + OPS.esc(t.priority) + '" data-tk="' + OPS.esc(t.id) + '">' + td('Priority', OPS.prioPill(t.priority)) +
+                td('Work order', '<b>' + OPS.esc(t.title) + '</b><br><span class="muted">' + OPS.esc(t.id) + ' · ' + OPS.t(CATS[t.category] || t.category) +
+                    (t.planned ? ' · ' + OPS.t('planned') : '') + ((t.alerts || []).length ? ' · 🔔 ' + t.alerts.length : '') + '</span>') +
+                td('Charger', t.cp ? OPS.cpLabel(t.cp, t.name) + (t.conn ? '<br>#' + t.conn : '') : '—') + td('Status', OPS.tkChip(t.status)) +
+                td('Assignee', t.assignee ? OPS.esc(t.assignee_name || t.assignee) : '<span class="muted">' + OPS.t('nobody') + '</span>') +
+                td('SLA', OPS.slaCell(t, now)) + td('Updated', OPS.ago(t.updated_at), 'ops-nowrap') + '</tr>').join('') ||
+                '<tr><td colspan="7" class="ops-ok">✓ ' + OPS.t('No work orders here') + '</td></tr>') + '</tbody>';
+    }
+
+    // ---- one work order (also used by the Alerts tab)
+    OPS.ticketOpen = async function (id) {
+        let t;
+        try { t = await OPS.api('/api/ops/ticket?id=' + encodeURIComponent(id)); } catch (e) { return OPS.fail(e); }
+        const techs = (M.data && M.data.technicians) || [];
+        const can = OPS.can('tickets');
+        const ro = can ? '' : ' disabled';
+        const now = Date.now() / 1000;
+        const flow = (OPS.TK_FLOW[t.status] || []).map(s => '<button class="tb-btn' + (s === 'resolved' ? ' primary' : '') + '" data-to="' + s + '">' + OPS.t(OPS.TK_ACT[s]) + '</button>').join('');
+        const dl = v => { if (!v) return ''; const d = new Date(v * 1000 + 6 * 3600 * 1000); return d.toISOString().slice(0, 16); };
+        const html = '<div class="ops-tk-head">' + OPS.prioPill(t.priority) + ' ' + OPS.tkChip(t.status) + ' <span class="muted">' + OPS.esc(t.id) + ' · ' +
+            OPS.t('created {t} by {b}', {t: OPS.fmt(t.created_at), b: t.created_by}) + '</span><div class="ops-sla-line">' + OPS.slaCell(t, now) +
+            (t.sla_live && t.sla_live.resolve_by ? ' · ' + OPS.t('resolve by {t}', {t: OPS.fmt(t.sla_live.resolve_by)}) : '') + '</div></div>' +
+            (can ? '<div class="ops-flow">' + flow + '</div>' : '') +
+            '<div class="ops-form"><label class="wide">' + OPS.t('Title') + '<input class="tb-inp" id="tkTitle" value="' + OPS.esc(t.title) + '"' + ro + '></label>' +
+            '<label>' + OPS.t('Charger') + '<input class="tb-inp" id="tkCp" value="' + OPS.esc(t.cp) + '"' + ro + '></label>' +
+            '<label>' + OPS.t('Connector') + '<input class="tb-inp" type="number" min="0" id="tkConn" value="' + OPS.esc(t.conn || 0) + '"' + ro + '></label>' +
+            '<label>' + OPS.t('Priority') + '<select class="tb-sel" id="tkPrio"' + ro + '>' + Object.keys(PRIO).map(p => OPS.opt(p, PRIO[p], p === t.priority)).join('') + '</select></label>' +
+            '<label>' + OPS.t('Category') + '<select class="tb-sel" id="tkCat"' + ro + '>' + Object.keys(CATS).map(k => OPS.opt(k, CATS[k], k === t.category)).join('') + '</select></label>' +
+            '<label>' + OPS.t('Assignee') + '<select class="tb-sel" id="tkWho"' + ro + '>' + OPS.opt('', 'nobody', !t.assignee) + techs.map(u => OPS.opt(u.username, u.name, u.username === t.assignee)).join('') + '</select></label>' +
+            '<label class="ops-check"><input type="checkbox" id="tkPlanned"' + (t.planned ? ' checked' : '') + ro + '> ' + OPS.t('Planned work (not counted as downtime)') + '</label>' +
+            '<label>' + OPS.t('Planned from (BTT)') + '<input class="tb-inp" type="datetime-local" id="tkPf" value="' + dl(t.planned_from) + '"' + ro + '></label>' +
+            '<label>' + OPS.t('Planned to (BTT)') + '<input class="tb-inp" type="datetime-local" id="tkPt" value="' + dl(t.planned_to) + '"' + ro + '></label>' +
+            '<label class="wide">' + OPS.t('Description') + '<textarea class="tb-inp" id="tkDesc"' + ro + '>' + OPS.esc(t.description || '') + '</textarea></label></div>' +
+            (t.charger ? '<div class="pay-help">' + OPS.t('Charger now') + ': ' + (t.charger.online ? '<span class="ops-ok">● ' + OPS.t('Online') + '</span>' : '<span class="ops-bad">● ' + OPS.t('Offline') + '</span>') + ' ' +
+                Object.keys(t.charger.conns || {}).filter(c => c !== '0').map(c => '#' + c + ' ' + OPS.stChip(t.charger.conns[c])).join(' ') + '</div>' : '') +
+            '<h4>' + OPS.t('Checklist') + '</h4><div id="tkChk">' + ((t.checklist || []).map((c, i) => '<label class="ops-check ops-chk"><input type="checkbox" data-ci="' + i + '"' + (c.done ? ' checked' : '') + ro + '> ' +
+                OPS.esc(c.text) + (c.done && c.by ? ' <span class="muted">' + OPS.esc(c.by) + '</span>' : '') + '</label>').join('') || '<span class="muted">—</span>') + '</div>' +
+            (can ? '<div class="ops-inline"><input class="tb-inp" id="tkChkAdd" placeholder="' + OPS.esc(OPS.tx('Add a checklist item')) + '"><button class="tb-btn ops-mini" id="tkChkBtn">➕</button></div>' : '') +
+            '<h4>' + OPS.t('Parts used') + '</h4><table class="fleet-table ops-table"><tbody>' + ((t.parts || []).map((p, i) => '<tr><td>' + OPS.esc(p.part) + '</td><td>× ' + OPS.num(p.qty, 2) +
+                '</td><td class="muted">' + OPS.esc(p.note || '') + ' · ' + OPS.esc(p.by) + '</td><td>' + (can ? '<button class="tb-btn ops-mini" data-rmpart="' + i + '">✕</button>' : '') + '</td></tr>').join('') ||
+                '<tr><td class="muted">—</td></tr>') + '</tbody></table>' +
+            (can ? '<div class="ops-inline"><input class="tb-inp" id="tkPart" placeholder="' + OPS.esc(OPS.tx('Part (e.g. 125 A contactor)')) + '"><input class="tb-inp ops-num" id="tkQty" type="number" min="0" step="any" value="1">' +
+                '<input class="tb-inp" id="tkPartNote" placeholder="' + OPS.esc(OPS.tx('Note')) + '"><button class="tb-btn ops-mini" id="tkPartBtn">➕</button></div>' : '') +
+            '<h4>' + OPS.t('Notes') + '</h4><div class="ops-notes">' + ((t.notes || []).slice().reverse().map(n => '<div><span class="muted">' + OPS.fmt(n.t) + ' · <b>' + OPS.esc(n.by) + '</b></span><br>' + OPS.esc(n.text) + '</div>').join('') ||
+                '<span class="muted">—</span>') + '</div>' +
+            (can ? '<div class="ops-inline"><textarea class="tb-inp" id="tkNote" placeholder="' + OPS.esc(OPS.tx('Write a note…')) + '"></textarea><button class="tb-btn ops-mini" id="tkNoteBtn">' + OPS.t('Add note') + '</button></div>' : '') +
+            ((t.alert_items || []).length ? '<h4>' + OPS.t('Alerts') + '</h4>' + t.alert_items.map(a => '<div>' + OPS.sevPill(a.sev) + ' ' + OPS.esc(a.id) + ' · ' + OPS.t(a.title) + ' · ' + OPS.esc(OPS.tx(a.state)) + '</div>').join('') : '') +
+            (t.resolution ? '<h4>' + OPS.t('Resolution') + '</h4><div>' + OPS.esc(t.resolution.cause || '') + '<br><span class="muted">' + OPS.esc(t.resolution.action || '') + '</span></div>' : '') +
+            '<details><summary>' + OPS.t('History') + '</summary>' + (t.history || []).slice().reverse().map(h => '<div class="muted">' + OPS.fmt(h.t, true) + ' · ' + OPS.esc(h.by) + ' · ' +
+                OPS.esc(OPS.tx(h.what)) + (h.to ? ' → ' + OPS.esc(h.to) : '') + (h.note ? ' · ' + OPS.esc(h.note) : '') + '</div>').join('') + '</details>';
+        const box = OPS.modal('Work order {u}', html, can ? [{label: 'Close'}, {label: '💾 Save', cls: 'primary', run: async b => {
+            await OPS.post('/api/ops/tickets/save', {id: t.id, title: OPS.val(b, '#tkTitle'), cp: OPS.val(b, '#tkCp'), conn: OPS.val(b, '#tkConn'),
+                priority: OPS.val(b, '#tkPrio'), category: OPS.val(b, '#tkCat'), assignee: OPS.val(b, '#tkWho'), planned: OPS.val(b, '#tkPlanned'),
+                description: b.querySelector('#tkDesc').value, planned_from: b.querySelector('#tkPf').value ? b.querySelector('#tkPf').value + ':00+06:00' : '',
+                planned_to: b.querySelector('#tkPt').value ? b.querySelector('#tkPt').value + ':00+06:00' : ''});
+            OPS.toast(OPS.tx('Saved'), 'success');
+            refreshAll();
+            return true;
+        }}] : [{label: 'Close'}], {wide: true, vars: {u: t.id}});
+        const reopen = () => { box.remove(); OPS.ticketOpen(t.id); refreshAll(); };
+        const call = async (url, body) => { try { await OPS.post(url, Object.assign({id: t.id}, body)); reopen(); } catch (e) { OPS.fail(e); } };
+        box.querySelectorAll('[data-to]').forEach(b => b.onclick = () => statusChange(t, b.dataset.to, box, reopen));
+        box.querySelectorAll('[data-ci]').forEach(cb => cb.onchange = () => call('/api/ops/tickets/check', {index: +cb.dataset.ci, done: cb.checked}));
+        box.querySelectorAll('[data-rmpart]').forEach(b => b.onclick = () => call('/api/ops/tickets/part', {remove: +b.dataset.rmpart}));
+        const q = s => box.querySelector(s);
+        if (q('#tkChkBtn')) q('#tkChkBtn').onclick = () => { if (q('#tkChkAdd').value.trim()) call('/api/ops/tickets/check', {add: q('#tkChkAdd').value.trim()}); };
+        if (q('#tkPartBtn')) q('#tkPartBtn').onclick = () => { if (q('#tkPart').value.trim()) call('/api/ops/tickets/part', {part: q('#tkPart').value.trim(), qty: q('#tkQty').value, note: q('#tkPartNote').value}); };
+        if (q('#tkNoteBtn')) q('#tkNoteBtn').onclick = () => { if (q('#tkNote').value.trim()) call('/api/ops/tickets/note', {text: q('#tkNote').value.trim()}); };
+    };
+
+    async function statusChange(t, to, box, after) {
+        if (to === 'resolved' || to === 'closed') {
+            const done = (t.checklist || []).every(c => c.done);
+            OPS.modal(to === 'resolved' ? 'Resolve work order {u}' : 'Close work order {u}',
+                '<div class="ops-form"><label class="wide">' + OPS.t('Cause found') + '<input class="tb-inp" id="rsCause" value="' + OPS.esc((t.resolution || {}).cause || '') + '"></label>' +
+                '<label class="wide">' + OPS.t('What was done') + '<textarea class="tb-inp" id="rsAct">' + OPS.esc((t.resolution || {}).action || '') + '</textarea></label></div>' +
+                (done ? '' : '<div class="pay-help ops-warn">' + OPS.t('Some checklist items are not ticked.') + '</div>'),
+                [{label: 'Cancel'}, {label: OPS.TK_ACT[to], cls: 'primary', run: async b => {
+                    await OPS.post('/api/ops/tickets/status', {id: t.id, status: to, cause: OPS.val(b, '#rsCause'), action: b.querySelector('#rsAct').value, force: true});
+                    OPS.toast(OPS.tx('Saved'), 'success'); after(); return true;
+                }}], {vars: {u: t.id}});
+            return;
+        }
+        try { await OPS.post('/api/ops/tickets/status', {id: t.id, status: to}); OPS.toast(OPS.tx('Saved'), 'success'); after(); } catch (e) { OPS.fail(e); }
+    }
+
+    function newTicket(pre) {
+        pre = pre || {};
+        const techs = (M.data && M.data.technicians) || [];
+        OPS.modal('New work order', '<div class="ops-form"><label class="wide">' + OPS.t('Title') + '<input class="tb-inp" id="ntTitle" value="' + OPS.esc(pre.title || '') + '"></label>' +
+            '<label>' + OPS.t('Charger') + '<input class="tb-inp" id="ntCp" value="' + OPS.esc(pre.cp || '') + '" list="ntCps"></label>' +
+            '<label>' + OPS.t('Connector') + '<input class="tb-inp" type="number" min="0" id="ntConn" value="' + OPS.esc(pre.conn || 0) + '"></label>' +
+            '<label>' + OPS.t('Priority') + '<select class="tb-sel" id="ntPrio">' + Object.keys(PRIO).map(p => OPS.opt(p, PRIO[p], p === (pre.priority || 'P3'))).join('') + '</select></label>' +
+            '<label>' + OPS.t('Category') + '<select class="tb-sel" id="ntCat">' + Object.keys(CATS).map(k => OPS.opt(k, CATS[k], k === (pre.category || 'fault'))).join('') + '</select></label>' +
+            '<label>' + OPS.t('Assignee') + '<select class="tb-sel" id="ntWho">' + OPS.opt('', 'nobody', true) + techs.map(u => OPS.opt(u.username, u.name)).join('') + '</select></label>' +
+            '<label class="wide">' + OPS.t('Description') + '<textarea class="tb-inp" id="ntDesc">' + OPS.esc(pre.description || '') + '</textarea></label>' +
+            '<label class="wide">' + OPS.t('Checklist (one item per line)') + '<textarea class="tb-inp" id="ntChk"></textarea></label></div>',
+            [{label: 'Cancel'}, {label: '💾 Save', cls: 'primary', run: async b => {
+                const j = await OPS.post('/api/ops/tickets/save', {title: OPS.val(b, '#ntTitle'), cp: OPS.val(b, '#ntCp'), conn: OPS.val(b, '#ntConn'),
+                    priority: OPS.val(b, '#ntPrio'), category: OPS.val(b, '#ntCat'), assignee: OPS.val(b, '#ntWho'), description: b.querySelector('#ntDesc').value,
+                    checklist: b.querySelector('#ntChk').value});
+                OPS.toast(OPS.tx('Work order {u} created', {u: j.ticket.id}), 'success'); refreshAll(); return true;
+            }}]);
+    }
+    OPS.newTicket = newTicket;
+
+    // ---- preventive maintenance plans
+    async function loadPm() {
+        try { M.pm = await OPS.api('/api/ops/pm'); } catch (e) { return OPS.fail(e); }
+        const p = M.pm;
+        OPS.$('mPm').innerHTML = '<thead><tr><th>' + OPS.t('Plan') + '</th><th>' + OPS.t('Every') + '</th><th>' + OPS.t('Chargers') + '</th><th>' + OPS.t('Next due') +
+            '</th><th></th></tr></thead><tbody>' + (p.plans.map(x => '<tr><td><b>' + OPS.esc(x.name) + '</b>' + (x.enabled === false ? ' <span class="pill">' + OPS.t('off') + '</span>' : '') +
+                '<br><span class="muted">' + OPS.esc(x.id) + ' · ' + OPS.esc([].concat(x.applies.models || [], x.applies.vendors || []).join(', ') || OPS.tx('all chargers')) + '</span></td><td>' +
+                OPS.t('{n} days', {n: x.interval_days}) + '</td><td class="c">' + x.chargers_now.length + '</td><td class="ops-nowrap">' + (x.next_due ? OPS.fmt(x.next_due).slice(0, 10) : '—') +
+                '</td><td>' + (OPS.can('config') ? '<button class="tb-btn ops-mini" data-pm="' + OPS.esc(x.id) + '">' + OPS.t('✏️ Edit') + '</button>' : '') + '</td></tr>').join('') ||
+                '<tr><td colspan="5" class="muted">' + OPS.t('No plans yet - add one, e.g. a quarterly inspection of every charger.') + '</td></tr>') + '</tbody>';
+        OPS.$('mPmDue').innerHTML = '<thead><tr><th>' + OPS.t('Due') + '</th><th>' + OPS.t('Charger') + '</th><th>' + OPS.t('Plan') + '</th></tr></thead><tbody>' +
+            (((M.data && M.data.pm_soon) || []).map(x => '<tr><td class="ops-nowrap ' + (x.due < Date.now() / 1000 ? 'ops-bad' : '') + '">' + OPS.fmt(x.due).slice(0, 10) + '</td><td>' + OPS.esc(x.cp) +
+                '</td><td>' + OPS.esc(x.name) + '</td></tr>').join('') || '<tr><td colspan="3" class="muted">—</td></tr>') + '</tbody>';
+    }
+
+    function planEdit(id) {
+        const p = id ? (M.pm.plans.find(x => x.id === id) || {}) : {interval_days: 90, lead_days: 7, priority: 'P3', enabled: true, applies: {}, checklist: [
+            'Visual inspection of the enclosure, cables and plugs', 'Clean the air filters and check the fans', 'Check the tightness of the power terminals',
+            'Test the emergency stop and the residual-current device', 'Check the display, RFID reader and the network link', 'Run a test charge and compare the energy meter']};
+        const ap = p.applies || {};
+        const techs = (M.pm && M.pm.technicians) || [];
+        OPS.modal(id ? 'Edit plan {u}' : 'New preventive maintenance plan', '<div class="ops-form"><label class="wide">' + OPS.t('Name') + '<input class="tb-inp" id="pmName" value="' + OPS.esc(p.name || '') + '" placeholder="' + OPS.esc(OPS.tx('Quarterly inspection')) + '"></label>' +
+            '<label>' + OPS.t('Every (days)') + '<input class="tb-inp" type="number" min="1" id="pmInt" value="' + OPS.esc(p.interval_days) + '"></label>' +
+            '<label>' + OPS.t('Open the job … days before') + '<input class="tb-inp" type="number" min="0" id="pmLead" value="' + OPS.esc(p.lead_days) + '"></label>' +
+            '<label>' + OPS.t('Priority') + '<select class="tb-sel" id="pmPrio">' + Object.keys(PRIO).map(k => OPS.opt(k, PRIO[k], k === p.priority)).join('') + '</select></label>' +
+            '<label>' + OPS.t('First due date') + '<input class="tb-inp" type="date" id="pmStart" value="' + (p.start ? OPS.fmt(p.start).slice(0, 10) : OPS.day()) + '"></label>' +
+            '<label>' + OPS.t('Assign to') + '<select class="tb-sel" id="pmWho">' + OPS.opt('', 'nobody', !p.assignee) + techs.map(u => OPS.opt(u.username, u.name, u.username === p.assignee)).join('') + '</select></label>' +
+            '<label class="ops-check"><input type="checkbox" id="pmOn"' + (p.enabled !== false ? ' checked' : '') + '> ' + OPS.t('Plan active') + '</label>' +
+            '<label>' + OPS.t('Only models (comma separated)') + '<input class="tb-inp" id="pmModels" value="' + OPS.esc((ap.models || []).join(', ') ) + '" placeholder="' + OPS.esc((M.pm.models || []).join(', ')) + '"></label>' +
+            '<label>' + OPS.t('Only vendors') + '<input class="tb-inp" id="pmVendors" value="' + OPS.esc((ap.vendors || []).join(', ')) + '" placeholder="' + OPS.esc((M.pm.vendors || []).join(', ')) + '"></label>' +
+            '<label>' + OPS.t('Only chargers') + '<input class="tb-inp" id="pmCps" value="' + OPS.esc((ap.chargers || []).join(', ')) + '"></label>' +
+            '<label class="wide">' + OPS.t('Checklist (one item per line)') + '<textarea class="tb-inp ops-tallarea" id="pmChk">' + OPS.esc((p.checklist || []).join('\n')) + '</textarea></label></div>' +
+            '<div class="pay-help">' + OPS.t('Leave models, vendors and chargers empty to cover every charger. A job opens automatically before each due date; closing it starts the next interval.') + '</div>',
+            [].concat(id ? [{label: '🗑️ Delete', run: async () => { if (!OPS.confirm('Delete this plan?')) return false; await OPS.post('/api/ops/pm/delete', {id}); loadPm(); return true; }}] : [],
+                [{label: 'Cancel'}, {label: '💾 Save', cls: 'primary', run: async b => {
+                    const j = await OPS.post('/api/ops/pm/save', {id: id || '', name: OPS.val(b, '#pmName'), interval_days: OPS.val(b, '#pmInt'), lead_days: OPS.val(b, '#pmLead'),
+                        priority: OPS.val(b, '#pmPrio'), start: OPS.val(b, '#pmStart'), assignee: OPS.val(b, '#pmWho'), enabled: OPS.val(b, '#pmOn'),
+                        applies: {models: OPS.val(b, '#pmModels'), vendors: OPS.val(b, '#pmVendors'), chargers: OPS.val(b, '#pmCps')}, checklist: b.querySelector('#pmChk').value});
+                    OPS.toast(OPS.tx('Saved') + (j.created && j.created.length ? ' · ' + OPS.tx('{n} jobs opened', {n: j.created.length}) : ''), 'success');
+                    refreshAll(); return true;
+                }}]), {wide: true, vars: {u: id || ''}});
+    }
+
+    async function loadCfg() {
+        let j;
+        try { j = await OPS.api('/api/ops/maint/config'); } catch (e) { return OPS.fail(e); }
+        M.cfg = j.config;
+        const c = j.config, ro = OPS.can('config') ? '' : ' disabled';
+        OPS.$('mCfg').innerHTML = '<table class="fleet-table ops-table"><thead><tr><th>' + OPS.t('Priority') + '</th><th>' + OPS.t('Respond within (h)') + '</th><th>' + OPS.t('Resolve within (h)') +
+            '</th></tr></thead><tbody>' + Object.keys(PRIO).map(p => '<tr><td>' + OPS.esc(PRIO[p]) + '</td><td><input class="tb-inp ops-num" type="number" min="0" step="any" data-p="' + p + '" data-k="respond_h" value="' +
+                OPS.esc(c.sla[p].respond_h) + '"' + ro + '></td><td><input class="tb-inp ops-num" type="number" min="0" step="any" data-p="' + p + '" data-k="resolve_h" value="' + OPS.esc(c.sla[p].resolve_h) + '"' + ro + '></td></tr>').join('') +
+            '</tbody></table><div class="ops-form ops-cfg">' + ['critical', 'major', 'minor', 'info'].map(s => '<label>' + OPS.t('Alert {s} → priority', {s: OPS.tx(OPS.SEV[s][1])}) +
+                '<select class="tb-sel" data-sev="' + s + '"' + ro + '>' + Object.keys(PRIO).map(p => OPS.opt(p, PRIO[p], c.auto_priority[s] === p)).join('') + '</select></label>').join('') +
+            '<label>' + OPS.t('Give new jobs to') + '<select class="tb-sel" id="mcAuto"' + ro + '>' + OPS.opt('', 'nobody', !c.auto_assign) + (j.technicians || []).map(u => OPS.opt(u.username, u.name, u.username === c.auto_assign)).join('') + '</select></label>' +
+            '<label>' + OPS.t('Preventive job grace (days after due)') + '<input class="tb-inp" type="number" min="0" id="mcGrace" value="' + OPS.esc(c.pm_grace_days) + '"' + ro + '></label>' +
+            '<label class="ops-check"><input type="checkbox" id="mcPause"' + (c.pause_waiting_parts ? ' checked' : '') + ro + '> ' + OPS.t('Stop the SLA clock while waiting for parts') + '</label>' +
+            '<label class="ops-check"><input type="checkbox" id="mcTell"' + (c.notify_assignee ? ' checked' : '') + ro + '> ' + OPS.t('Tell the technician about a new job (email / Telegram / SMS)') + '</label></div>' +
+            (OPS.can('config') ? '<div class="pay-form-row"><button class="tb-btn primary" id="mcSave">' + OPS.t('💾 Save settings') + '</button></div>' : '');
+        const b = OPS.$('mcSave');
+        if (b) b.onclick = async () => {
+            const sla = {}, ap = {};
+            OPS.$('mCfg').querySelectorAll('[data-p]').forEach(i => { sla[i.dataset.p] = sla[i.dataset.p] || {}; sla[i.dataset.p][i.dataset.k] = i.value; });
+            OPS.$('mCfg').querySelectorAll('[data-sev]').forEach(i => { ap[i.dataset.sev] = i.value; });
+            try {
+                await OPS.post('/api/ops/maint/config', {sla, auto_priority: ap, auto_assign: OPS.$('mcAuto').value, pm_grace_days: OPS.$('mcGrace').value,
+                    pause_waiting_parts: OPS.$('mcPause').checked, notify_assignee: OPS.$('mcTell').checked});
+                OPS.toast(OPS.tx('Saved'), 'success');
+            } catch (e) { OPS.fail(e); }
+        };
+    }
+
+    function refreshAll() { if (OPS.active === 'maint') load(); }
+
+    OPS.register({tab: 'maint', perm: 'view', every: 20,
+        show() { const v = OPS.$('view-maint'); if (!v) return; if (!v.dataset.built) build(v); load(); },
+        refresh() { load(); },
+        relang() { if (M.data) render(); loadPm(); }});
+    document.addEventListener('ops-ready', async () => {
+        const upd = async () => { try { const d = await OPS.api('/api/ops/tickets?mine=1'); const b = OPS.$('maintBadge'); if (b) { const n = d.counts.mine || 0; b.textContent = n || ''; b.classList.toggle('show', !!n); } } catch (e) {} };
+        if (OPS.can('tickets')) { upd(); setInterval(() => { if (!document.hidden) upd(); }, 60000); }
+    });
+
+    Object.assign(OPS.actionLabels, {'/api/ops/tickets/save': 'Work order saved', '/api/ops/tickets/status': 'Work order status changed', '/api/ops/tickets/note': 'Work order note',
+        '/api/ops/tickets/part': 'Part used', '/api/ops/tickets/check': 'Checklist ticked', '/api/ops/pm/save': 'Maintenance plan saved', '/api/ops/pm/delete': 'Maintenance plan deleted',
+        '/api/ops/maint/config': 'SLA settings changed'});
+    OPS.addI18n({
+        '🛠️ Maintenance': ['🛠️ ཉམས་སྲུང་', '🛠️ ซ่อมบำรุง'], 'Active work orders': ['', 'ใบงานที่ยังเปิด'], 'Overdue': ['', 'เกินกำหนด'], 'past the SLA': ['', 'เกิน SLA'],
+        'Waiting for parts': ['', 'รออะไหล่'], 'Preventive due': ['', 'บำรุงรักษาตามแผนที่ถึงกำหนด'], 'next 14 days': ['', '14 วันข้างหน้า'], 'MTTR (30 days)': ['', 'MTTR (30 วัน)'],
+        'mean time to repair': ['', 'เวลาซ่อมเฉลี่ย'], 'SLA met (30 days)': ['', 'ทำได้ตาม SLA (30 วัน)'], '🛠️ Work orders': ['', '🛠️ ใบงาน'], 'Active': ['', 'ที่เปิดอยู่'], 'Mine': ['', 'ของฉัน'],
+        'Unassigned': ['', 'ยังไม่มีผู้รับผิดชอบ'], 'Done (30 days)': ['', 'เสร็จแล้ว (30 วัน)'], 'All': ['', 'ทั้งหมด'], '📱 Phone view': ['', '📱 หน้าสำหรับมือถือ'],
+        '➕ New work order': ['', '➕ ใบงานใหม่'], '🗓️ Preventive maintenance': ['', '🗓️ การบำรุงรักษาตามแผน'], '➕ New plan': ['', '➕ แผนใหม่'], 'Plans': ['', 'แผน'],
+        'Due in the next 30 days': ['', 'ถึงกำหนดใน 30 วัน'], '⚙️ SLA & work-order settings': ['', '⚙️ ตั้งค่า SLA และใบงาน'], '{m} mine · {u} unassigned': ['', 'ของฉัน {m} · ยังไม่มีผู้รับ {u}'],
+        'Priority': ['', 'ความสำคัญ'], 'Work order': ['', 'ใบงาน'], 'Status': ['', 'สถานะ'], 'Assignee': ['', 'ผู้รับผิดชอบ'], 'SLA': ['', 'SLA'], 'Updated': ['', 'อัปเดต'],
+        'planned': ['', 'ตามแผน'], 'nobody': ['', 'ยังไม่มี'], 'No work orders here': ['', 'ไม่มีใบงาน'], 'late': ['', 'ล่าช้า'], 'on time': ['', 'ทันเวลา'], 'paused': ['', 'หยุดนับเวลา'],
+        '{d} overdue': ['', 'เกินกำหนด {d}'], '{d} left': ['', 'เหลือ {d}'], 'no response yet': ['', 'ยังไม่มีการตอบรับ'], 'Open': ['', 'เปิด'], 'Assigned': ['', 'มอบหมายแล้ว'],
+        'In progress': ['', 'กำลังดำเนินการ'], 'Resolved': ['', 'แก้ไขแล้ว'], 'Closed': ['', 'ปิดงาน'], 'Cancelled': ['', 'ยกเลิก'], '▶️ Start work': ['', '▶️ เริ่มงาน'],
+        '⏸️ Waiting for parts': ['', '⏸️ รออะไหล่'], '✅ Resolved': ['', '✅ แก้ไขเสร็จ'], '🔒 Close': ['', '🔒 ปิดงาน'], '✖️ Cancel': ['', '✖️ ยกเลิก'], '↩️ Reopen': ['', '↩️ เปิดใหม่'],
+        'Fault': ['', 'ขัดข้อง'], 'Preventive': ['', 'บำรุงรักษาตามแผน'], 'Inspection': ['', 'ตรวจสอบ'], 'Customer complaint': ['', 'ข้อร้องเรียนจากลูกค้า'], 'Other': ['', 'อื่นๆ'],
+        'Work order {u}': ['', 'ใบงาน {u}'], 'created {t} by {b}': ['', 'สร้างเมื่อ {t} โดย {b}'], 'resolve by {t}': ['', 'ต้องเสร็จภายใน {t}'], 'Title': ['', 'หัวข้อ'],
+        'Category': ['', 'ประเภท'], 'Planned work (not counted as downtime)': ['', 'งานตามแผน (ไม่นับเป็นเวลาหยุดทำงาน)'], 'Planned from (BTT)': ['', 'เริ่มตามแผน (BTT)'],
+        'Planned to (BTT)': ['', 'สิ้นสุดตามแผน (BTT)'], 'Description': ['', 'รายละเอียด'], 'Charger now': ['', 'ตู้ตอนนี้'], 'Checklist': ['', 'รายการตรวจ'],
+        'Add a checklist item': ['', 'เพิ่มรายการตรวจ'], 'Parts used': ['', 'อะไหล่ที่ใช้'], 'Part (e.g. 125 A contactor)': ['', 'อะไหล่ (เช่น คอนแทคเตอร์ 125 A)'], 'Notes': ['', 'บันทึก'],
+        'Write a note…': ['', 'เขียนบันทึก…'], 'Add note': ['', 'เพิ่มบันทึก'], 'Alerts': ['', 'การแจ้งเตือน'], 'Resolution': ['', 'การแก้ไข'], 'History': ['', 'ประวัติ'], '💾 Save': ['', '💾 บันทึก'],
+        'Resolve work order {u}': ['', 'แก้ไขใบงาน {u} เสร็จ'], 'Close work order {u}': ['', 'ปิดใบงาน {u}'], 'Cause found': ['', 'สาเหตุที่พบ'], 'What was done': ['', 'สิ่งที่ทำ'],
+        'Some checklist items are not ticked.': ['', 'ยังมีรายการตรวจที่ไม่ได้ติ๊ก'], 'New work order': ['', 'ใบงานใหม่'], 'Checklist (one item per line)': ['', 'รายการตรวจ (บรรทัดละรายการ)'],
+        'Work order {u} created': ['', 'สร้างใบงาน {u} แล้ว'], 'Plan': ['', 'แผน'], 'Every': ['', 'ทุก'], 'Next due': ['', 'ครั้งถัดไป'], 'off': ['', 'ปิด'], 'all chargers': ['', 'ทุกตู้'],
+        '{n} days': ['', '{n} วัน'], 'No plans yet - add one, e.g. a quarterly inspection of every charger.': ['', 'ยังไม่มีแผน - เพิ่มได้ เช่น ตรวจทุกตู้ทุก 3 เดือน'], 'Due': ['', 'กำหนด'],
+        'Edit plan {u}': ['', 'แก้ไขแผน {u}'], 'New preventive maintenance plan': ['', 'แผนบำรุงรักษาใหม่'], 'Name': ['', 'ชื่อ'], 'Quarterly inspection': ['', 'ตรวจรายไตรมาส'],
+        'Every (days)': ['', 'ทุก (วัน)'], 'Open the job … days before': ['', 'เปิดใบงานล่วงหน้า (วัน)'], 'First due date': ['', 'ครบกำหนดครั้งแรก'], 'Assign to': ['', 'มอบหมายให้'],
+        'Plan active': ['', 'เปิดใช้แผน'], 'Only models (comma separated)': ['', 'เฉพาะรุ่น (คั่นด้วยจุลภาค)'], 'Only vendors': ['', 'เฉพาะผู้ผลิต'], 'Only chargers': ['', 'เฉพาะตู้'],
+        'Leave models, vendors and chargers empty to cover every charger. A job opens automatically before each due date; closing it starts the next interval.': ['', 'เว้นรุ่น ผู้ผลิต และตู้ว่างไว้เพื่อใช้กับทุกตู้ ระบบจะเปิดใบงานให้เองก่อนถึงกำหนด และเมื่อปิดใบงานจะเริ่มนับรอบใหม่'],
+        'Delete this plan?': ['', 'ลบแผนนี้?'], '{n} jobs opened': ['', 'เปิดใบงาน {n} ใบ'], 'Respond within (h)': ['', 'ตอบรับภายใน (ชม.)'], 'Resolve within (h)': ['', 'แก้ไขภายใน (ชม.)'],
+        'Alert {s} → priority': ['', 'การแจ้งเตือน {s} → ความสำคัญ'], 'Give new jobs to': ['', 'มอบใบงานใหม่ให้'], 'Preventive job grace (days after due)': ['', 'ผ่อนผันงานตามแผน (วันหลังครบกำหนด)'],
+        'Stop the SLA clock while waiting for parts': ['', 'หยุดนับเวลา SLA ระหว่างรออะไหล่'], 'Tell the technician about a new job (email / Telegram / SMS)': ['', 'แจ้งช่างเมื่อมีใบงานใหม่ (อีเมล / Telegram / SMS)'],
+        'MTTR (repair time)': ['', 'MTTR (เวลาซ่อม)'], 'Work order saved': ['', 'บันทึกใบงาน'], 'Work order status changed': ['', 'เปลี่ยนสถานะใบงาน'], 'Work order note': ['', 'บันทึกในใบงาน'],
+        'Part used': ['', 'บันทึกอะไหล่'], 'Checklist ticked': ['', 'ติ๊กรายการตรวจ'], 'Maintenance plan saved': ['', 'บันทึกแผนบำรุงรักษา'], 'Maintenance plan deleted': ['', 'ลบแผนบำรุงรักษา'],
+        'SLA settings changed': ['', 'เปลี่ยนการตั้งค่า SLA'], 'Tick every checklist item first': ['', 'กรุณาติ๊กรายการตรวจให้ครบก่อน'], 'Give the work order a title': ['', 'กรุณาใส่หัวข้อใบงาน'],
+        'No such work order': ['', 'ไม่พบใบงานนี้'], 'created': ['', 'สร้าง'], 'assigned': ['', 'มอบหมาย'], 'status': ['', 'สถานะ'], 'note': ['', 'บันทึก'], 'edited': ['', 'แก้ไข'],
+        'part used': ['', 'ใช้อะไหล่'], 'alert added': ['', 'เพิ่มการแจ้งเตือน'], 'alert cleared': ['', 'การแจ้งเตือนหายแล้ว'], 'reopened': ['', 'เปิดใหม่']
+    });
+})();
+''')
+
+
+# ---- [OPS] v1.6 charger security: OCPP 1.6 security profiles 1-2 (HTTP Basic Auth per charger + TLS), unknown charger
+#      ids refused, lock-outs, passwords sent to the charger (AuthorizationKey / SecurityProfile), security event log
+OPS_FEATURES.append('security')
+import base64 as _ops_b64
+import hashlib as _ops_hashlib
+import contextvars as _ops_ctxvars
+
+ops_charger_access = OpsDocStore('charger_access', 'ops_charger_access')   # charger id -> access record (password hash ...)
+ops_charger_unknown = OpsDocStore('charger_unknown', 'ops_charger_unknown')  # unknown ids that tried to connect
+OPS_SECURITY = OpsEventLog('security', 'ops_security', keep_days=120)
+OPS_SEC_MODES = ('open', 'known', 'strict')
+OPS_SEC_DEFAULTS = {'mode': 'open', 'lock_fails': 10, 'lock_window_min': 15, 'lock_min': 15, 'scan_ids': 20,
+                    'scan_block_min': 30, 'grace_h': 24, 'fail_delay_s': 1.0, 'unknown_keep': 200}
+OPS_SEC_KEY_RE = _ops_re.compile(r'^[\x21-\x7e]{16,40}$')          # OCPP: 16 - 40 printable characters
+OPS_SEC_HEX_RE = _ops_re.compile(r'^(?:[0-9a-fA-F]{2}){8,20}$')     # 16 - 40 hex digits (AuthorizationKey as hex)
+OPS_SEC_SECRET_KEYS = {'authorizationkey', 'basicauthpassword'}
+OPS_SEC_HTTP_TEXT = {401: 'Unauthorized', 403: 'Forbidden', 404: 'Unknown charge point', 429: 'Too many failed attempts',
+                     503: 'Charge point check failed'}
+OPS_SEC_CONN: Dict[str, dict] = {}              # charger id -> how its current / last connection was let in
+OPS_ISSUE_PROVIDERS: list = []                  # extra health issue kinds (called by ops_health_eval with add(), now)
+_OPS_SEC_FAILS: Dict[tuple, list] = {}          # (charger, ip) -> recent failure times
+_OPS_SEC_LOCK: Dict[tuple, float] = {}          # (charger, ip) -> locked until
+_OPS_SEC_SCAN: Dict[str, dict] = {}             # ip -> {unknown id: last try} (id scanning)
+_OPS_SEC_IP_BLOCK: Dict[str, float] = {}        # ip -> unknown ids refused without a look until
+_OPS_SEC_EVT_LAST: Dict[tuple, list] = {}       # repeated event -> [last logged, attempts since]
+_OPS_SEC_DIRTY = {'access': False, 'unknown': False}
+_OPS_SEC_ACTOR = _ops_ctxvars.ContextVar('ops_sec_actor', default='')
+for _p in ('/api/ops/security/charger', '/api/ops/security/push', '/api/ops/security/allow', '/api/ops/security/delete',
+           '/api/ops/security/unknown/clear', '/api/ops/security/import', '/api/ops/security/unlock',
+           '/api/ops/security/reconnect'):
+    ops_perm_rule('POST', _p, 'config')
+ops_perm_rule('POST', '/api/ops/security/config', 'admin')
+ops_perm_rule('GET', '/api/ops/security', 'config', prefix=True)
+OPS_AUDIT_SECRET_FIELDS['/api/ops/security/charger'] = {'password'}
+
+
+def ops_sec_cfg() -> dict:
+    d = ops_cfg('security', OPS_SEC_DEFAULTS)
+    if d.get('mode') not in OPS_SEC_MODES:
+        d['mode'] = 'open'
+    return d
+
+
+def ops_cp_id_from_path(path) -> str:
+    """The charger id exactly as on_ocpp_connect takes it (last path segment)."""
+    parts = str(path or '').strip('/').split('/')
+    return parts[-1] if parts else ''
+
+
+def _ops_sec_hash(salt: bytes, secret: bytes) -> str:
+    return _ops_hashlib.sha256(salt + b'\x00' + secret).hexdigest()
+
+
+def ops_sec_make_pw(key: str, by: str = '') -> dict:
+    """Stored form of a charger password: salted SHA-256 (charger keys are long random strings, see ops_sec_new_key)."""
+    salt = secrets.token_bytes(16)
+    is_hex = bool(OPS_SEC_HEX_RE.match(key))
+    norm = key.lower() if is_hex else key
+    return {'salt': salt.hex(), 'hash': _ops_sec_hash(salt, norm.encode('utf-8')), 'hex': is_hex, 'len': len(key),
+            'set_at': round(ops_now()), 'set_by': str(by or '')[:64]}
+
+
+def ops_sec_new_key() -> str:
+    return secrets.token_hex(20)                       # 40 hex digits = 160 bits, valid as text and as hex AuthorizationKey
+
+
+def ops_sec_pw_match(pw: dict, given: bytes) -> bool:
+    """True when the Basic Auth password matches. A hex key may arrive as text (any case) or as the decoded bytes."""
+    if not isinstance(pw, dict) or not pw.get('hash') or given is None:
+        return False
+    try:
+        salt = bytes.fromhex(pw['salt'])
+    except (TypeError, ValueError):
+        return False
+    cands = [given]
+    if pw.get('hex'):
+        try:
+            text = given.decode('ascii')
+            if OPS_SEC_HEX_RE.match(text):
+                cands.append(text.lower().encode('ascii'))
+        except UnicodeDecodeError:
+            pass
+        cands.append(given.hex().encode('ascii'))
+    ok = False
+    for c in cands:
+        ok = secrets.compare_digest(_ops_sec_hash(salt, c), pw['hash']) or ok
+    return ok
+
+
+def ops_sec_basic(header: str):
+    """(username, password bytes) from 'Authorization: Basic …', or None."""
+    parts = str(header or '').strip().split(None, 1)
+    if len(parts) != 2 or parts[0].lower() != 'basic':
+        return None
+    try:
+        raw = _ops_b64.b64decode(parts[1].strip() + '==='[: (4 - len(parts[1].strip()) % 4) % 4], validate=False)
+    except Exception:
+        return None
+    if b':' not in raw:
+        return None
+    user, pw = raw.split(b':', 1)
+    return user.decode('utf-8', 'replace')[:80], pw
+
+
+def ops_sec_rec(cp_id: str, create: bool = False):
+    rec = ops_charger_access.data.get(cp_id)
+    if rec is None and create:
+        rec = {'cp': cp_id, 'profile': 0, 'allowed': True, 'added_at': round(ops_now()),
+               'added_by': _OPS_SEC_ACTOR.get() or 'system'}
+        ops_charger_access.data[cp_id] = rec
+    return rec
+
+
+def ops_sec_event(kind: str, cp: str = '', ip: str = '', reason: str = '', **extra):
+    """Security event; repeated refusals of the same charger / address are written at most once a minute."""
+    now = ops_now()
+    if kind in ('fail', 'unknown', 'locked_hit', 'blocked_hit', 'ip_blocked_hit'):
+        k = (kind, cp, ip, reason)
+        last = _OPS_SEC_EVT_LAST.get(k)
+        if last and now - last[0] < 60:
+            last[1] += 1
+            return None
+        if last and last[1]:
+            extra['repeat'] = last[1]
+        _OPS_SEC_EVT_LAST[k] = [now, 0]
+    ev = {'cp': str(cp or '')[:80], 'k': kind, 'ip': str(ip or '')[:64], 'r': str(reason or '')[:120]}
+    by = extra.pop('by', None) or _OPS_SEC_ACTOR.get()
+    if by:
+        ev['by'] = str(by)[:64]
+    ev.update({k: v for k, v in extra.items() if v not in (None, '')})
+    return OPS_SECURITY.add(ev)
+
+
+def _ops_sec_fail(cp_id: str, ip: str, status: int, reason: str, cfg: dict, now: float, rec=None):
+    key = (cp_id, ip)
+    win = max(1, ops_int(cfg.get('lock_window_min'), 15)) * 60
+    lst = [t for t in _OPS_SEC_FAILS.get(key, []) if t > now - win] + [now]
+    _OPS_SEC_FAILS[key] = lst
+    if rec is not None:
+        rec.update(last_fail=round(now), last_fail_ip=ip, last_fail_reason=reason)
+        rec['fails_total'] = int(rec.get('fails_total') or 0) + 1
+        _OPS_SEC_DIRTY['access'] = True
+    ops_sec_event('fail', cp_id, ip, reason, status=status)
+    if len(lst) >= max(3, ops_int(cfg.get('lock_fails'), 10)):
+        _OPS_SEC_LOCK[key] = now + max(1, ops_int(cfg.get('lock_min'), 15)) * 60
+        _OPS_SEC_FAILS.pop(key, None)
+        ops_sec_event('locked', cp_id, ip, f'{len(lst)} failed attempts', minutes=ops_int(cfg.get('lock_min'), 15))
+        logger.warning(f"🔒 charger {cp_id} from {ip}: {len(lst)} failed sign-ins - refused for {cfg.get('lock_min')} min")
+    return status, reason
+
+
+def _ops_sec_unknown(cp_id: str, ip: str, has_auth: bool, cfg: dict, now: float):
+    u = ops_charger_unknown.data.get(cp_id)
+    if u is None:
+        u = ops_charger_unknown.data[cp_id] = {'cp': cp_id, 'first': round(now), 'count': 0}
+        keep = max(20, ops_int(cfg.get('unknown_keep'), 200))
+        if len(ops_charger_unknown.data) > keep:
+            for k in sorted(ops_charger_unknown.data, key=lambda k: ops_charger_unknown.data[k].get('last') or 0)[:len(ops_charger_unknown.data) - keep]:
+                ops_charger_unknown.data.pop(k, None)
+    u.update(last=round(now), ip=ip, auth=bool(has_auth))
+    u['count'] = int(u.get('count') or 0) + 1
+    _OPS_SEC_DIRTY['unknown'] = True
+    seen = _OPS_SEC_SCAN.setdefault(ip, {})
+    seen[cp_id] = now
+    for k in [k for k, t in seen.items() if t < now - 600]:
+        seen.pop(k, None)
+    if len(seen) > max(5, ops_int(cfg.get('scan_ids'), 20)):
+        _OPS_SEC_IP_BLOCK[ip] = now + max(1, ops_int(cfg.get('scan_block_min'), 30)) * 60
+        _OPS_SEC_SCAN.pop(ip, None)
+        ops_sec_event('ip_blocked', '', ip, f'{len(seen)} unknown charger ids in 10 min', minutes=ops_int(cfg.get('scan_block_min'), 30))
+        logger.warning(f"🔒 {ip} tried {len(seen)} unknown charger ids - unknown ids from it refused for {cfg.get('scan_block_min')} min")
+    ops_sec_event('unknown', cp_id, ip, 'unknown charger id')
+
+
+def ops_sec_check(cp_id: str, auth_header: str, ip: str, secure: bool, transport: str):
+    """Decision for one OCPP connection attempt: (0, how) = let in, (HTTP status, reason) = refuse."""
+    cfg, now = ops_sec_cfg(), ops_now()
+    mode = cfg['mode']
+    ip = str(ip or '?')
+    if not cp_id or len(cp_id) > 64 or any(ord(ch) < 33 or ch in '\\"<>' for ch in cp_id):
+        ops_sec_event('fail', cp_id[:64], ip, 'invalid charger id', status=404)
+        return 404, 'invalid charger id'
+    key = (cp_id, ip)
+    if _OPS_SEC_LOCK.get(key, 0) > now:
+        ops_sec_event('locked_hit', cp_id, ip, 'locked after failed attempts')
+        return 429, 'locked'
+    rec = ops_charger_access.data.get(cp_id)
+    creds = ops_sec_basic(auth_header)
+    if rec is None:
+        if mode == 'open':
+            OPS_SEC_CONN[cp_id] = {'t': round(now), 'ip': ip, 'tls': bool(secure), 'auth': False, 'how': 'open', 'via': transport}
+            return 0, 'open'
+        if _OPS_SEC_IP_BLOCK.get(ip, 0) > now:
+            ops_sec_event('ip_blocked_hit', cp_id, ip, 'address blocked (id scanning)')
+            return 403, 'address blocked'
+        _ops_sec_unknown(cp_id, ip, creds is not None, cfg, now)
+        return 404, 'unknown charger id'
+    if rec.get('allowed') is False:
+        ops_sec_event('blocked_hit', cp_id, ip, 'charger blocked')
+        rec['last_fail'], rec['last_fail_ip'], rec['last_fail_reason'] = round(now), ip, 'blocked'
+        _OPS_SEC_DIRTY['access'] = True
+        return 403, 'blocked'
+    profile = ops_int(rec.get('profile'), 0, 0, 2)
+    need_pw = profile >= 1 or mode == 'strict'
+    if profile == 2 and not secure:
+        return _ops_sec_fail(cp_id, ip, 401, 'TLS (wss://) required for profile 2', cfg, now, rec)
+    how, which, user = 'no password', None, None
+    if need_pw:
+        if not (rec.get('pw') or {}).get('hash'):
+            return _ops_sec_fail(cp_id, ip, 401, 'no password set in the CSMS for this charger', cfg, now, rec)
+        if creds is None:
+            if (rec.get('fallback_until') or 0) > now:
+                how = 'fallback'                     # just moved to a password: the charger may still use profile 0
+            else:
+                return _ops_sec_fail(cp_id, ip, 401, 'no password sent', cfg, now, rec)
+        else:
+            user, given = creds
+            if ops_sec_pw_match(rec.get('pw'), given):
+                which = 'current'
+            elif (rec.get('pw_old_until') or 0) > now and ops_sec_pw_match(rec.get('pw_old'), given):
+                which = 'old'
+            else:
+                return _ops_sec_fail(cp_id, ip, 401, 'wrong password', cfg, now, rec)
+            how = 'password'
+    elif creds is not None and (rec.get('pw') or {}).get('hash'):
+        which = 'current' if ops_sec_pw_match(rec.get('pw'), creds[1]) else 'not checked'
+        user = creds[0]
+        how = 'password' if which == 'current' else 'no password'
+    # let in
+    _OPS_SEC_FAILS.pop(key, None)
+    rec.update(last_ok=round(now), last_ok_ip=ip, last_how=how, last_tls=bool(secure), last_via=transport)
+    if user is not None:
+        rec['user_mismatch'] = user != cp_id
+        if user != cp_id:
+            rec['last_user'] = user[:64]
+    rec['using_old'] = which == 'old'
+    if which == 'current' and not rec.get('confirmed_at'):
+        rec['confirmed_at'] = round(now)
+        rec.pop('pw_old', None)
+        rec.pop('pw_old_until', None)
+        rec.pop('fallback_until', None)
+        ops_sec_event('confirmed', cp_id, ip, 'charger signed in with its new password')
+    _OPS_SEC_DIRTY['access'] = True
+    OPS_SEC_CONN[cp_id] = {'t': round(now), 'ip': ip, 'tls': bool(secure), 'auth': how == 'password', 'how': how,
+                           'which': which, 'via': transport, 'profile': profile}
+    if how == 'fallback':
+        ops_sec_event('fallback', cp_id, ip, 'signed in without a password during the change-over')
+    return 0, how
+
+
+async def ops_sec_gate(cp_id: str, auth_header: str, ip: str, secure: bool, transport: str):
+    try:
+        status, reason = ops_sec_check(cp_id, auth_header, ip, secure, transport)
+    except Exception as e:
+        logger.error(f"ops: charger security check failed for {cp_id}: {e}")
+        if ops_sec_cfg().get('mode') == 'open':
+            return 0, 'open'
+        return 503, 'check failed'
+    if status and status != 429:
+        try:
+            await asyncio.sleep(max(0.0, min(5.0, float(ops_sec_cfg().get('fail_delay_s') or 0))))
+        except (TypeError, ValueError):
+            pass
+    if status:
+        logger.info(f"🔐 refused charger {cp_id[:64]} from {ip} ({transport}): HTTP {status} {reason}")
+    return status, reason
+
+
+async def ops_ws_process_request(connection, request):
+    """websockets >= 14 (OCPP port): refuse the handshake with 401/403/404/429 before on_ocpp_connect."""
+    try:
+        addr = connection.remote_address
+        ip = addr[0] if isinstance(addr, (tuple, list)) and addr else str(addr or '?')
+        if TRUST_PROXY:
+            fwd = (request.headers.get(CLIENT_IP_HEADER) if CLIENT_IP_HEADER else None) or request.headers.get('X-Forwarded-For') or ''
+            ip = fwd.split(',')[0].strip()[:64] or ip
+        status, reason = await ops_sec_gate(ops_cp_id_from_path(request.path), request.headers.get('Authorization', ''),
+                                            ip, False, 'ocpp-port')
+    except Exception as e:
+        logger.error(f"ops: OCPP handshake check failed: {e}")
+        return None
+    if not status:
+        return None
+    resp = connection.respond(status, OPS_SEC_HTTP_TEXT.get(status, 'Refused') + '\n')
+    if status == 401:
+        resp.headers['WWW-Authenticate'] = 'Basic realm="OCPP", charset="UTF-8"'
+    return resp
+
+
+async def ops_ws_process_request_legacy(path, request_headers):
+    """websockets <= 13 (legacy server): same check, the client address is not available here."""
+    status, reason = await ops_sec_gate(ops_cp_id_from_path(path), request_headers.get('Authorization', ''), '?', False, 'ocpp-port')
+    if not status:
+        return None
+    headers = [('WWW-Authenticate', 'Basic realm="OCPP", charset="UTF-8"')] if status == 401 else []
+    return status, headers, (OPS_SEC_HTTP_TEXT.get(status, 'Refused') + '\n').encode('utf-8')
+
+
+def ops_ws_serve_kwargs() -> dict:
+    try:
+        from websockets.asyncio.server import serve as _new_serve
+        if websockets.serve is _new_serve:
+            return {'process_request': ops_ws_process_request}
+    except Exception:
+        pass
+    return {'process_request': ops_ws_process_request_legacy}
+
+
+def ops_request_secure(request) -> bool:
+    if request.secure:
+        return True
+    if TRUST_PROXY:
+        proto = (request.headers.get('X-Forwarded-Proto') or '').split(',')[0].strip().lower()
+        return proto in ('https', 'wss')
+    return False
+
+
+async def ops_sec_web_gate(request):
+    """OCPP on the web port (/ocpp/<id>, also behind Render's TLS): None = continue, else the refusal response."""
+    status, reason = await ops_sec_gate(ops_cp_id_from_path(request.path), request.headers.get('Authorization', ''),
+                                        _client_ip(request), ops_request_secure(request), 'web-port')
+    if not status:
+        return None
+    headers = {'WWW-Authenticate': 'Basic realm="OCPP", charset="UTF-8"'} if status == 401 else {}
+    return web.Response(status=status, text=OPS_SEC_HTTP_TEXT.get(status, 'Refused') + '\n', headers=headers)
+
+
+# ---- keep the registry in step with configuration changes sent to the charger (any tab, any API) -----------------------
+def ops_sec_after_change_cfg(cp_id: str, key: str, value):
+    kl, now, cfg = str(key or '').strip().lower(), ops_now(), ops_sec_cfg()
+    grace = max(1, ops_int(cfg.get('grace_h'), 24)) * 3600
+    if kl == 'authorizationkey':
+        val = str(value or '')
+        rec = ops_sec_rec(cp_id, create=True)
+        if ops_sec_pw_match(rec.get('pw'), val.encode('utf-8')):
+            return
+        if (rec.get('pw') or {}).get('hash'):
+            rec['pw_old'], rec['pw_old_until'] = rec['pw'], round(now + grace)
+        rec['pw'] = ops_sec_make_pw(val, _OPS_SEC_ACTOR.get() or 'ChangeConfiguration')
+        rec['confirmed_at'] = None
+        rec['pushed_at'] = round(now)
+        ops_sec_event('pw_pushed', cp_id, '', 'AuthorizationKey accepted by the charger')
+    elif kl == 'securityprofile':
+        p = ops_int(value, -1)
+        if p not in (0, 1, 2):
+            return
+        rec = ops_sec_rec(cp_id, create=True)
+        old = ops_int(rec.get('profile'), 0)
+        if p > 0 and old == 0:
+            rec['fallback_until'] = round(now + grace)
+        rec['profile'] = p
+        ops_sec_event('profile', cp_id, '', f'SecurityProfile {old} → {p} accepted by the charger')
+    else:
+        return
+    ops_charger_access.save()
+
+
+_ops_sec_orig_change_cfg = CentralSystem.cmd_change_configuration
+
+
+async def _ops_sec_change_cfg(self, key: str, value: str):
+    res = await _ops_sec_orig_change_cfg(self, key, value)
+    try:
+        if str((res or {}).get('status')) in ('Accepted', 'RebootRequired'):
+            ops_sec_after_change_cfg(self.id, key, value)
+    except Exception as e:
+        logger.error(f"ops: charger security registry update failed: {e}")
+    return res
+
+CentralSystem.cmd_change_configuration = _ops_sec_change_cfg
+
+
+def ops_sec_mask(data, depth: int = 0):
+    """OCPP log copy without charger passwords (ChangeConfiguration / GetConfiguration AuthorizationKey)."""
+    if depth > 5:
+        return data
+    if isinstance(data, dict):
+        out = {}
+        for k, v in data.items():
+            if str(k).lower() in OPS_SEC_SECRET_KEYS and v not in (None, ''):
+                out[k] = '***'
+            else:
+                out[k] = ops_sec_mask(v, depth + 1)
+        if str(out.get('key') or '').lower() in OPS_SEC_SECRET_KEYS and out.get('value') not in (None, ''):
+            out['value'] = '***'
+        return out
+    if isinstance(data, list):
+        return [ops_sec_mask(v, depth + 1) for v in data]
+    return data
+
+
+_ops_sec_orig_add_log = AppState.add_log
+
+
+def _ops_sec_add_log(self, direction: str, cp_id: str, action: str, data: dict = None):
+    if data and 'onfiguration' in str(action or ''):
+        try:
+            data = ops_sec_mask(data)
+        except Exception:
+            pass
+    return _ops_sec_orig_add_log(self, direction, cp_id, action, data)
+
+AppState.add_log = _ops_sec_add_log
+
+
+class _OpsSecLogFilter(logging.Filter):
+    """python-ocpp logs every frame ('send [2, …, "ChangeConfiguration", {"key": "AuthorizationKey", "value": …}]')."""
+    _re = _ops_re.compile(r'("key"\s*:\s*"(?:AuthorizationKey|BasicAuthPassword)"\s*,\s*"value"\s*:\s*")((?:[^"\\]|\\.)*)(")', _ops_re.I)
+    _re2 = _ops_re.compile(r"('key'\s*:\s*'(?:AuthorizationKey|BasicAuthPassword)'\s*,\s*'value'\s*:\s*')([^']*)(')", _ops_re.I)
+
+    def filter(self, record):
+        try:
+            msg = record.getMessage()
+            if 'uthorizationKey' in msg or 'asicAuthPassword' in msg:
+                record.msg, record.args = self._re2.sub(r'\1***\3', self._re.sub(r'\1***\3', msg)), ()
+        except Exception:
+            pass
+        return True
+
+logging.getLogger('ocpp').addFilter(_OpsSecLogFilter())
+logger.addFilter(_OpsSecLogFilter())
+
+
+# ---- health: chargers whose password is being refused --------------------------------------------------------------------
+def _ops_sec_issues(add, now):
+    win = max(1, ops_int(ops_sec_cfg().get('lock_window_min'), 15)) * 60
+    for cp_id, rec in ops_charger_access.data.items():
+        lf = rec.get('last_fail') or 0
+        if lf < now - win or (rec.get('last_ok') or 0) > lf or rec.get('last_fail_reason') == 'blocked':
+            continue
+        n = sum(len([t for t in lst if t > now - win]) for (c, _ip), lst in _OPS_SEC_FAILS.items() if c == cp_id)
+        locked = any(c == cp_id and until > now for (c, _ip), until in _OPS_SEC_LOCK.items())
+        if n >= 3 or locked:
+            add('auth_fail', cp_id, 0, 'major', lf, 'Sign-in refused: {reason} (from {ip})' + (' - locked' if locked else ''),
+                reason=rec.get('last_fail_reason') or '', ip=rec.get('last_fail_ip') or '', n=n)
+
+OPS_ISSUE_PROVIDERS.append(_ops_sec_issues)
+try:
+    OPS_ISSUE_TITLES['auth_fail'] = 'Charger password refused'
+    OPS_ALERT_RULES_DEFAULT['auth_fail'] = {'on': True, 'sev': 'major', 'delay_min': 0, 'notify': True, 'ticket': False}
+except NameError:
+    pass
+
+
+async def ops_sec_loop():
+    """Saves the registry after sign-ins (at most every 5 s) and forgets expired counters."""
+    while True:
+        await asyncio.sleep(5)
+        now = ops_now()
+        if _OPS_SEC_DIRTY['access']:
+            _OPS_SEC_DIRTY['access'] = False
+            ops_charger_access.save()
+        if _OPS_SEC_DIRTY['unknown']:
+            _OPS_SEC_DIRTY['unknown'] = False
+            ops_charger_unknown.save()
+        win = max(1, ops_int(ops_sec_cfg().get('lock_window_min'), 15)) * 60
+        for k in [k for k, lst in _OPS_SEC_FAILS.items() if not lst or lst[-1] < now - win]:
+            _OPS_SEC_FAILS.pop(k, None)
+        for d in (_OPS_SEC_LOCK, _OPS_SEC_IP_BLOCK):
+            for k in [k for k, until in d.items() if until < now]:
+                d.pop(k, None)
+        for ip in [ip for ip, seen in _OPS_SEC_SCAN.items() if not seen or max(seen.values()) < now - 600]:
+            _OPS_SEC_SCAN.pop(ip, None)
+        for k in [k for k, v in _OPS_SEC_EVT_LAST.items() if v[0] < now - 3600]:
+            _OPS_SEC_EVT_LAST.pop(k, None)
+
+OPS_TASKS.append(ops_sec_loop)
+
+
+# ---- API --------------------------------------------------------------------------------------------------------------------
+def _ops_sec_public(cp_id: str, rec: dict, now: float) -> dict:
+    pw = rec.get('pw') or {}
+    data = app_state.cp_data.get(cp_id)
+    conn = OPS_SEC_CONN.get(cp_id) or {}
+    out = {'cp': cp_id, 'known': True, 'allowed': rec.get('allowed') is not False, 'profile': ops_int(rec.get('profile'), 0, 0, 2),
+           'pw_set': bool(pw.get('hash')), 'pw_hex': bool(pw.get('hex')), 'pw_len': pw.get('len'), 'pw_set_at': pw.get('set_at'),
+           'pw_set_by': pw.get('set_by'), 'confirmed_at': rec.get('confirmed_at'), 'pushed_at': rec.get('pushed_at'),
+           'using_old': bool(rec.get('using_old')), 'old_until': rec.get('pw_old_until') if (rec.get('pw_old_until') or 0) > now else None,
+           'fallback_until': rec.get('fallback_until') if (rec.get('fallback_until') or 0) > now else None,
+           'note': rec.get('note') or '', 'added_at': rec.get('added_at'), 'added_by': rec.get('added_by'),
+           'last_ok': rec.get('last_ok'), 'last_ok_ip': rec.get('last_ok_ip'), 'last_how': rec.get('last_how'),
+           'last_tls': rec.get('last_tls'), 'last_via': rec.get('last_via'), 'last_fail': rec.get('last_fail'),
+           'last_fail_ip': rec.get('last_fail_ip'), 'last_fail_reason': rec.get('last_fail_reason'),
+           'fails_total': rec.get('fails_total') or 0, 'user_mismatch': bool(rec.get('user_mismatch')),
+           'last_user': rec.get('last_user') if rec.get('user_mismatch') else None,
+           'connected': cp_id in app_state.charge_points, 'conn': conn if cp_id in app_state.charge_points else None,
+           'registration': app_state.cp_registrations.get(cp_id) or (getattr(data, 'registration_status', '') if data else ''),
+           'vendor': getattr(data, 'vendor', '') if data else '', 'model': getattr(data, 'model', '') if data else '',
+           'locked': sorted(ip for (c, ip), until in _OPS_SEC_LOCK.items() if c == cp_id and until > now)}
+    return out
+
+
+def ops_sec_overview() -> dict:
+    now, cfg = ops_now(), ops_sec_cfg()
+    rows = [_ops_sec_public(cp, rec, now) for cp, rec in sorted(ops_charger_access.data.items())]
+    known = set(ops_charger_access.data)
+    others = []
+    for st in app_state.station_records():
+        cp = st.get('id') or ''
+        if cp and cp not in known:
+            conn = OPS_SEC_CONN.get(cp) or {}
+            others.append({'cp': cp, 'known': False, 'allowed': True, 'profile': 0, 'pw_set': False,
+                           'connected': cp in app_state.charge_points, 'conn': conn if cp in app_state.charge_points else None,
+                           'registration': st.get('registration_status') or '', 'vendor': st.get('vendor') or '',
+                           'model': st.get('model') or '', 'last_ok': conn.get('t'), 'last_ok_ip': conn.get('ip'), 'locked': []})
+    all_rows = rows + sorted(others, key=lambda r: r['cp'])
+    impact = {'known': [r['cp'] for r in all_rows if not r['known']],
+              'strict': [r['cp'] for r in all_rows if not r['known'] or not r['pw_set'] or r['profile'] == 0]}
+    connected = [r for r in all_rows if r['connected']]
+    counts = {'registered': len(rows), 'with_password': sum(1 for r in rows if r['pw_set'] and r['profile'] >= 1),
+              'blocked': sum(1 for r in rows if not r['allowed']), 'connected': len(connected),
+              'connected_tls': sum(1 for r in connected if (r.get('conn') or {}).get('tls')),
+              'connected_password': sum(1 for r in connected if (r.get('conn') or {}).get('auth')),
+              'unknown_24h': sum(1 for u in ops_charger_unknown.data.values() if (u.get('last') or 0) > now - 86400),
+              'locked': len([1 for until in _OPS_SEC_LOCK.values() if until > now]) + len([1 for until in _OPS_SEC_IP_BLOCK.values() if until > now]),
+              'not_registered': len(others)}
+    unknown = sorted(({k: v for k, v in u.items()} for u in ops_charger_unknown.data.values()), key=lambda u: -(u.get('last') or 0))
+    locks = [{'cp': c, 'ip': ip, 'until': until} for (c, ip), until in _OPS_SEC_LOCK.items() if until > now]
+    blocks = [{'ip': ip, 'until': until} for ip, until in _OPS_SEC_IP_BLOCK.items() if until > now]
+    return {'cfg': {k: cfg.get(k) for k in OPS_SEC_DEFAULTS}, 'modes': list(OPS_SEC_MODES), 'chargers': all_rows,
+            'unknown': unknown[:200], 'locks': locks, 'ip_blocks': blocks, 'impact': impact, 'counts': counts, 'now': now,
+            'tls_web': bool(TRUST_PROXY) or None}
+
+
+async def ops_api_sec(request):
+    data = ops_sec_overview()
+    days = ops_int(request.query.get('days'), 7, 1, 120)
+    data['events'] = await asyncio.to_thread(OPS_SECURITY.query, ops_now() - days * 86400, ops_now() + 1, None, 300, True)
+    return ops_json(data)
+
+
+async def ops_api_sec_events_csv(request):
+    days = ops_int(request.query.get('days'), 30, 1, 120)
+    items = await asyncio.to_thread(OPS_SECURITY.query, ops_now() - days * 86400, ops_now() + 1, None, None, True)
+    buf = _ops_io.StringIO()
+    w = _ops_csv.writer(buf)
+    w.writerow(['time (BTT)', 'charger', 'event', 'reason', 'address', 'by', 'repeats', 'details'])
+    for e in items:
+        extra = {k: v for k, v in e.items() if k not in ('t', 'cp', 'k', 'r', 'ip', 'by', 'repeat')}
+        w.writerow([ops_csv_safe(x) for x in (ops_iso(e.get('t')), e.get('cp', ''), e.get('k', ''), e.get('r', ''), e.get('ip', ''),
+                                                e.get('by', ''), e.get('repeat', ''), json.dumps(extra, ensure_ascii=False) if extra else '')])
+    name = 'csms_charger_security_%s.csv' % ops_dt().strftime('%Y%m%d_%H%M')
+    return web.Response(body=('﻿' + buf.getvalue()).encode('utf-8'), content_type='text/csv',
+                        headers={'Content-Disposition': f'attachment; filename="{name}"'})
+
+
+def _ops_sec_actor(request) -> str:
+    who = ops_request_user(request).get('username') or '?'
+    _OPS_SEC_ACTOR.set(who)
+    return who
+
+
+def _ops_sec_cp_arg(b: dict) -> str:
+    cp = str(b.get('cp_id') or b.get('cp') or '').strip()
+    if not cp or len(cp) > 64 or any(ord(ch) < 33 or ch in '/\\"<>?#' for ch in cp):
+        raise ValueError('Give a valid charger id (no spaces or slashes)')
+    return cp
+
+
+async def _ops_sec_disconnect(cp_id: str, reason: str) -> bool:
+    cs = app_state.charge_points.get(cp_id)
+    if cs is None:
+        return False
+    try:
+        await cs._connection.close(1000, reason)
+        return True
+    except Exception as e:
+        logger.error(f"ops: disconnecting {cp_id} failed: {e}")
+        return False
+
+
+async def ops_api_sec_charger(request):
+    """Add / edit a charger: access, profile, password ('generate', a typed one, 'clear' or empty = keep), note."""
+    who = _ops_sec_actor(request)
+    b = await ops_body(request)
+    try:
+        cp = _ops_sec_cp_arg(b)
+    except ValueError as e:
+        return ops_err(str(e))
+    now, cfg = ops_now(), ops_sec_cfg()
+    rec = ops_charger_access.data.get(cp)
+    new = rec is None
+    work = dict(rec or {'cp': cp, 'profile': 0, 'allowed': True, 'added_at': round(now), 'added_by': who})
+    pw_in = b.get('password')
+    key = None
+    if pw_in == 'generate':
+        key = ops_sec_new_key()
+    elif isinstance(pw_in, str) and pw_in not in ('', 'clear'):
+        if not OPS_SEC_KEY_RE.match(pw_in):
+            return ops_err('The password needs 16 to 40 characters (letters, digits, symbols - no spaces)')
+        key = pw_in
+    profile = ops_int(b.get('profile', work.get('profile', 0)), 0, 0, 2)
+    if pw_in == 'clear':
+        if profile > 0:
+            return ops_err('Set the security profile to 0 (no password) before removing the password')
+        work.pop('pw', None)
+        work.pop('pw_old', None)
+        work.pop('pw_old_until', None)
+        work['confirmed_at'] = None
+    if key is not None:
+        if (work.get('pw') or {}).get('hash'):
+            work['pw_old'], work['pw_old_until'] = work['pw'], round(now + max(1, ops_int(cfg.get('grace_h'), 24)) * 3600)
+        work['pw'] = ops_sec_make_pw(key, who)
+        work['confirmed_at'] = None
+    if profile >= 1 and not (work.get('pw') or {}).get('hash'):
+        return ops_err('Profile 1 and 2 need a password - generate one or type it')
+    old_profile = ops_int(work.get('profile'), 0)
+    if profile > 0 and old_profile == 0 and not new and b.get('fallback', True):
+        work['fallback_until'] = round(now + max(1, ops_int(cfg.get('grace_h'), 24)) * 3600)
+    if profile == 0:
+        work.pop('fallback_until', None)
+    work['profile'] = profile
+    if 'allowed' in b:
+        work['allowed'] = bool(b.get('allowed'))
+    if 'note' in b:
+        work['note'] = str(b.get('note') or '')[:200]
+    ops_charger_access.data[cp] = work
+    ops_charger_access.save()
+    ops_sec_event('added' if new else 'edited', cp, '', f'profile {profile}' + ('' if work.get('allowed', True) else ', blocked') +
+                  (', new password' if key else (', password removed' if pw_in == 'clear' else '')))
+    ops_charger_unknown.data.pop(cp, None)
+    _OPS_SEC_DIRTY['unknown'] = True
+    if b.get('accept_registration') and app_state.cp_registrations.get(cp) != 'Accepted':
+        app_state.set_cp_registration_status(cp, 'Accepted')
+    dropped = False
+    if work.get('allowed') is False or b.get('disconnect'):
+        dropped = await _ops_sec_disconnect(cp, 'access changed by the operator')
+    return ops_json({'ok': True, 'key': key, 'charger': _ops_sec_public(cp, work, now), 'disconnected': dropped})
+
+
+async def ops_api_sec_push(request):
+    """New password for a connected charger: ChangeConfiguration AuthorizationKey (+ SecurityProfile), shown once."""
+    who = _ops_sec_actor(request)
+    b = await ops_body(request)
+    try:
+        cp = _ops_sec_cp_arg(b)
+    except ValueError as e:
+        return ops_err(str(e))
+    cs = app_state.charge_points.get(cp)
+    if cs is None:
+        return ops_err('The charger is not connected - set the password on the charger by hand, or send it when the charger is online', 409)
+    profile = ops_int(b.get('profile'), 1, 1, 2)
+    key = ops_sec_new_key()
+    rec_before = json.loads(json.dumps(ops_charger_access.data.get(cp) or {}))
+    try:
+        r1 = await asyncio.wait_for(cs.cmd_change_configuration('AuthorizationKey', key), 40)
+    except Exception as e:
+        ops_sec_event('push_failed', cp, '', f'no answer to AuthorizationKey ({type(e).__name__})')
+        return ops_err(f'The charger did not answer ({type(e).__name__})', 502)
+    st1 = str((r1 or {}).get('status'))
+    if st1 not in ('Accepted', 'RebootRequired'):
+        ops_sec_event('push_failed', cp, '', f'AuthorizationKey {st1}')
+        return ops_err(f'The charger refused the new password ({st1}) - it may not support OCPP security profiles; set the password on the charger by hand', 409, charger_status=st1)
+    rec = ops_sec_rec(cp, create=True)
+    st2 = None
+    if profile != ops_int(rec_before.get('profile'), 0) or b.get('send_profile'):
+        try:
+            r2 = await asyncio.wait_for(cs.cmd_change_configuration('SecurityProfile', str(profile)), 40)
+            st2 = str((r2 or {}).get('status'))
+        except Exception as e:
+            st2 = f'no answer ({type(e).__name__})'
+    if (rec.get('pw') or {}).get('set_by') in ('', 'ChangeConfiguration'):
+        rec['pw']['set_by'] = who
+    ops_charger_access.save()
+    ops_sec_event('pushed', cp, '', f'new password sent (AuthorizationKey {st1}' + (f', SecurityProfile {profile} {st2}' if st2 else '') + ')')
+    dropped = False
+    if b.get('reconnect', True) and st1 == 'Accepted' and st2 in (None, 'Accepted'):
+        await asyncio.sleep(0.5)
+        dropped = await _ops_sec_disconnect(cp, 'new password - reconnect')
+    return ops_json({'ok': True, 'key': key, 'auth_status': st1, 'profile_status': st2, 'reconnected': dropped,
+                     'charger': _ops_sec_public(cp, rec, ops_now())})
+
+
+async def ops_api_sec_allow(request):
+    who = _ops_sec_actor(request)
+    b = await ops_body(request)
+    try:
+        cp = _ops_sec_cp_arg(b)
+    except ValueError as e:
+        return ops_err(str(e))
+    rec = ops_sec_rec(cp, create=True)
+    rec['allowed'] = True
+    ops_charger_unknown.data.pop(cp, None)
+    ops_charger_access.save()
+    ops_charger_unknown.save()
+    if b.get('accept_registration', True) and app_state.cp_registrations.get(cp) != 'Accepted':
+        app_state.set_cp_registration_status(cp, 'Accepted')
+    ops_sec_event('added', cp, '', 'allowed from the unknown chargers list')
+    return ops_json({'ok': True, 'charger': _ops_sec_public(cp, rec, ops_now())})
+
+
+async def ops_api_sec_delete(request):
+    _ops_sec_actor(request)
+    b = await ops_body(request)
+    cp = str(b.get('cp_id') or '').strip()
+    if cp not in ops_charger_access.data:
+        return ops_err('Not in the list', 404)
+    ops_charger_access.data.pop(cp, None)
+    ops_charger_access.save()
+    ops_sec_event('removed', cp, '', 'removed from the charger access list')
+    return ops_json({'ok': True})
+
+
+async def ops_api_sec_unknown_clear(request):
+    _ops_sec_actor(request)
+    b = await ops_body(request)
+    cp = str(b.get('cp_id') or '').strip()
+    if b.get('all'):
+        n = len(ops_charger_unknown.data)
+        ops_charger_unknown.data.clear()
+    else:
+        n = 1 if ops_charger_unknown.data.pop(cp, None) else 0
+    ops_charger_unknown.save()
+    return ops_json({'ok': True, 'removed': n})
+
+
+async def ops_api_sec_import(request):
+    """Put every charger the CSMS already knows (registered and not rejected, or connected now) on the access list."""
+    who = _ops_sec_actor(request)
+    added = []
+    ids = {st.get('id') or '' for st in app_state.station_records()} | set(app_state.charge_points)
+    for cp in sorted(ids):
+        if cp in ops_charger_access.data or app_state.cp_registrations.get(cp) == 'Rejected':
+            continue
+        if not cp or len(cp) > 64:
+            continue
+        ops_sec_rec(cp, create=True)
+        added.append(cp)
+    if added:
+        ops_charger_access.save()
+        ops_sec_event('imported', '', '', f'{len(added)} chargers added to the access list', n=len(added))
+    return ops_json({'ok': True, 'added': added})
+
+
+async def ops_api_sec_unlock(request):
+    _ops_sec_actor(request)
+    b = await ops_body(request)
+    cp, ip = str(b.get('cp_id') or '').strip(), str(b.get('ip') or '').strip()
+    n = 0
+    for k in list(_OPS_SEC_LOCK):
+        if (cp and k[0] == cp and (not ip or k[1] == ip)) or (not cp and ip and k[1] == ip) or b.get('all'):
+            _OPS_SEC_LOCK.pop(k, None)
+            _OPS_SEC_FAILS.pop(k, None)
+            n += 1
+    if ip and (b.get('ip_block') or not cp):
+        if _OPS_SEC_IP_BLOCK.pop(ip, None):
+            n += 1
+    if b.get('all'):
+        n += len(_OPS_SEC_IP_BLOCK)
+        _OPS_SEC_IP_BLOCK.clear()
+    ops_sec_event('unlocked', cp, ip, f'{n} lock(s) lifted')
+    return ops_json({'ok': True, 'unlocked': n})
+
+
+async def ops_api_sec_reconnect(request):
+    _ops_sec_actor(request)
+    b = await ops_body(request)
+    cp = str(b.get('cp_id') or '').strip()
+    ok = await _ops_sec_disconnect(cp, 'reconnect requested by the operator')
+    return ops_json({'ok': ok}) if ok else ops_err('The charger is not connected', 409)
+
+
+async def ops_api_sec_config(request):
+    _ops_sec_actor(request)
+    b = await ops_body(request)
+    cfg = ops_sec_cfg()
+    before = dict(cfg)
+    if 'mode' in b:
+        if b['mode'] not in OPS_SEC_MODES:
+            return ops_err('Unknown mode')
+        cfg['mode'] = b['mode']
+    for k, lo, hi in (('lock_fails', 3, 100), ('lock_window_min', 1, 1440), ('lock_min', 1, 1440), ('scan_ids', 5, 1000),
+                      ('scan_block_min', 1, 1440), ('grace_h', 1, 720), ('unknown_keep', 20, 5000)):
+        if k in b:
+            cfg[k] = ops_int(b[k], OPS_SEC_DEFAULTS[k], lo, hi)
+    if 'fail_delay_s' in b:
+        try:
+            cfg['fail_delay_s'] = max(0.0, min(5.0, float(b['fail_delay_s'])))
+        except (TypeError, ValueError):
+            pass
+    ops_settings.save()
+    if before.get('mode') != cfg['mode']:
+        ops_sec_event('mode', '', '', f"mode {before.get('mode')} → {cfg['mode']}")
+        logger.warning(f"🔐 charger access mode is now '{cfg['mode']}'")
+    return ops_json({'ok': True, 'cfg': {k: cfg.get(k) for k in OPS_SEC_DEFAULTS}})
+
+
+OPS_ROUTES += [
+    ('GET', '/api/ops/security', ops_api_sec), ('GET', '/api/ops/security/events.csv', ops_api_sec_events_csv),
+    ('POST', '/api/ops/security/charger', ops_api_sec_charger), ('POST', '/api/ops/security/push', ops_api_sec_push),
+    ('POST', '/api/ops/security/allow', ops_api_sec_allow), ('POST', '/api/ops/security/delete', ops_api_sec_delete),
+    ('POST', '/api/ops/security/unknown/clear', ops_api_sec_unknown_clear), ('POST', '/api/ops/security/import', ops_api_sec_import),
+    ('POST', '/api/ops/security/unlock', ops_api_sec_unlock), ('POST', '/api/ops/security/reconnect', ops_api_sec_reconnect),
+    ('POST', '/api/ops/security/config', ops_api_sec_config),
+]
+
+OPS_CSS_PARTS.append(r'''/* [OPS] v1.6 charger access (Registration tab) */
+#secPanel { margin-top: 1rem; }
+.ops-sec-mode { border-radius: 10px; padding: 0.6rem 0.8rem; margin: 0.3rem 0 0.8rem; font-size: 0.8rem; line-height: 1.5; border: 1px solid var(--border); }
+.ops-sec-mode.ops-sec-warn { background: rgba(245, 158, 11, 0.10); border-color: rgba(245, 158, 11, 0.45); }
+.ops-sec-mode.ops-sec-info { background: rgba(59, 130, 246, 0.08); border-color: rgba(59, 130, 246, 0.35); }
+.ops-sec-mode.ops-sec-good { background: rgba(16, 185, 129, 0.08); border-color: rgba(16, 185, 129, 0.40); }
+.ops-sec-pill { display: inline-block; padding: 0.1rem 0.55rem; border-radius: 50px; font-size: 0.72rem; font-weight: 700; vertical-align: middle; }
+.ops-sec-pill.ops-sec-warn { background: #fef3c7; color: #92400e; }
+.ops-sec-pill.ops-sec-info { background: #dbeafe; color: #1d4ed8; }
+.ops-sec-pill.ops-sec-good { background: #d1fae5; color: #047857; }
+.ops-prof { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 6px; font-size: 0.72rem; font-weight: 700; white-space: nowrap; }
+.ops-prof-0 { background: #f1f5f9; color: #475569; }
+.ops-prof-1 { background: #dbeafe; color: #1d4ed8; }
+.ops-prof-2 { background: #d1fae5; color: #047857; }
+.ops-sec-unlisted td { opacity: 0.85; }
+.ops-sec-sub { margin-top: 1rem; }
+.ops-sec-sub h4 { margin: 0; }
+.ops-sec-ev { margin-top: 0.8rem; }
+.ops-sec-ev summary { cursor: pointer; padding: 0.3rem 0; }
+.ops-sec-opts { display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 0.6rem; }
+.ops-sec-opt { display: flex; gap: 0.5rem; align-items: flex-start; padding: 0.55rem 0.7rem; border: 1px solid var(--border); border-radius: 10px; cursor: pointer; font-size: 0.8rem; line-height: 1.45; }
+.ops-sec-opt input { margin-top: 0.2rem; }
+.ops-sec-line { font-size: 0.78rem; margin: 0.45rem 0 0; }
+.ops-sec-line:empty { display: none; }
+.ops-key { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; letter-spacing: 0.02em; }
+@media (max-width: 700px) {
+    #secPanel table.ops-cards .ops-btns { white-space: normal; display: flex; flex-wrap: wrap; gap: 0.25rem; }
+    #secPanel table.ops-cards .ops-btns .tb-btn.ops-mini { margin: 0; }
+}
+''')
+OPS_JS_PARTS.append(r'''/* [OPS] 🔑 Charger access (v1.6): OCPP security profiles, passwords per charger, unknown chargers - inside the 🔐 Registration tab */
+(function () {
+    'use strict';
+    const OPS = window.OPS;
+    if (!OPS) return;
+    const S = {data: null, busy: false};
+    OPS.ISSUE_KINDS = OPS.ISSUE_KINDS || {};
+    OPS.ISSUE_KINDS.auth_fail = 'Charger password refused';
+    const MODES = {
+        open: ['🔓 Open', 'Any charger id can connect. Chargers on the list that have a password must still send it.', 'warn'],
+        known: ['🪪 Known chargers only', 'Charger ids that are not on the list are refused (HTTP 404). Chargers with profile 1 or 2 must send their password.', 'info'],
+        strict: ['🔐 Password for every charger', 'Every charger must be on the list and sign in with its own password (security profile 1 or 2).', 'good']
+    };
+    const PROFILES = {0: 'Profile 0 · no password', 1: 'Profile 1 · password', 2: 'Profile 2 · password + TLS'};
+    const EVENTS = {fail: '🚫 Refused', unknown: '❓ Unknown charger', locked: '🔒 Locked', locked_hit: '🔒 Refused (locked)',
+        blocked_hit: '⛔ Refused (blocked)', ip_blocked: '🧱 Address blocked', ip_blocked_hit: '🧱 Refused (address blocked)',
+        confirmed: '✅ New password in use', fallback: '⚠️ Signed in without password (change-over)', pw_pushed: '🔑 Password stored on the charger',
+        pushed: '📤 New password sent', push_failed: '❌ Sending the password failed', profile: '🛡️ Security profile changed',
+        added: '➕ Added', edited: '✏️ Changed', removed: '🗑️ Removed', imported: '📥 Chargers added', unlocked: '🔓 Unlocked', mode: '⚙️ Access mode'};
+    const td = (l, h, c) => OPS.td(l, h, c);
+    const ago = t => (t ? OPS.t('{d} ago', {d: OPS.dur(Date.now() / 1000 - t)}) : '—');
+
+    function build(view) {
+        const box = document.createElement('section');
+        box.className = 'pay-panel ops-panel';
+        box.id = 'secPanel';
+        box.innerHTML = '<div class="ops-head"><h3>' + OPS.t('🔑 Charger access (OCPP security)') + ' <span id="secMode" class="pill"></span></h3>' +
+            '<div class="ops-actions"><button class="tb-btn primary" id="secAdd">' + OPS.t('➕ Add charger') + '</button>' +
+            '<button class="tb-btn" id="secImport">' + OPS.t('📥 Add all known chargers') + '</button>' +
+            '<button class="tb-btn" id="secCfg">' + OPS.t('⚙️ Access mode') + '</button>' +
+            '<a class="tb-btn" id="secCsv" href="/api/ops/security/events.csv?days=30">' + OPS.t('⬇️ Security log (CSV)') + '</a></div></div>' +
+            '<div id="secModeBox" class="ops-sec-mode"></div>' +
+            '<section class="kpis ops-kpis">' + OPS.kpi('info', 'On the access list', 'secKList', '') + OPS.kpi('good', 'With a password', 'secKPw', 'profile 1 or 2') +
+            OPS.kpi('info', 'Connected now', 'secKConn', '') + OPS.kpi('good', 'Using a password', 'secKAuth', 'connected now') +
+            OPS.kpi('warn', 'Unknown ids (24 h)', 'secKUnk', 'tried to connect') + OPS.kpi('warn', 'Locked', 'secKLock', 'after failed attempts') + '</section>' +
+            '<div class="ops-table-wrap"><table class="fleet-table ops-table ops-cards" id="secTable"></table></div>' +
+            '<div id="secUnknownBox"></div><div id="secLocksBox"></div>' +
+            '<details id="secEvBox" class="ops-sec-ev"><summary><b>' + OPS.t('📜 Security log') + '</b> <span class="muted" id="secEvCnt"></span></summary>' +
+            '<div class="ops-table-wrap ops-tall"><table class="fleet-table ops-table ops-cards" id="secEvents"></table></div></details>' +
+            '<div class="pay-help">' + OPS.t('Chargers sign in with HTTP Basic authentication: user name = charger id, password = the key from this list (OCPP security profile 1; profile 2 adds TLS: wss://). The CSMS keeps only a fingerprint of each password. Use wss:// through the web port (/ocpp/<id>) or the cloud address for profile 2.') + '</div>';
+        view.appendChild(box);
+        OPS.$('secAdd').onclick = () => editCharger(null);
+        OPS.$('secImport').onclick = importKnown;
+        OPS.$('secCfg').onclick = modeDialog;
+        box.addEventListener('click', onClick);
+    }
+
+    async function load() {
+        if (S.busy) return;
+        S.busy = true;
+        try { S.data = await OPS.api('/api/ops/security?days=14'); } catch (e) { S.busy = false; return OPS.fail(e); }
+        S.busy = false;
+        render();
+    }
+
+    function modePill(m) {
+        const x = MODES[m] || [m, '', 'info'];
+        return '<span class="ops-sec-pill ops-sec-' + x[2] + '">' + OPS.t(x[0]) + '</span>';
+    }
+
+    function render() {
+        const d = S.data;
+        if (!d) return;
+        const c = d.counts, now = d.now;
+        OPS.$('secMode').outerHTML = '<span id="secMode">' + modePill(d.cfg.mode) + '</span>';
+        let hint = '<b>' + OPS.t((MODES[d.cfg.mode] || [''])[0]) + '</b> - ' + OPS.t((MODES[d.cfg.mode] || ['', ''])[1]);
+        if (d.cfg.mode === 'open') hint += '<br>' + OPS.t('Recommended before the chargers go on the internet: add your chargers here, give each a password, then switch to "Known chargers only" or "Password for every charger".');
+        if (d.cfg.mode !== 'open' && c.not_registered) hint += '<br><span class="ops-warn">' + OPS.t('{n} charger(s) the CSMS knows are not on the list and will be refused at their next connection.', {n: c.not_registered}) + '</span>';
+        OPS.$('secModeBox').className = 'ops-sec-mode ops-sec-' + ((MODES[d.cfg.mode] || [])[2] || 'info');
+        OPS.$('secModeBox').innerHTML = hint;
+        OPS.$('secKList').textContent = c.registered;
+        OPS.$('secKPw').textContent = c.with_password;
+        OPS.$('secKConn').textContent = c.connected;
+        OPS.$('secKAuth').textContent = c.connected_password;
+        OPS.$('secKAuthSub').innerHTML = OPS.t('{n} via TLS', {n: c.connected_tls});
+        OPS.$('secKUnk').textContent = c.unknown_24h;
+        OPS.$('secKLock').textContent = c.locked;
+        const cfgBtn = OPS.$('secCfg');
+        if (cfgBtn) cfgBtn.style.display = OPS.can('admin') ? '' : 'none';
+        const rows = d.chargers.map(r => row(r, now, d.cfg.mode)).join('');
+        OPS.$('secTable').innerHTML = '<thead><tr><th>' + OPS.t('Charger') + '</th><th>' + OPS.t('Access') + '</th><th>' + OPS.t('Password') + '</th><th>' +
+            OPS.t('Connection') + '</th><th>' + OPS.t('Last refusal') + '</th><th></th></tr></thead><tbody>' +
+            (rows || '<tr><td colspan="6" class="muted">' + OPS.t('No chargers yet') + '</td></tr>') + '</tbody>';
+        renderUnknown(d, now);
+        renderLocks(d, now);
+        renderEvents(d);
+    }
+
+    function row(r, now, mode) {
+        const name = '<b>' + OPS.esc(r.cp) + '</b>' + (r.vendor || r.model ? '<br><span class="muted">' + OPS.esc([r.vendor, r.model].filter(Boolean).join(' · ')) + '</span>' : '') +
+            (r.registration && r.registration !== 'Accepted' ? '<br><span class="ops-warn">' + OPS.t('Registration {r}', {r: OPS.tx(r.registration)}) + '</span>' : '');
+        let access;
+        if (!r.known) {
+            access = '<span class="muted">' + OPS.t('Not on the list') + '</span>' + (mode !== 'open' ? '<br><span class="ops-bad">' + OPS.t('refused at the next connection') + '</span>' : '');
+        } else if (!r.allowed) {
+            access = '<span class="ops-bad">' + OPS.t('⛔ Blocked') + '</span>';
+        } else {
+            access = '<span class="ops-prof ops-prof-' + r.profile + '">' + OPS.t(PROFILES[r.profile]) + '</span>' +
+                (mode === 'strict' && r.profile === 0 ? '<br><span class="ops-bad">' + OPS.t('needs a password in this mode') + '</span>' : '');
+        }
+        let pw = '—';
+        if (r.pw_set) {
+            pw = OPS.t('Set {t}', {t: OPS.fmt(r.pw_set_at)}) + (r.pw_set_by ? ' · ' + OPS.esc(r.pw_set_by) : '') + '<br>' +
+                (r.confirmed_at ? '<span class="ops-ok">✅ ' + OPS.t('in use since {t}', {t: OPS.fmt(r.confirmed_at)}) + '</span>'
+                    : '<span class="ops-warn">⏳ ' + OPS.t('waiting for the charger to use it') + '</span>');
+            if (r.using_old) pw += '<br><span class="ops-warn">⚠️ ' + OPS.t('charger still uses the previous password (accepted until {t})', {t: OPS.fmt(r.old_until)}) + '</span>';
+            else if (r.old_until && !r.confirmed_at) pw += '<br><span class="muted">' + OPS.t('previous password accepted until {t}', {t: OPS.fmt(r.old_until)}) + '</span>';
+            if (r.fallback_until) pw += '<br><span class="muted">' + OPS.t('change-over: sign-in without password allowed until {t}', {t: OPS.fmt(r.fallback_until)}) + '</span>';
+            if (r.user_mismatch) pw += '<br><span class="ops-warn">' + OPS.t('user name sent: {u} (should be the charger id)', {u: OPS.esc(r.last_user || '?')}) + '</span>';
+        }
+        let conn;
+        if (r.connected && r.conn) {
+            conn = (r.conn.tls ? '🔒 TLS' : '<span class="muted">ws</span>') + ' · ' + (r.conn.auth ? '<span class="ops-ok">' + OPS.t('password') + '</span>'
+                : (r.conn.how === 'fallback' ? '<span class="ops-warn">' + OPS.t('no password (change-over)') + '</span>' : '<span class="ops-warn">' + OPS.t('no password') + '</span>')) +
+                '<br><span class="muted">' + OPS.esc(r.conn.ip || '') + ' · ' + OPS.esc(r.conn.via === 'web-port' ? OPS.tx('web port') : OPS.tx('OCPP port')) + '</span>';
+        } else if (r.connected) {
+            conn = '<span class="ops-ok">' + OPS.t('connected') + '</span>';
+        } else {
+            conn = '<span class="muted">' + OPS.t('offline') + (r.last_ok ? ' · ' + OPS.t('last sign-in {a}', {a: ago(r.last_ok)}) : '') + '</span>';
+        }
+        let fail = '—';
+        if (r.last_fail) {
+            fail = '<span class="' + ((r.last_ok || 0) > r.last_fail ? 'muted' : 'ops-bad') + '">' + OPS.t(r.last_fail_reason || 'refused') + '</span><br><span class="muted">' +
+                ago(r.last_fail) + (r.last_fail_ip ? ' · ' + OPS.esc(r.last_fail_ip) : '') + '</span>';
+        }
+        if (r.locked && r.locked.length) fail += '<br><span class="ops-bad">🔒 ' + OPS.t('locked: {ips}', {ips: OPS.esc(r.locked.join(', '))}) + '</span>';
+        const cp = OPS.esc(r.cp);
+        let btns = '';
+        if (r.known) {
+            btns += '<button class="tb-btn ops-mini primary" data-sec="pw" data-cp="' + cp + '">' + OPS.t('🔑 New password') + '</button>' +
+                '<button class="tb-btn ops-mini" data-sec="edit" data-cp="' + cp + '">' + OPS.t('✏️ Edit') + '</button>' +
+                (r.allowed ? '<button class="tb-btn ops-mini" data-sec="block" data-cp="' + cp + '">' + OPS.t('⛔ Block') + '</button>'
+                    : '<button class="tb-btn ops-mini" data-sec="unblock" data-cp="' + cp + '">' + OPS.t('✅ Allow') + '</button>') +
+                (r.connected ? '<button class="tb-btn ops-mini" data-sec="reconnect" data-cp="' + cp + '">' + OPS.t('🔄 Reconnect') + '</button>' : '') +
+                (r.locked && r.locked.length ? '<button class="tb-btn ops-mini" data-sec="unlock" data-cp="' + cp + '">' + OPS.t('🔓 Unlock') + '</button>' : '') +
+                '<button class="tb-btn ops-mini" data-sec="del" data-cp="' + cp + '">🗑️</button>';
+        } else {
+            btns = '<button class="tb-btn ops-mini primary" data-sec="add" data-cp="' + cp + '">' + OPS.t('➕ Add to the list') + '</button>';
+        }
+        return '<tr class="' + (r.known ? '' : 'ops-sec-unlisted') + '">' + td('Charger', name) + td('Access', access) + td('Password', pw) +
+            td('Connection', conn) + td('Last refusal', fail) + td('', '<div class="ops-btns">' + btns + '</div>') + '</tr>';
+    }
+
+    function renderUnknown(d, now) {
+        const el = OPS.$('secUnknownBox');
+        if (!d.unknown.length) { el.innerHTML = ''; return; }
+        el.innerHTML = '<div class="ops-head ops-sec-sub"><h4>' + OPS.t('❓ Unknown chargers trying to connect') + '</h4><div class="ops-actions">' +
+            '<button class="tb-btn ops-mini" data-sec="unk-clear-all">' + OPS.t('Clear the list') + '</button></div></div>' +
+            '<div class="ops-table-wrap"><table class="fleet-table ops-table ops-cards"><thead><tr><th>' + OPS.t('Charger id') + '</th><th>' + OPS.t('Attempts') + '</th><th>' +
+            OPS.t('First / last attempt') + '</th><th>' + OPS.t('Address') + '</th><th>' + OPS.t('Sent a password') + '</th><th></th></tr></thead><tbody>' +
+            d.unknown.map(u => '<tr>' + td('Charger id', '<b>' + OPS.esc(u.cp) + '</b>') + td('Attempts', OPS.num(u.count, 0)) +
+                td('First / last attempt', OPS.fmt(u.first) + '<br><span class="muted">' + ago(u.last) + '</span>') + td('Address', OPS.esc(u.ip || '')) +
+                td('Sent a password', u.auth ? OPS.t('yes') : OPS.t('no')) +
+                td('', '<div class="ops-btns"><button class="tb-btn ops-mini primary" data-sec="allow" data-cp="' + OPS.esc(u.cp) + '">' + OPS.t('✅ Allow') + '</button>' +
+                    '<button class="tb-btn ops-mini" data-sec="unk-clear" data-cp="' + OPS.esc(u.cp) + '">' + OPS.t('Dismiss') + '</button></div>') + '</tr>').join('') +
+            '</tbody></table></div>';
+    }
+
+    function renderLocks(d, now) {
+        const el = OPS.$('secLocksBox');
+        const items = d.locks.map(l => ({cp: l.cp, ip: l.ip, until: l.until})).concat(d.ip_blocks.map(b => ({cp: '', ip: b.ip, until: b.until})));
+        if (!items.length) { el.innerHTML = ''; return; }
+        el.innerHTML = '<div class="ops-head ops-sec-sub"><h4>' + OPS.t('🔒 Locked after failed attempts') + '</h4></div><div class="ops-table-wrap"><table class="fleet-table ops-table ops-cards"><tbody>' +
+            items.map(l => '<tr>' + td('Charger', l.cp ? '<b>' + OPS.esc(l.cp) + '</b>' : OPS.t('all unknown ids')) + td('Address', OPS.esc(l.ip)) +
+                td('Until', OPS.fmt(l.until, true)) + td('', '<button class="tb-btn ops-mini" data-sec="unlock" data-cp="' + OPS.esc(l.cp) + '" data-ip="' + OPS.esc(l.ip) + '">' +
+                OPS.t('🔓 Unlock') + '</button>') + '</tr>').join('') + '</tbody></table></div>';
+    }
+
+    function renderEvents(d) {
+        const ev = d.events || [];
+        OPS.$('secEvCnt').textContent = ev.length ? '(' + ev.length + ')' : '';
+        OPS.$('secEvents').innerHTML = '<thead><tr><th>' + OPS.t('Time') + '</th><th>' + OPS.t('Charger') + '</th><th>' + OPS.t('Event') + '</th><th>' +
+            OPS.t('Details') + '</th><th>' + OPS.t('Address') + '</th></tr></thead><tbody>' +
+            (ev.map(e => '<tr>' + td('Time', OPS.fmt(e.t, true)) + td('Charger', OPS.esc(e.cp || '—')) + td('Event', OPS.t(EVENTS[e.k] || e.k)) +
+                td('Details', OPS.esc(OPS.tx(e.r || '')) + (e.repeat ? ' <span class="muted">' + OPS.t('(+{n} more)', {n: e.repeat}) + '</span>' : '') +
+                    (e.by ? ' <span class="muted">· ' + OPS.esc(e.by) + '</span>' : '')) + td('Address', OPS.esc(e.ip || '')) + '</tr>').join('') ||
+                '<tr><td colspan="5" class="muted">' + OPS.t('Nothing yet') + '</td></tr>') + '</tbody>';
+    }
+
+    function find(cp) { return (S.data && S.data.chargers || []).find(r => r.cp === cp) || null; }
+
+    async function onClick(e) {
+        const b = e.target.closest('[data-sec]');
+        if (!b) return;
+        const cp = b.dataset.cp || '', act = b.dataset.sec;
+        try {
+            if (act === 'pw') return newPassword(cp);
+            if (act === 'edit') return editCharger(find(cp));
+            if (act === 'add') return editCharger({cp: cp, known: false, profile: 0, allowed: true});
+            if (act === 'block') {
+                if (!OPS.confirm('Block {cp}? It is disconnected now and refused until you allow it again.', {cp: cp})) return;
+                await OPS.post('/api/ops/security/charger', {cp_id: cp, allowed: false});
+            } else if (act === 'unblock') {
+                await OPS.post('/api/ops/security/charger', {cp_id: cp, allowed: true});
+            } else if (act === 'reconnect') {
+                await OPS.post('/api/ops/security/reconnect', {cp_id: cp});
+                OPS.toast(OPS.tx('{cp} disconnected - it signs in again by itself', {cp: cp}), 'success');
+            } else if (act === 'unlock') {
+                await OPS.post('/api/ops/security/unlock', {cp_id: cp, ip: b.dataset.ip || ''});
+            } else if (act === 'del') {
+                if (!OPS.confirm('Remove {cp} from the access list? In the modes "Known chargers only" and "Password for every charger" it is refused at its next connection.', {cp: cp})) return;
+                await OPS.post('/api/ops/security/delete', {cp_id: cp});
+            } else if (act === 'allow') {
+                await OPS.post('/api/ops/security/allow', {cp_id: cp, accept_registration: true});
+                OPS.toast(OPS.tx('{cp} allowed - it connects at its next attempt', {cp: cp}), 'success');
+            } else if (act === 'unk-clear') {
+                await OPS.post('/api/ops/security/unknown/clear', {cp_id: cp});
+            } else if (act === 'unk-clear-all') {
+                await OPS.post('/api/ops/security/unknown/clear', {all: true});
+            }
+        } catch (err) { return OPS.fail(err); }
+        load();
+    }
+
+    function keyDialog(cp, key, lines) {
+        const html = '<div class="ops-form"><label class="wide">' + OPS.t('User name') + '<input class="tb-inp" type="text" readonly value="' + OPS.esc(cp) + '"></label>' +
+            '<label class="wide">' + OPS.t('Password (charger key)') + '<div class="ops-inline"><input class="tb-inp ops-key" type="text" readonly autocomplete="off" data-lpignore="true" data-1p-ignore id="secKeyOut" value="' + OPS.esc(key) + '">' +
+            '<button class="tb-btn" type="button" id="secCopy">' + OPS.t('📋 Copy') + '</button></div></label></div>' +
+            (lines || []).map(l => '<div class="ops-sec-line">' + l + '</div>').join('') +
+            '<div class="pay-help">' + OPS.t('Shown only once - the CSMS keeps only a fingerprint. Keep it in your password manager or the charger file.') + '<br>' +
+            OPS.t('On the charger: CSMS connection → HTTP Basic authentication, user name = charger id, password = this key. The key is 40 hexadecimal digits, so it also works where the charger asks whether the OCPP 1.6 key is hexadecimal (Vector vSECC).') + '</div>';
+        const w = OPS.modal('🔑 Password for {cp}', html, [{label: 'Done', cls: 'primary'}], {vars: {cp: cp}});
+        const inp = w.querySelector('#secKeyOut');
+        w.querySelector('#secCopy').onclick = async () => {
+            try { await navigator.clipboard.writeText(inp.value); OPS.toast(OPS.tx('Copied'), 'success'); }
+            catch (e) { inp.select(); document.execCommand('copy'); OPS.toast(OPS.tx('Copied'), 'success'); }
+        };
+        setTimeout(() => { inp.focus(); inp.select(); }, 50);
+    }
+
+    function newPassword(cp) {
+        const r = find(cp) || {cp: cp, profile: 0};
+        const online = !!r.connected;
+        const prof = Math.max(1, r.profile || 1);
+        const html = '<div class="ops-form"><label>' + OPS.t('Security profile') + '<select class="tb-sel" id="secNpProf">' +
+            [1, 2].map(p => OPS.opt(p, PROFILES[p], p === prof)).join('') + '</select></label>' +
+            '<label class="wide ops-check"><input type="checkbox" id="secNpSend"' + (online ? ' checked' : ' disabled') + '> ' +
+            OPS.t('Send it to the charger now (OCPP ChangeConfiguration AuthorizationKey + SecurityProfile)') + '</label>' +
+            '<label class="wide ops-check"><input type="checkbox" id="secNpRe"' + (online ? ' checked' : ' disabled') + '> ' + OPS.t('Then reconnect the charger to confirm the new password') + '</label>' +
+            '<label class="wide">' + OPS.t('…or type your own password (16 - 40 characters, leave empty to generate one)') +
+            '<input class="tb-inp db-secret" type="text" id="secNpOwn" autocomplete="off" data-lpignore="true" data-1p-ignore maxlength="40"></label></div>' +
+            '<div class="pay-help">' + (online ? OPS.t('{cp} is online: the new password is sent over OCPP and the previous one stays valid for a while, so the charger is never locked out.', {cp: cp})
+                : OPS.t('{cp} is offline: the new password is shown once - type it into the charger (its web page or service tool). The previous password stays valid for a while.', {cp: cp})) + '</div>';
+        OPS.modal('🔑 New password for {cp}', html, [{label: 'Cancel'}, {label: 'Create password', cls: 'primary', run: async box => {
+            const profile = parseInt(OPS.val(box, '#secNpProf'), 10) || 1;
+            const own = box.querySelector('#secNpOwn').value.trim();
+            const send = box.querySelector('#secNpSend').checked && !own;
+            if (send) {
+                const j = await OPS.post('/api/ops/security/push', {cp_id: cp, profile: profile, reconnect: box.querySelector('#secNpRe').checked});
+                load();
+                keyDialog(cp, j.key, [OPS.t('AuthorizationKey: {s}', {s: OPS.esc(j.auth_status)}) + (j.profile_status ? ' · ' + OPS.t('SecurityProfile {p}: {s}', {p: profile, s: OPS.esc(j.profile_status)}) : ''),
+                    j.reconnected ? OPS.t('The charger was asked to reconnect - the list shows ✅ once it signs in with the new password.') : '']);
+                return true;
+            }
+            const j = await OPS.post('/api/ops/security/charger', {cp_id: cp, profile: profile, password: own || 'generate'});
+            load();
+            if (j.key) keyDialog(cp, j.key, [OPS.t('Saved in the CSMS. Now set the same password on the charger.')]);
+            return true;
+        }}]);
+    }
+
+    function editCharger(r) {
+        const isNew = !r || !r.known;
+        r = r || {cp: '', profile: 0, allowed: true, note: ''};
+        const html = '<div class="ops-form"><label>' + OPS.t('Charger id') + '<input class="tb-inp" id="secEdCp" maxlength="64" value="' + OPS.esc(r.cp || '') + '"' + (isNew && !r.cp ? '' : ' readonly') + '></label>' +
+            '<label>' + OPS.t('Security profile') + '<select class="tb-sel" id="secEdProf">' + [0, 1, 2].map(p => OPS.opt(p, PROFILES[p], p === (r.profile || 0))).join('') + '</select></label>' +
+            '<label>' + OPS.t('Password') + '<select class="tb-sel" id="secEdPwMode">' + (r.pw_set ? OPS.opt('', 'Keep the current password', true) : OPS.opt('', 'No password', true)) +
+            OPS.opt('generate', 'Generate a new password') + OPS.opt('type', 'Type a password') + (r.pw_set ? OPS.opt('clear', 'Remove the password') : '') + '</select></label>' +
+            '<label id="secEdOwnL" style="display:none">' + OPS.t('Password (16 - 40 characters)') + '<input class="tb-inp db-secret" type="text" id="secEdOwn" autocomplete="off" data-lpignore="true" data-1p-ignore maxlength="40"></label>' +
+            '<label class="wide">' + OPS.t('Note') + '<input class="tb-inp" id="secEdNote" maxlength="200" value="' + OPS.esc(r.note || '') + '"></label>' +
+            '<label class="ops-check"><input type="checkbox" id="secEdAllowed"' + (r.allowed !== false ? ' checked' : '') + '> ' + OPS.t('Allowed to connect') + '</label>' +
+            '<label class="ops-check"><input type="checkbox" id="secEdAccept"' + (isNew ? ' checked' : '') + '> ' + OPS.t('Also accept its registration (BootNotification)') + '</label>' +
+            (r.connected ? '<label class="ops-check"><input type="checkbox" id="secEdDrop"> ' + OPS.t('Reconnect it after saving') + '</label>' : '') + '</div>' +
+            '<div class="pay-help">' + OPS.t('Profile 0 = no password (only allowed in the modes Open and Known chargers only). Profile 1 = HTTP Basic password. Profile 2 = password over TLS (wss://) - plain ws:// sign-ins are refused.') + '</div>';
+        const w = OPS.modal(isNew ? 'Add a charger to the access list' : 'Charger access: {cp}', html, [{label: 'Cancel'}, {label: '💾 Save', cls: 'primary', run: async box => {
+            const mode = OPS.val(box, '#secEdPwMode');
+            const body = {cp_id: OPS.val(box, '#secEdCp'), profile: parseInt(OPS.val(box, '#secEdProf'), 10) || 0, allowed: box.querySelector('#secEdAllowed').checked,
+                note: OPS.val(box, '#secEdNote'), accept_registration: box.querySelector('#secEdAccept').checked,
+                disconnect: !!(box.querySelector('#secEdDrop') && box.querySelector('#secEdDrop').checked)};
+            if (mode === 'generate' || mode === 'clear') body.password = mode;
+            if (mode === 'type') body.password = box.querySelector('#secEdOwn').value.trim();
+            const j = await OPS.post('/api/ops/security/charger', body);
+            load();
+            if (j.key) keyDialog(body.cp_id, j.key, [OPS.t('Saved in the CSMS. Now set the same password on the charger.')]);
+            else OPS.toast(OPS.tx('Saved'), 'success');
+            return true;
+        }}], {vars: {cp: r.cp}});
+        const sel = w.querySelector('#secEdPwMode');
+        sel.onchange = () => { w.querySelector('#secEdOwnL').style.display = sel.value === 'type' ? '' : 'none'; };
+    }
+
+    async function importKnown() {
+        if (!OPS.confirm('Add every charger the CSMS already knows (registered and not rejected) to the access list, without a password (profile 0)?')) return;
+        try {
+            const j = await OPS.post('/api/ops/security/import', {});
+            OPS.toast(OPS.tx('{n} chargers added', {n: j.added.length}), 'success');
+        } catch (e) { return OPS.fail(e); }
+        load();
+    }
+
+    function modeDialog() {
+        const d = S.data;
+        if (!d) return;
+        const imp = d.impact || {};
+        const opts = ['open', 'known', 'strict'].map(m => {
+            const n = m === 'open' ? 0 : (imp[m] || []).length;
+            return '<label class="ops-sec-opt"><input type="radio" name="secMode" value="' + m + '"' + (d.cfg.mode === m ? ' checked' : '') + '> <span><b>' + OPS.t(MODES[m][0]) + '</b><br>' +
+                '<span class="muted">' + OPS.t(MODES[m][1]) + '</span>' + (n ? '<br><span class="ops-bad">' + OPS.t('{n} charger(s) would be refused: {ids}', {n: n, ids: OPS.esc((imp[m] || []).slice(0, 12).join(', ') + (n > 12 ? ' …' : ''))}) + '</span>' : '') + '</span></label>';
+        }).join('');
+        const c = d.cfg;
+        const num = (id, label, v, min, max) => '<label>' + OPS.t(label) + '<input class="tb-inp" type="number" id="' + id + '" min="' + min + '" max="' + max + '" value="' + v + '"></label>';
+        const html = '<div class="ops-sec-opts">' + opts + '</div><details><summary>' + OPS.t('Lock-out settings') + '</summary><div class="ops-form">' +
+            num('secCfFails', 'Lock a charger + address after … failed sign-ins', c.lock_fails, 3, 100) + num('secCfWin', '… within (minutes)', c.lock_window_min, 1, 1440) +
+            num('secCfLock', 'Lock for (minutes)', c.lock_min, 1, 1440) + num('secCfScan', 'Block an address that tries more than … unknown ids in 10 min', c.scan_ids, 5, 1000) +
+            num('secCfScanMin', 'Block it for (minutes)', c.scan_block_min, 1, 1440) + num('secCfGrace', 'Previous password stays valid for (hours)', c.grace_h, 1, 720) +
+            '</div></details>';
+        OPS.modal('⚙️ Charger access mode', html, [{label: 'Cancel'}, {label: '💾 Save', cls: 'primary', run: async box => {
+            const m = (box.querySelector('input[name=secMode]:checked') || {}).value || c.mode;
+            const n = m === 'open' ? 0 : (imp[m] || []).length;
+            if (n && !OPS.confirm('{n} charger(s) will be refused at their next connection. Continue?', {n: n})) return false;
+            await OPS.post('/api/ops/security/config', {mode: m, lock_fails: OPS.val(box, '#secCfFails'), lock_window_min: OPS.val(box, '#secCfWin'),
+                lock_min: OPS.val(box, '#secCfLock'), scan_ids: OPS.val(box, '#secCfScan'), scan_block_min: OPS.val(box, '#secCfScanMin'), grace_h: OPS.val(box, '#secCfGrace')});
+            OPS.toast(OPS.tx('Saved'), 'success');
+            load();
+            return true;
+        }}], {wide: true});
+    }
+
+    OPS.register({tab: 'registration', every: 15,
+        show: function () {
+            const v = OPS.$('view-registration');
+            if (!v || !OPS.can('config')) return;
+            if (!OPS.$('secPanel')) build(v);
+            load();
+        },
+        refresh: load,
+        relang: function () { const p = OPS.$('secPanel'); if (p) { p.remove(); OPS.mods.registration.show(); } }
+    });
+
+    OPS.addI18n({
+        '🔑 Charger access (OCPP security)': ['', '🔑 การเข้าถึงของตู้ชาร์จ (ความปลอดภัย OCPP)'], '➕ Add charger': ['', '➕ เพิ่มตู้'],
+        '📥 Add all known chargers': ['', '📥 เพิ่มตู้ที่รู้จักทั้งหมด'], '⚙️ Access mode': ['', '⚙️ โหมดการเข้าถึง'], '⬇️ Security log (CSV)': ['', '⬇️ บันทึกความปลอดภัย (CSV)'],
+        '🔓 Open': ['', '🔓 เปิด'], '🪪 Known chargers only': ['', '🪪 เฉพาะตู้ที่รู้จัก'], '🔐 Password for every charger': ['', '🔐 ทุกตู้ต้องมีรหัสผ่าน'],
+        'Any charger id can connect. Chargers on the list that have a password must still send it.': ['', 'ตู้ชาร์จ ID ใดก็เชื่อมต่อได้ แต่ตู้ในรายการที่มีรหัสผ่านต้องส่งรหัสผ่านมาด้วย'],
+        'Charger ids that are not on the list are refused (HTTP 404). Chargers with profile 1 or 2 must send their password.': ['', 'ปฏิเสธตู้ที่ไม่มี ID ในรายการ (HTTP 404) ตู้ที่ใช้ profile 1 หรือ 2 ต้องส่งรหัสผ่านมาด้วย'],
+        'Every charger must be on the list and sign in with its own password (security profile 1 or 2).': ['', 'ทุกตู้ต้องอยู่ในรายการและเข้าระบบด้วยรหัสผ่านของตัวเอง (security profile 1 หรือ 2)'],
+        'Recommended before the chargers go on the internet: add your chargers here, give each a password, then switch to "Known chargers only" or "Password for every charger".': ['', 'แนะนำก่อนนำตู้ขึ้นอินเทอร์เน็ต: เพิ่มตู้ในรายการนี้ ตั้งรหัสผ่านให้ทุกตู้ แล้วเปลี่ยนเป็นโหมด "เฉพาะตู้ที่รู้จัก" หรือ "ทุกตู้ต้องมีรหัสผ่าน"'],
+        '{n} charger(s) the CSMS knows are not on the list and will be refused at their next connection.': ['', 'มีตู้ที่ CSMS รู้จัก {n} ตู้ที่ไม่อยู่ในรายการ และจะถูกปฏิเสธเมื่อเชื่อมต่อครั้งถัดไป'],
+        'On the access list': ['', 'อยู่ในรายการ'], 'With a password': ['', 'มีรหัสผ่าน'], 'profile 1 or 2': ['', 'profile 1 หรือ 2'], 'Connected now': ['', 'เชื่อมต่ออยู่'],
+        'Using a password': ['', 'ใช้รหัสผ่านอยู่'], 'connected now': ['', 'ที่เชื่อมต่ออยู่'], '{n} via TLS': ['', 'ผ่าน TLS {n} ตู้'], 'Unknown ids (24 h)': ['', 'ID ที่ไม่รู้จัก (24 ชม.)'],
+        'tried to connect': ['', 'พยายามเชื่อมต่อ'], 'Locked': ['', 'ถูกล็อก'], 'after failed attempts': ['', 'หลังใส่รหัสผิดหลายครั้ง'], '📜 Security log': ['', '📜 บันทึกความปลอดภัย'],
+        'Chargers sign in with HTTP Basic authentication: user name = charger id, password = the key from this list (OCPP security profile 1; profile 2 adds TLS: wss://). The CSMS keeps only a fingerprint of each password. Use wss:// through the web port (/ocpp/<id>) or the cloud address for profile 2.': ['', 'ตู้ชาร์จเข้าระบบด้วย HTTP Basic authentication: user name = ID ของตู้, password = รหัสจากรายการนี้ (OCPP security profile 1; profile 2 เพิ่ม TLS: wss://) CSMS เก็บเฉพาะลายนิ้วมือ (hash) ของรหัสผ่าน สำหรับ profile 2 ให้ใช้ wss:// ผ่าน web port (/ocpp/<id>) หรือที่อยู่บนคลาวด์'],
+        'Charger': ['', 'ตู้ชาร์จ'], 'Access': ['', 'สิทธิ์'], 'Password': ['', 'รหัสผ่าน'], 'Connection': ['', 'การเชื่อมต่อ'], 'Last refusal': ['', 'ถูกปฏิเสธล่าสุด'],
+        'No chargers yet': ['', 'ยังไม่มีตู้'], 'Registration {r}': ['', 'การลงทะเบียน {r}'], 'Not on the list': ['', 'ไม่อยู่ในรายการ'], 'refused at the next connection': ['', 'จะถูกปฏิเสธเมื่อเชื่อมต่อครั้งถัดไป'],
+        '⛔ Blocked': ['', '⛔ ถูกบล็อก'], 'Profile 0 · no password': ['', 'Profile 0 · ไม่มีรหัสผ่าน'], 'Profile 1 · password': ['', 'Profile 1 · รหัสผ่าน'],
+        'Profile 2 · password + TLS': ['', 'Profile 2 · รหัสผ่าน + TLS'], 'needs a password in this mode': ['', 'โหมดนี้ต้องมีรหัสผ่าน'], 'Set {t}': ['', 'ตั้งเมื่อ {t}'],
+        'in use since {t}': ['', 'ตู้ใช้อยู่ตั้งแต่ {t}'], 'waiting for the charger to use it': ['', 'รอให้ตู้เริ่มใช้'],
+        'charger still uses the previous password (accepted until {t})': ['', 'ตู้ยังใช้รหัสผ่านเดิม (ยอมรับถึง {t})'], 'previous password accepted until {t}': ['', 'รหัสผ่านเดิมยังใช้ได้ถึง {t}'],
+        'change-over: sign-in without password allowed until {t}': ['', 'ช่วงเปลี่ยนผ่าน: เข้าระบบโดยไม่มีรหัสผ่านได้ถึง {t}'], 'user name sent: {u} (should be the charger id)': ['', 'user name ที่ส่งมา: {u} (ควรเป็น ID ของตู้)'],
+        'password': ['', 'รหัสผ่าน'], 'no password (change-over)': ['', 'ไม่มีรหัสผ่าน (ช่วงเปลี่ยนผ่าน)'], 'no password': ['', 'ไม่มีรหัสผ่าน'], 'web port': ['', 'web port'], 'OCPP port': ['', 'OCPP port'],
+        'connected': ['', 'เชื่อมต่ออยู่'], 'offline': ['', 'ออฟไลน์'], 'last sign-in {a}': ['', 'เข้าระบบล่าสุด {a}'], '{d} ago': ['', '{d} ที่แล้ว'], 'refused': ['', 'ถูกปฏิเสธ'],
+        'locked: {ips}': ['', 'ถูกล็อก: {ips}'], '🔑 New password': ['', '🔑 รหัสผ่านใหม่'], '✏️ Edit': ['', '✏️ แก้ไข'], '⛔ Block': ['', '⛔ บล็อก'], '✅ Allow': ['', '✅ อนุญาต'],
+        '🔄 Reconnect': ['', '🔄 เชื่อมต่อใหม่'], '🔓 Unlock': ['', '🔓 ปลดล็อก'], '➕ Add to the list': ['', '➕ เพิ่มในรายการ'], '❓ Unknown chargers trying to connect': ['', '❓ ตู้ที่ไม่รู้จักพยายามเชื่อมต่อ'],
+        'Clear the list': ['', 'ล้างรายการ'], 'Charger id': ['', 'ID ตู้'], 'Attempts': ['', 'จำนวนครั้ง'], 'First / last attempt': ['', 'ครั้งแรก / ล่าสุด'], 'Address': ['', 'ที่อยู่ IP'],
+        'Sent a password': ['', 'ส่งรหัสผ่านมา'], 'yes': ['', 'ใช่'], 'no': ['', 'ไม่'], 'Dismiss': ['', 'ซ่อน'], '🔒 Locked after failed attempts': ['', '🔒 ถูกล็อกหลังใส่รหัสผิด'],
+        'all unknown ids': ['', 'ID ที่ไม่รู้จักทั้งหมด'], 'Until': ['', 'ถึง'], 'Time': ['', 'เวลา'], 'Event': ['', 'เหตุการณ์'], 'Details': ['', 'รายละเอียด'], '(+{n} more)': ['', '(+อีก {n} ครั้ง)'],
+        'Nothing yet': ['', 'ยังไม่มี'], '🚫 Refused': ['', '🚫 ปฏิเสธ'], '❓ Unknown charger': ['', '❓ ตู้ที่ไม่รู้จัก'], '🔒 Locked': ['', '🔒 ล็อก'], '🔒 Refused (locked)': ['', '🔒 ปฏิเสธ (ถูกล็อก)'],
+        '⛔ Refused (blocked)': ['', '⛔ ปฏิเสธ (ถูกบล็อก)'], '🧱 Address blocked': ['', '🧱 บล็อกที่อยู่ IP'], '🧱 Refused (address blocked)': ['', '🧱 ปฏิเสธ (IP ถูกบล็อก)'],
+        '✅ New password in use': ['', '✅ ตู้ใช้รหัสผ่านใหม่แล้ว'], '⚠️ Signed in without password (change-over)': ['', '⚠️ เข้าระบบโดยไม่มีรหัสผ่าน (ช่วงเปลี่ยนผ่าน)'],
+        '🔑 Password stored on the charger': ['', '🔑 ตู้บันทึกรหัสผ่านแล้ว'], '📤 New password sent': ['', '📤 ส่งรหัสผ่านใหม่แล้ว'], '❌ Sending the password failed': ['', '❌ ส่งรหัสผ่านไม่สำเร็จ'],
+        '🛡️ Security profile changed': ['', '🛡️ เปลี่ยน security profile'], '➕ Added': ['', '➕ เพิ่ม'], '✏️ Changed': ['', '✏️ แก้ไข'], '🗑️ Removed': ['', '🗑️ ลบ'], '📥 Chargers added': ['', '📥 เพิ่มตู้'],
+        '🔓 Unlocked': ['', '🔓 ปลดล็อก'], '⚙️ Access mode': ['', '⚙️ โหมดการเข้าถึง'],
+        'wrong password': ['', 'รหัสผ่านผิด'], 'no password sent': ['', 'ไม่ได้ส่งรหัสผ่าน'], 'unknown charger id': ['', 'ไม่รู้จัก ID ตู้'], 'blocked': ['', 'ถูกบล็อก'],
+        'locked after failed attempts': ['', 'ถูกล็อกหลังใส่รหัสผิด'], 'no password set in the CSMS for this charger': ['', 'ยังไม่ได้ตั้งรหัสผ่านของตู้นี้ใน CSMS'],
+        'TLS (wss://) required for profile 2': ['', 'profile 2 ต้องใช้ TLS (wss://)'], 'invalid charger id': ['', 'ID ตู้ไม่ถูกต้อง'],
+        'Block {cp}? It is disconnected now and refused until you allow it again.': ['', 'บล็อก {cp}? ตู้จะถูกตัดการเชื่อมต่อทันทีและถูกปฏิเสธจนกว่าจะอนุญาตอีกครั้ง'],
+        '{cp} disconnected - it signs in again by itself': ['', 'ตัดการเชื่อมต่อ {cp} แล้ว ตู้จะเข้าระบบใหม่เอง'],
+        'Remove {cp} from the access list? In the modes "Known chargers only" and "Password for every charger" it is refused at its next connection.': ['', 'ลบ {cp} ออกจากรายการ? ในโหมด "เฉพาะตู้ที่รู้จัก" และ "ทุกตู้ต้องมีรหัสผ่าน" ตู้จะถูกปฏิเสธเมื่อเชื่อมต่อครั้งถัดไป'],
+        '{cp} allowed - it connects at its next attempt': ['', 'อนุญาต {cp} แล้ว ตู้จะเชื่อมต่อได้ในครั้งถัดไป'], 'User name': ['', 'User name'], 'Password (charger key)': ['', 'รหัสผ่าน (คีย์ของตู้)'],
+        '📋 Copy': ['', '📋 คัดลอก'], 'Copied': ['', 'คัดลอกแล้ว'], 'Done': ['', 'เสร็จ'], '🔑 Password for {cp}': ['', '🔑 รหัสผ่านของ {cp}'],
+        'Shown only once - the CSMS keeps only a fingerprint. Keep it in your password manager or the charger file.': ['', 'แสดงครั้งเดียวเท่านั้น - CSMS เก็บเฉพาะลายนิ้วมือ (hash) เก็บรหัสนี้ไว้ในโปรแกรมจัดการรหัสผ่านหรือแฟ้มข้อมูลตู้'],
+        'On the charger: CSMS connection → HTTP Basic authentication, user name = charger id, password = this key. The key is 40 hexadecimal digits, so it also works where the charger asks whether the OCPP 1.6 key is hexadecimal (Vector vSECC).': ['', 'ที่ตู้: การเชื่อมต่อ CSMS → HTTP Basic authentication, user name = ID ของตู้, password = คีย์นี้ คีย์เป็นเลขฐานสิบหก 40 หลัก จึงใช้ได้ทั้งแบบเปิดและไม่เปิดตัวเลือก "password เป็น hexadecimal" ของ OCPP 1.6 (Vector vSECC)'],
+        'Security profile': ['', 'Security profile'], 'Send it to the charger now (OCPP ChangeConfiguration AuthorizationKey + SecurityProfile)': ['', 'ส่งไปที่ตู้ทันที (OCPP ChangeConfiguration AuthorizationKey + SecurityProfile)'],
+        'Then reconnect the charger to confirm the new password': ['', 'จากนั้นให้ตู้เชื่อมต่อใหม่เพื่อยืนยันรหัสผ่านใหม่'], '…or type your own password (16 - 40 characters, leave empty to generate one)': ['', '…หรือพิมพ์รหัสผ่านเอง (16 - 40 ตัวอักษร เว้นว่างเพื่อให้ระบบสร้างให้)'],
+        '{cp} is online: the new password is sent over OCPP and the previous one stays valid for a while, so the charger is never locked out.': ['', '{cp} ออนไลน์อยู่: รหัสผ่านใหม่จะถูกส่งผ่าน OCPP และรหัสเดิมยังใช้ได้อีกระยะหนึ่ง ตู้จึงไม่ถูกล็อกออกจากระบบ'],
+        '{cp} is offline: the new password is shown once - type it into the charger (its web page or service tool). The previous password stays valid for a while.': ['', '{cp} ออฟไลน์อยู่: รหัสผ่านใหม่จะแสดงครั้งเดียว ให้นำไปตั้งที่ตู้ (หน้าเว็บของตู้หรือเครื่องมือของช่าง) รหัสเดิมยังใช้ได้อีกระยะหนึ่ง'],
+        '🔑 New password for {cp}': ['', '🔑 รหัสผ่านใหม่ของ {cp}'], 'Create password': ['', 'สร้างรหัสผ่าน'], 'Cancel': ['', 'ยกเลิก'], 'AuthorizationKey: {s}': ['', 'AuthorizationKey: {s}'],
+        'SecurityProfile {p}: {s}': ['', 'SecurityProfile {p}: {s}'], 'The charger was asked to reconnect - the list shows ✅ once it signs in with the new password.': ['', 'สั่งให้ตู้เชื่อมต่อใหม่แล้ว - รายการจะขึ้น ✅ เมื่อตู้เข้าระบบด้วยรหัสผ่านใหม่'],
+        'Saved in the CSMS. Now set the same password on the charger.': ['', 'บันทึกใน CSMS แล้ว ต่อไปให้ตั้งรหัสผ่านเดียวกันที่ตู้'], 'Keep the current password': ['', 'ใช้รหัสผ่านเดิม'],
+        'No password': ['', 'ไม่มีรหัสผ่าน'], 'Generate a new password': ['', 'สร้างรหัสผ่านใหม่'], 'Type a password': ['', 'พิมพ์รหัสผ่าน'], 'Remove the password': ['', 'ลบรหัสผ่าน'],
+        'Password (16 - 40 characters)': ['', 'รหัสผ่าน (16 - 40 ตัวอักษร)'], 'Note': ['', 'หมายเหตุ'], 'Allowed to connect': ['', 'อนุญาตให้เชื่อมต่อ'],
+        'Also accept its registration (BootNotification)': ['', 'ยอมรับการลงทะเบียน (BootNotification) ด้วย'], 'Reconnect it after saving': ['', 'ให้เชื่อมต่อใหม่หลังบันทึก'],
+        'Profile 0 = no password (only allowed in the modes Open and Known chargers only). Profile 1 = HTTP Basic password. Profile 2 = password over TLS (wss://) - plain ws:// sign-ins are refused.': ['', 'Profile 0 = ไม่มีรหัสผ่าน (ใช้ได้เฉพาะโหมดเปิดและโหมดเฉพาะตู้ที่รู้จัก) Profile 1 = รหัสผ่าน HTTP Basic, Profile 2 = รหัสผ่านผ่าน TLS (wss://) และปฏิเสธการเข้าระบบผ่าน ws:// ธรรมดา'],
+        'Add a charger to the access list': ['', 'เพิ่มตู้ในรายการ'], 'Charger access: {cp}': ['', 'สิทธิ์ของตู้: {cp}'], '💾 Save': ['', '💾 บันทึก'], 'Saved': ['', 'บันทึกแล้ว'],
+        'Add every charger the CSMS already knows (registered and not rejected) to the access list, without a password (profile 0)?': ['', 'เพิ่มทุกตู้ที่ CSMS รู้จักอยู่แล้ว (ลงทะเบียนและไม่ถูกปฏิเสธ) เข้ารายการโดยยังไม่มีรหัสผ่าน (profile 0)?'],
+        '{n} chargers added': ['', 'เพิ่ม {n} ตู้แล้ว'], '{n} charger(s) would be refused: {ids}': ['', 'จะมี {n} ตู้ถูกปฏิเสธ: {ids}'], 'Lock-out settings': ['', 'การตั้งค่าการล็อก'],
+        'Lock a charger + address after … failed sign-ins': ['', 'ล็อกตู้ + IP หลังเข้าระบบผิด … ครั้ง'], '… within (minutes)': ['', '… ภายใน (นาที)'], 'Lock for (minutes)': ['', 'ล็อกนาน (นาที)'],
+        'Block an address that tries more than … unknown ids in 10 min': ['', 'บล็อก IP ที่ลอง ID ที่ไม่รู้จักเกิน … ตัวใน 10 นาที'], 'Block it for (minutes)': ['', 'บล็อกนาน (นาที)'],
+        'Previous password stays valid for (hours)': ['', 'รหัสผ่านเดิมยังใช้ได้อีก (ชั่วโมง)'], '⚙️ Charger access mode': ['', '⚙️ โหมดการเข้าถึงของตู้ชาร์จ'],
+        '{n} charger(s) will be refused at their next connection. Continue?': ['', 'จะมี {n} ตู้ถูกปฏิเสธเมื่อเชื่อมต่อครั้งถัดไป ดำเนินการต่อ?'],
+        'Charger password refused': ['', 'รหัสผ่านของตู้ถูกปฏิเสธ'], 'Sign-in refused: {reason} (from {ip})': ['', 'ปฏิเสธการเข้าระบบ: {reason} (จาก {ip})'],
+        'Sign-in refused: {reason} (from {ip}) - locked': ['', 'ปฏิเสธการเข้าระบบ: {reason} (จาก {ip}) - ถูกล็อก']
+    });
+})();
+''')
+
+
+# ---- [OPS] v1.7 free charging with limits: start by RFID card, BPC EV app or the QR code on the charger without paying,
+#      the vehicle number plate / mobile number is recorded, the CSMS stops the session at the kWh / time limit
+OPS_FEATURES.append('free')
+ops_free_active = OpsDocStore('free_active', 'ops_free_active')    # sessions starting / charging / stopping
+ops_free_cards = OpsDocStore('free_cards', 'ops_free_cards')       # RFID card -> vehicle plate / mobile / owner
+OPS_FREE_LOG = OpsEventLog('free', 'ops_free_log', keep_days=62)   # finished sessions (one event each, 't' = end)
+OPS_FREE_DEFAULTS = {
+    'on': False, 'name': 'Free charging', 'message': '', 'chargers': '', 'date_from': '', 'date_to': '', 'hours_from': '',
+    'hours_to': '', 'methods': {'qr': True, 'app': True, 'card': True}, 'session_kwh': 20.0, 'session_min': 60,
+    'daily_kwh': 40.0, 'daily_sessions': 3, 'idle_stop_min': 15, 'require_plate': True, 'require_phone': False,
+    'any_card': False, 'card_needs_plate': False, 'allow_paid': True, 'start_timeout_s': 180,
+}
+OPS_FREE_ACTIVE_STATES = ('starting', 'charging', 'stopping')
+OPS_FREE_REASONS = {'kwh_limit': 'kWh limit reached', 'time_limit': 'time limit reached', 'idle': 'car stopped charging',
+                    'customer': 'stopped by the driver', 'operator': 'stopped by the operator', 'charger': 'stopped at the charger',
+                    'not_started': 'charging did not start', 'rejected': 'charger refused to start', 'cancelled': 'cancelled'}
+_OPS_FREE_DIRTY = {'active': False}
+for _p in ('/api/ops/free/config', '/api/ops/free/cards/save', '/api/ops/free/cards/delete'):
+    ops_perm_rule('POST', _p, 'config')
+ops_perm_rule('POST', '/api/ops/free/stop', 'control')
+OPS_TAB_PERMS['free'] = 'view'
+PUBLIC_PATHS.add('/free')
+PUBLIC_PREFIXES = tuple(PUBLIC_PREFIXES) + ('/free/', '/api/free/public/')
+
+
+def ops_free_cfg() -> dict:
+    d = ops_cfg('free', OPS_FREE_DEFAULTS)
+    if not isinstance(d.get('methods'), dict):
+        d['methods'] = dict(OPS_FREE_DEFAULTS['methods'])
+    for k, v in OPS_FREE_DEFAULTS['methods'].items():
+        d['methods'].setdefault(k, v)
+    return d
+
+
+def ops_free_norm_plate(p) -> str:
+    return ''.join(ch for ch in str(p or '').upper() if ch.isalnum())[:12]
+
+
+def ops_free_norm_phone(p) -> str:
+    try:
+        return _app_norm_phone(p)[:15]
+    except Exception:
+        return ''.join(ch for ch in str(p or '') if ch.isdigit())[:15]
+
+
+def _ops_free_hm(s):
+    try:
+        h, m = str(s).strip().split(':')[:2]
+        return int(h) * 60 + int(m)
+    except (ValueError, TypeError):
+        return None
+
+
+def ops_free_open_at(cp_id: str, now: float = None):
+    """(True, '') when free charging is offered at this charger right now, else (False, why)."""
+    cfg, now = ops_free_cfg(), now or ops_now()
+    if not cfg.get('on'):
+        return False, 'off'
+    allowed = [x.strip() for x in str(cfg.get('chargers') or '').replace(';', ',').split(',') if x.strip()]
+    if allowed and cp_id not in allowed:
+        return False, 'not at this charger'
+    day = ops_dt(now).strftime('%Y-%m-%d')
+    if cfg.get('date_from') and day < str(cfg['date_from'])[:10]:
+        return False, 'starts on ' + str(cfg['date_from'])[:10]
+    if cfg.get('date_to') and day > str(cfg['date_to'])[:10]:
+        return False, 'ended on ' + str(cfg['date_to'])[:10]
+    a, b = _ops_free_hm(cfg.get('hours_from')), _ops_free_hm(cfg.get('hours_to'))
+    if a is not None and b is not None and a != b:
+        m = ops_dt(now).hour * 60 + ops_dt(now).minute
+        inside = (a <= m < b) if a < b else (m >= a or m < b)
+        if not inside:
+            return False, f"free charging hours are {cfg['hours_from']} - {cfg['hours_to']}"
+    return True, ''
+
+
+def ops_free_sessions(t0: float, t1: float, pred=None) -> List[dict]:
+    """Finished sessions in [t0, t1) plus the active ones started in that range."""
+    out = OPS_FREE_LOG.query(t0, t1, pred)
+    for s in ops_free_active.data.values():
+        if t0 <= (s.get('created') or 0) < t1 and (pred is None or pred(s)):
+            out.append(s)
+    return out
+
+
+def ops_free_usage(ident: dict, now: float = None) -> dict:
+    """Free kWh / sessions today (Bhutan Time) for each identity (plate, phone, card, customer) - the highest counts."""
+    now = now or ops_now()
+    day0 = ops_day_start(ops_dt(now).strftime('%Y-%m-%d'))
+    keys = [(k, v) for k, v in ident.items() if v]
+    best = {'kwh': 0.0, 'sessions': 0}
+    if not keys:
+        return best
+    rows = ops_free_sessions(day0, now + 1, lambda s: s.get('state') != 'failed')
+    for k, v in keys:
+        mine = [s for s in rows if s.get(k) == v]
+        best['kwh'] = max(best['kwh'], sum(float(s.get('kwh') or 0) for s in mine))
+        best['sessions'] = max(best['sessions'], len(mine))
+    return best
+
+
+def ops_free_allowance(ident: dict, now: float = None):
+    """(ok, session kWh limit, session minutes limit, reason) for a new free session of this driver / card."""
+    cfg = ops_free_cfg()
+    use = ops_free_usage(ident, now)
+    if int(cfg.get('daily_sessions') or 0) and use['sessions'] >= int(cfg['daily_sessions']):
+        return False, 0, 0, f"daily limit reached ({use['sessions']} free sessions today)"
+    lim = float(cfg.get('session_kwh') or 0)
+    daily = float(cfg.get('daily_kwh') or 0)
+    if daily:
+        left = round(daily - use['kwh'], 3)
+        if left < 0.2:
+            return False, 0, 0, f"daily limit reached ({use['kwh']:.1f} of {daily:g} kWh free today)"
+        lim = min(lim, left) if lim else left
+    for s in ops_free_active.data.values():
+        if s.get('state') in OPS_FREE_ACTIVE_STATES and any(v and s.get(k) == v for k, v in ident.items()):
+            return False, 0, 0, f"a free session is already running at {s.get('cp')}"
+    return True, round(lim, 3), float(cfg.get('session_min') or 0), ''
+
+
+def _ops_free_new(method: str, cp_id: str, conn, tag: str, ident: dict, lim_kwh: float, lim_min: float, **extra) -> dict:
+    sid = tag if tag.startswith('FREE-') else 'FC-' + secrets.token_hex(4).upper()
+    s = {'id': sid, 'tag': tag, 'method': method, 'cp': cp_id, 'conn': conn, 'state': 'starting', 'created': round(ops_now(), 1),
+         'plate': ident.get('plate') or '', 'phone': ident.get('phone') or '', 'card': ident.get('card') or '',
+         'customer': ident.get('customer') or '', 'name': str(extra.pop('name', '') or '')[:60],
+         'limit_kwh': lim_kwh, 'limit_min': lim_min, 'kwh': 0.0, 'power_w': 0.0}
+    s.update(extra)
+    ops_free_active.data[sid] = s
+    ops_free_active.save()
+    return s
+
+
+def _ops_free_find(cp_id: str = None, txn=None, tag: str = None):
+    for s in ops_free_active.data.values():
+        if cp_id and s.get('cp') != cp_id:
+            continue
+        if txn is not None and s.get('txn') is not None and str(s.get('txn')) == str(txn):
+            return s
+        if tag and s.get('tag') == tag and (txn is None or s.get('txn') is None):
+            return s
+    return None
+
+
+def _ops_free_card_meta(key: str):
+    """(registered card record or None, free-charging registration of the card)."""
+    card = app_state.get_rfid_card(key)
+    ckey = key
+    if card is None:
+        try:
+            rev = reverse_hex_bytes(key)
+            if rev != key and app_state.get_rfid_card(rev) is not None:
+                card, ckey = app_state.get_rfid_card(rev), rev
+        except Exception:
+            pass
+    meta = ops_free_cards.data.get(ckey) or ops_free_cards.data.get(key) or {}
+    return card, ckey, meta
+
+
+def ops_free_authorize(cp_id: str, connector_id, id_tag: str, start: bool = False):
+    """Authorize / StartTransaction: an idTagInfo when free charging decides, else None (normal card / payment rules)."""
+    key = str(id_tag or '').strip().upper()
+    if not key:
+        return None
+    if key.startswith('FREE-'):
+        s = ops_free_active.data.get(key)
+        ok = s is not None and s.get('cp') == cp_id and s.get('state') in OPS_FREE_ACTIVE_STATES
+        return {'status': AuthorizationStatus.accepted if ok else AuthorizationStatus.invalid}
+    for s in ops_free_active.data.values():                # the same card again on this charger (stop / re-check)
+        if s.get('method') == 'card' and s.get('tag') == key and s.get('cp') == cp_id and s.get('state') in OPS_FREE_ACTIVE_STATES:
+            return {'status': AuthorizationStatus.accepted}
+    cfg = ops_free_cfg()
+    if not (cfg.get('methods') or {}).get('card') or not ops_free_open_at(cp_id)[0]:
+        return None
+    if key.startswith((str(getattr(app_state, 'payment_prefix', 'PAY-')).upper(), str(getattr(app_state, 'autocharge_prefix', 'AUTO-')).upper())):
+        return None
+    card, ckey, meta = _ops_free_card_meta(key)
+    if card is not None:
+        if str(card.get('status', 'Accepted')).split('.')[-1].lower() != 'accepted':
+            return None                                     # blocked / expired cards keep their status
+    elif not cfg.get('any_card'):
+        return None
+    ident = {'card': ckey, 'plate': ops_free_norm_plate(meta.get('plate')), 'phone': ops_free_norm_phone(meta.get('phone'))}
+    if cfg.get('card_needs_plate') and not (ident['plate'] or ident['phone']):
+        logger.info(f"free charging: card {ckey} has no vehicle plate / mobile number on file -> Blocked")
+        return {'status': AuthorizationStatus.blocked}
+    ok, lim_kwh, lim_min, why = ops_free_allowance(ident)
+    if not ok:
+        logger.info(f"free charging: card {ckey} at {cp_id}: {why} -> Blocked")
+        return {'status': AuthorizationStatus.blocked}
+    if start:
+        try:
+            conn = int(connector_id)
+        except (TypeError, ValueError):
+            conn = None
+        _ops_free_new('card', cp_id, conn, key, ident, lim_kwh, lim_min, name=meta.get('name') or card and card.get('description') or '')
+    return {'status': AuthorizationStatus.accepted}
+
+
+@ops_on('tx_start')
+def _ops_free_tx_start(cp_id=None, connector=None, txn_id=None, id_tag='', meter_start=0, accepted=True, **kw):
+    key = str(id_tag or '').upper()
+    s = None
+    for x in ops_free_active.data.values():
+        if x.get('cp') == cp_id and x.get('tag') == key and x.get('state') == 'starting' and \
+                (x.get('conn') in (None, connector) or x.get('method') != 'card'):
+            s = x
+            break
+    if s is None:
+        return
+    if not accepted:
+        _ops_free_finish(s, 'failed', 'rejected', 'StartTransaction not accepted')
+        return
+    s.update(state='charging', txn=txn_id, conn=connector, meter_start=float(meter_start or 0), started=round(ops_now(), 1),
+             kwh=0.0, last_mv=ops_now())
+    ops_free_active.save()
+    logger.info(f"🎟️ free session {s['id']} charging at {cp_id} #{connector} (txn {txn_id}, limit {s.get('limit_kwh') or '-'} kWh / {s.get('limit_min') or '-'} min)")
+
+
+@ops_on('meter')
+def _ops_free_meter(cp_id=None, connector=None, txn_id=None, energy_wh=None, power_w=None, **kw):
+    s = _ops_free_find(cp_id, txn=txn_id) if txn_id is not None else None
+    if s is None or s.get('state') not in ('charging', 'stopping'):
+        return
+    now = ops_now()
+    if energy_wh is not None and s.get('meter_start') is not None:
+        s['kwh'] = round(max(float(s.get('kwh') or 0), (float(energy_wh) - float(s['meter_start'])) / 1000.0), 3)
+    if power_w is not None:
+        s['power_w'] = round(float(power_w), 1)
+    gap = max(5.0, min(60.0, now - float(s.get('last_mv') or now)))
+    s['last_mv'] = now
+    _OPS_FREE_DIRTY['active'] = True
+    lim = float(s.get('limit_kwh') or 0)
+    if s['state'] == 'charging' and lim > 0:
+        projected = max(0.0, float(s.get('power_w') or 0)) / 1000.0 * gap / 3600.0
+        if s['kwh'] + projected >= lim - 1e-6:
+            asyncio.create_task(ops_free_stop(s, 'kwh_limit'))
+
+
+@ops_on('tx_stop')
+def _ops_free_tx_stop(cp_id=None, txn_id=None, meter_stop=None, reason='', energy_wh=None, **kw):
+    s = _ops_free_find(cp_id, txn=txn_id)
+    if s is None or s.get('txn') is None:
+        return
+    if meter_stop is not None and s.get('meter_start') is not None:
+        s['kwh'] = round(max(float(s.get('kwh') or 0), (float(meter_stop) - float(s['meter_start'])) / 1000.0), 3)
+    _ops_free_finish(s, 'completed', s.get('stop_reason') or 'charger', str(reason or ''))
+
+
+def _ops_free_finish(s: dict, state: str, reason: str, detail: str = ''):
+    now = ops_now()
+    s.update(state=state, stopped=round(now, 1), reason=reason, detail=str(detail or '')[:120])
+    if s.get('started'):
+        s['minutes'] = round(max(0.0, now - s['started']) / 60.0, 1)
+    ev = {k: v for k, v in s.items() if k not in ('token', 'stop_sent', 'idle_since', 'last_mv')}
+    ev['t'] = round(now, 3)
+    OPS_FREE_LOG.add(ev)
+    ops_free_active.data.pop(s['id'], None)
+    ops_free_active.save()
+    if s.get('tag', '').startswith('FREE-') and state != 'completed':
+        for k in [k for k in list(app_state.remote_start_pending) if len(k) == 3 and k[0] == s.get('cp') and k[2] == s['tag']]:
+            app_state.remote_start_pending.pop(k, None)    # a late StartTransaction must not run unmonitored
+    logger.info(f"🎟️ free session {s['id']} {state}: {OPS_FREE_REASONS.get(reason, reason)} - {float(s.get('kwh') or 0):.2f} kWh")
+    return ev
+
+
+async def ops_free_stop(s: dict, reason: str) -> dict:
+    if s.get('state') == 'starting':
+        _ops_free_finish(s, 'failed', reason if reason in ('customer', 'operator') else 'cancelled', 'stopped before charging started')
+        return {'ok': True, 'cancelled': True}
+    if s.get('state') not in ('charging', 'stopping'):
+        return {'ok': False, 'error': 'the session is not running'}
+    if s.get('state') == 'stopping' and ops_now() - float(s.get('stop_sent') or 0) < 20:
+        return {'ok': True, 'already': True}
+    s.update(state='stopping', stop_reason=s.get('stop_reason') or reason, stop_sent=ops_now(),
+             stop_attempts=int(s.get('stop_attempts') or 0) + 1)
+    _OPS_FREE_DIRTY['active'] = True
+    cs = app_state.charge_points.get(s.get('cp'))
+    if cs is None:
+        return {'ok': False, 'error': 'the charger is offline - it stops when it is back online'}
+    try:
+        r = await cs.cmd_remote_stop(int(s['txn']))
+        st = str((r or {}).get('status', '')).split('.')[-1]
+    except Exception as e:
+        st = f'error {type(e).__name__}'
+    if st.lower() != 'accepted':
+        s['detail'] = f'RemoteStop {st}'
+        return {'ok': False, 'error': f'the charger answered {st}'}
+    logger.info(f"🎟️ free session {s['id']}: RemoteStop sent ({OPS_FREE_REASONS.get(reason, reason)})")
+    return {'ok': True}
+
+
+async def ops_free_loop():
+    """Start timeouts, time limits, idle cars, stop retries; saves the active sessions."""
+    while True:
+        await asyncio.sleep(max(1.0, min(5.0, float(os.environ.get('OPS_TICK', '5') or 5))))
+        now, cfg = ops_now(), ops_free_cfg()
+        for s in list(ops_free_active.data.values()):
+            try:
+                st = s.get('state')
+                if st == 'starting' and now - float(s.get('created') or now) > max(10, int(cfg.get('start_timeout_s') or 180)):
+                    _ops_free_finish(s, 'failed', 'not_started', 'no StartTransaction - was the cable plugged in?')
+                    continue
+                if st == 'charging':
+                    lim_min = float(s.get('limit_min') or 0)
+                    if lim_min and now - float(s.get('started') or now) >= lim_min * 60:
+                        asyncio.create_task(ops_free_stop(s, 'time_limit'))
+                        continue
+                    idle_min = float(cfg.get('idle_stop_min') or 0)
+                    if idle_min:
+                        data = app_state.cp_data.get(s['cp'])
+                        sts = (getattr(data, 'status', None) or {}) if data else {}
+                        cst = str(sts.get(s.get('conn')) or sts.get(str(s.get('conn'))) or '')
+                        if float(s.get('power_w') or 0) < 100 or cst in ('SuspendedEV', 'SuspendedEVSE'):
+                            s.setdefault('idle_since', now)
+                            if now - float(s.get('started') or now) >= min(300.0, idle_min * 60) and now - s['idle_since'] >= idle_min * 60:
+                                asyncio.create_task(ops_free_stop(s, 'idle'))
+                        else:
+                            s.pop('idle_since', None)
+                if st == 'stopping' and now - float(s.get('stop_sent') or 0) > 60:
+                    if int(s.get('stop_attempts') or 0) < 5:
+                        asyncio.create_task(ops_free_stop(s, s.get('stop_reason') or 'operator'))
+                    elif now - float(s.get('stop_sent') or 0) > 6 * 3600:
+                        _ops_free_finish(s, 'completed', s.get('stop_reason') or 'charger', 'no StopTransaction received')
+            except Exception as e:
+                logger.error(f"ops: free session {s.get('id')} check failed: {e}")
+        if _OPS_FREE_DIRTY['active']:
+            _OPS_FREE_DIRTY['active'] = False
+            ops_free_active.save()
+
+OPS_TASKS.append(ops_free_loop)
+
+
+def _ops_free_kpi(t0, t1, res):
+    rows = [s for s in ops_free_sessions(t0, t1) if s.get('state') != 'failed']
+    kwh = round(sum(float(s.get('kwh') or 0) for s in rows), 2)
+    who = {s.get('plate') or s.get('phone') or s.get('card') or s.get('customer') for s in rows} - {''}
+    res['free'] = {'sessions': len(rows), 'kwh': kwh, 'drivers': len(who),
+                   'at_limit': sum(1 for s in rows if s.get('reason') in ('kwh_limit', 'time_limit'))}
+    if rows or ops_free_cfg().get('on'):
+        res.setdefault('extra_tiles', []).append({'cls': 'good', 'label': 'Free charging', 'value': f"{kwh:g} <small>kWh</small>",
+                                                  'sub': f"{len(rows)} sessions · {len(who)} vehicles"})
+        res.setdefault('extra_summary', []).extend([('Free charging sessions', len(rows)), ('Free charging kWh', kwh),
+                                                    ('Free charging vehicles / drivers', len(who))])
+
+OPS_KPI_EXTRA.append(_ops_free_kpi)
+
+
+# ---- customer pages: /free (list), /free/<charger>[/<connector>]; the QR sticker /pay/<charger>/<n> leads here while it is on
+def _ops_free_public_cfg() -> dict:
+    cfg = ops_free_cfg()
+    return {'on': bool(cfg.get('on')), 'name': cfg.get('name') or 'Free charging', 'message': cfg.get('message') or '',
+            'session_kwh': float(cfg.get('session_kwh') or 0), 'session_min': float(cfg.get('session_min') or 0),
+            'daily_kwh': float(cfg.get('daily_kwh') or 0), 'daily_sessions': int(cfg.get('daily_sessions') or 0),
+            'require_plate': bool(cfg.get('require_plate')), 'require_phone': bool(cfg.get('require_phone')),
+            'methods': dict(cfg.get('methods') or {}), 'allow_paid': bool(cfg.get('allow_paid')),
+            'hours': f"{cfg['hours_from']} - {cfg['hours_to']}" if cfg.get('hours_from') and cfg.get('hours_to') else '',
+            'date_to': cfg.get('date_to') or ''}
+
+
+def _ops_free_station(cp_id: str) -> dict:
+    pub = _pay_station_public(cp_id)
+    info = station_info.data.get(cp_id) or {}
+    ok, why = ops_free_open_at(cp_id)
+    busy = {(s.get('cp'), s.get('conn')) for s in ops_free_active.data.values() if s.get('state') in OPS_FREE_ACTIVE_STATES}
+    for c in pub['connectors']:
+        if (cp_id, c['id']) in busy:
+            c['busy'] = True
+        c.pop('pay_ref', None)
+    return {'id': cp_id, 'name': info.get('name') or cp_id, 'address': info.get('address') or '', 'connected': pub['connected'],
+            'accepted': pub.get('registration') == 'Accepted', 'free': ok, 'why': why, 'connectors': pub['connectors']}
+
+
+def _ops_free_public_view(s: dict) -> dict:
+    out = {k: s.get(k) for k in ('id', 'method', 'cp', 'conn', 'state', 'created', 'started', 'stopped', 'kwh', 'power_w',
+                                 'limit_kwh', 'limit_min', 'reason', 'detail', 'plate', 'minutes')}
+    out['reason_text'] = OPS_FREE_REASONS.get(s.get('reason') or '', s.get('reason') or '')
+    out['now'] = ops_now()
+    info = station_info.data.get(s.get('cp')) or {}
+    out['station'] = info.get('name') or s.get('cp')
+    return out
+
+
+async def ops_free_page(request):
+    return web.Response(text=OPS_FREE_HTML, content_type='text/html', headers={'Cache-Control': 'no-store'})
+
+
+async def ops_free_app_js(request):
+    return web.Response(text=OPS_FREE_APP_JS, content_type='application/javascript', headers={'Cache-Control': 'no-cache'})
+
+
+async def ops_free_api_info(request):
+    stations = []
+    if ops_free_cfg().get('on'):
+        for st in app_state.station_records():
+            if st.get('registration_status') != 'Accepted' or (station_info.data.get(st['id']) or {}).get('hidden'):
+                continue
+            if ops_free_open_at(st['id'])[0]:
+                x = _ops_free_station(st['id'])
+                x['available'] = sum(1 for c in x['connectors'] if not c['busy'] and c['status'] in ('Available', 'Preparing')) if x['connected'] else 0
+                stations.append(x)
+    return ops_json({'cfg': _ops_free_public_cfg(), 'stations': stations})
+
+
+async def ops_free_api_station(request):
+    cp = request.match_info['cp_id']
+    return ops_json({'cfg': _ops_free_public_cfg(), 'station': _ops_free_station(cp)})
+
+
+async def ops_free_api_start(request):
+    ip = _client_ip(request)
+    if not _pay_rate_ok(ip, 'free_start', 10):
+        return ops_err('Too many requests - please wait a minute', 429)
+    b = await ops_body(request)
+    cfg = ops_free_cfg()
+    cp = str(b.get('cp_id') or '').strip()
+    try:
+        conn = int(b.get('connector_id') or 0)
+    except (TypeError, ValueError):
+        conn = 0
+    if not cp or cp not in app_state.cp_data and cp not in app_state.cp_registrations:
+        return ops_err('Unknown charger', 404)
+    ok, why = ops_free_open_at(cp)
+    if not ok:
+        return ops_err('Free charging is not available at this charger now' + (f' ({why})' if why else ''), 403)
+    cust = None
+    tok = str(b.get('app_token') or '')
+    if tok:
+        try:
+            cust = customers.resolve(tok)
+        except Exception:
+            cust = None
+    method = 'app' if cust else 'qr'
+    if not (cfg.get('methods') or {}).get(method):
+        return ops_err('Free charging with the app is switched off - use the QR code page' if method == 'app'
+                       else 'Free charging from this page is switched off - use your RFID card or the BPC EV app', 403)
+    plate = ops_free_norm_plate(b.get('plate') or (cust or {}).get('plate'))
+    phone = ops_free_norm_phone(b.get('phone') or (cust or {}).get('phone'))
+    if b.get('plate') and not (4 <= len(plate) <= 12):
+        return ops_err('Type the vehicle number plate (4 - 12 letters / digits)')
+    if cfg.get('require_plate') and not plate:
+        return ops_err('Type the vehicle number plate')
+    if b.get('phone') and not (8 <= len(phone) <= 15):
+        return ops_err('Type a valid mobile number')
+    if cfg.get('require_phone') and not phone:
+        return ops_err('Type your mobile number')
+    if not plate and not phone:
+        return ops_err('Type the vehicle number plate or your mobile number')
+    st = _ops_free_station(cp)
+    if not st['connected']:
+        return ops_err('The charger is offline right now', 409)
+    if not st['accepted']:
+        return ops_err('The charger is not in service yet', 409)
+    conns = {c['id']: c for c in st['connectors']}
+    if not conn:
+        free_c = [c['id'] for c in st['connectors'] if not c['busy']]
+        conn = free_c[0] if len(st['connectors']) == 1 and free_c else 0
+    if conn not in conns:
+        return ops_err('Choose a connector')
+    if conns[conn]['busy']:
+        return ops_err(f'Connector {conn} is busy - choose another one or wait', 409)
+    ident = {'plate': plate, 'phone': phone, 'customer': (cust or {}).get('id') or ''}
+    ok, lim_kwh, lim_min, why = ops_free_allowance(ident)
+    if not ok:
+        return ops_err(why[:1].upper() + why[1:], 409)
+    tag = 'FREE-' + ''.join(secrets.choice('ABCDEFGHJKLMNPQRSTUVWXYZ23456789') for _ in range(8))
+    s = _ops_free_new(method, cp, conn, tag, ident, lim_kwh, lim_min, token=secrets.token_urlsafe(18), ip=ip,
+                      name=(cust or {}).get('name') or '')
+    cs = app_state.charge_points.get(cp)
+    try:
+        r = await asyncio.wait_for(cs.cmd_remote_start(tag, conn), 40)
+        rs = str((r or {}).get('status', '')).split('.')[-1]
+    except Exception as e:
+        rs = f'no answer ({type(e).__name__})'
+    if rs.lower() != 'accepted':
+        _ops_free_finish(s, 'failed', 'rejected', f'RemoteStart {rs}')
+        return ops_err(f'The charger did not accept the start ({rs}) - try again or use another connector', 409)
+    s['detail'] = 'plug in the cable'
+    ops_free_active.save()
+    logger.info(f"🎟️ free session {tag} ({method}) requested at {cp} #{conn} for {plate or '-'} / {('…' + phone[-3:]) if phone else '-'}")
+    return ops_json({'ok': True, 'ref': tag, 'token': s['token'], 'session': _ops_free_public_view(s)})
+
+
+def _ops_free_by_token(ref: str, token: str):
+    ref = str(ref or '').strip().upper()
+    s = ops_free_active.data.get(ref)
+    if s is not None:
+        return s if secrets.compare_digest(str(token or ''), str(s.get('token') or '')) else None
+    return None
+
+
+async def ops_free_api_status(request):
+    ip = _client_ip(request)
+    if not _pay_rate_ok(ip, 'free_status', 240):
+        return ops_err('Too many requests', 429)
+    ref, token = request.query.get('ref', ''), request.query.get('token', '')
+    s = _ops_free_by_token(ref, token)
+    if s is not None:
+        return ops_json({'session': _ops_free_public_view(s)})
+    now = ops_now()
+    done = OPS_FREE_LOG.query(now - 2 * 86400, now + 1, lambda e: e.get('id') == str(ref).upper())
+    if done:
+        e = done[-1]
+        # finished sessions: the token is not kept - the reference alone shows only the outcome (no personal data)
+        v = _ops_free_public_view(e)
+        v['plate'] = ''
+        return ops_json({'session': v})
+    return ops_err('Session not found', 404)
+
+
+async def ops_free_api_stop(request):
+    ip = _client_ip(request)
+    if not _pay_rate_ok(ip, 'free_stop', 20):
+        return ops_err('Too many requests', 429)
+    b = await ops_body(request)
+    s = _ops_free_by_token(b.get('ref'), b.get('token'))
+    if s is None:
+        return ops_err('Session not found', 404)
+    r = await ops_free_stop(s, 'customer')
+    return ops_json(dict(r, session=_ops_free_public_view(s)), status=200 if r.get('ok') else 409)
+
+
+# ---- operator console API -------------------------------------------------------------------------------------------
+def _ops_free_admin_view(s: dict, now: float) -> dict:
+    v = {k: s.get(k) for k in ('id', 'tag', 'method', 'cp', 'conn', 'state', 'created', 'started', 'stopped', 'kwh', 'power_w',
+                               'limit_kwh', 'limit_min', 'reason', 'detail', 'plate', 'phone', 'card', 'customer', 'name', 'minutes', 'txn')}
+    v['reason_text'] = OPS_FREE_REASONS.get(s.get('reason') or s.get('stop_reason') or '', s.get('reason') or '')
+    if s.get('state') in OPS_FREE_ACTIVE_STATES and s.get('started'):
+        v['minutes'] = round((now - s['started']) / 60.0, 1)
+    v['station'] = (station_info.data.get(s.get('cp')) or {}).get('name') or s.get('cp')
+    return v
+
+
+async def ops_api_free(request):
+    now = ops_now()
+    t0, t1 = ops_range_from_query(request.query, 7)
+    q = (request.query.get('q') or '').strip().upper()
+    pred = (lambda s: q in ' '.join(str(s.get(k) or '') for k in ('id', 'cp', 'plate', 'phone', 'card', 'name')).upper()) if q else None
+    recent = await asyncio.to_thread(OPS_FREE_LOG.query, t0, t1, pred, 500, True)
+    day0 = ops_day_start(ops_dt(now).strftime('%Y-%m-%d'))
+    m0 = ops_day_start(ops_dt(now).strftime('%Y-%m-01'))
+    today = [s for s in ops_free_sessions(day0, now + 1) if s.get('state') != 'failed']
+    month = [s for s in ops_free_sessions(m0, now + 1) if s.get('state') != 'failed']
+    who = lambda rows: len({s.get('plate') or s.get('phone') or s.get('card') or s.get('customer') for s in rows} - {''})  # noqa: E731
+    stats = {'active': sum(1 for s in ops_free_active.data.values() if s.get('state') in OPS_FREE_ACTIVE_STATES),
+             'today_sessions': len(today), 'today_kwh': round(sum(float(s.get('kwh') or 0) for s in today), 2), 'today_drivers': who(today),
+             'month_kwh': round(sum(float(s.get('kwh') or 0) for s in month), 2), 'month_sessions': len(month),
+             'today_at_limit': sum(1 for s in today if s.get('reason') in ('kwh_limit', 'time_limit'))}
+    cfg = ops_free_cfg()
+    open_now = [st['id'] for st in app_state.station_records() if ops_free_open_at(st['id'], now)[0]]
+    cards = []
+    for k, m in sorted(ops_free_cards.data.items()):
+        card = app_state.get_rfid_card(k)
+        cards.append(dict(m, card=k, registered=card is not None, card_status=(card or {}).get('status', '')))
+    return ops_json({'cfg': {k: cfg.get(k) for k in OPS_FREE_DEFAULTS}, 'open_now': open_now, 'stats': stats,
+                     'active': [_ops_free_admin_view(s, now) for s in sorted(ops_free_active.data.values(), key=lambda s: -(s.get('created') or 0))],
+                     'recent': [_ops_free_admin_view(s, now) for s in recent], 'cards': cards, 'from': t0, 'to': t1, 'now': now,
+                     'rfid_cards': sorted(app_state.rfid_cards)[:500]})
+
+
+async def ops_api_free_csv(request):
+    t0, t1 = ops_range_from_query(request.query, 31)
+    rows = await asyncio.to_thread(OPS_FREE_LOG.query, t0, t1, None, None, False)
+    buf = _ops_io.StringIO()
+    w = _ops_csv.writer(buf)
+    w.writerow(['session', 'method', 'charger', 'connector', 'plate', 'mobile', 'card', 'app customer', 'name', 'requested (BTT)',
+                'started (BTT)', 'ended (BTT)', 'kWh', 'minutes', 'kWh limit', 'minutes limit', 'result', 'ended because', 'details'])
+    for s in rows:
+        w.writerow([ops_csv_safe(x) for x in (s.get('id'), s.get('method'), s.get('cp'), s.get('conn'), s.get('plate'), s.get('phone'),
+                    s.get('card'), s.get('customer'), s.get('name'), ops_iso(s.get('created')) if s.get('created') else '',
+                    ops_iso(s.get('started')) if s.get('started') else '', ops_iso(s.get('stopped')) if s.get('stopped') else '',
+                    s.get('kwh'), s.get('minutes'), s.get('limit_kwh'), s.get('limit_min'), s.get('state'),
+                    OPS_FREE_REASONS.get(s.get('reason') or '', s.get('reason') or ''), s.get('detail'))])
+    name = 'csms_free_charging_%s.csv' % ops_dt().strftime('%Y%m%d_%H%M')
+    return web.Response(body=('﻿' + buf.getvalue()).encode('utf-8'), content_type='text/csv',
+                        headers={'Content-Disposition': f'attachment; filename="{name}"'})
+
+
+async def ops_api_free_config(request):
+    b = await ops_body(request)
+    cfg = ops_free_cfg()
+    if 'on' in b:
+        cfg['on'] = bool(b['on'])
+    for k in ('name', 'message'):
+        if k in b:
+            cfg[k] = str(b[k] or '')[:200]
+    if 'chargers' in b:
+        cfg['chargers'] = ','.join(x.strip() for x in str(b['chargers'] or '').replace(';', ',').split(',') if x.strip())[:2000]
+    for k in ('date_from', 'date_to'):
+        if k in b:
+            v = str(b[k] or '').strip()[:10]
+            if v:
+                try:
+                    datetime.strptime(v, '%Y-%m-%d')
+                except ValueError:
+                    return ops_err(f'{k}: use YYYY-MM-DD')
+            cfg[k] = v
+    for k in ('hours_from', 'hours_to'):
+        if k in b:
+            v = str(b[k] or '').strip()[:5]
+            if v and _ops_free_hm(v) is None:
+                return ops_err(f'{k}: use HH:MM')
+            cfg[k] = v
+    for k, lo, hi in (('session_kwh', 0, 500), ('daily_kwh', 0, 2000), ('session_min', 0, 1440), ('idle_stop_min', 0, 240)):
+        if k in b:
+            try:
+                cfg[k] = max(lo, min(hi, round(float(b[k] or 0), 2)))
+            except (TypeError, ValueError):
+                return ops_err(f'{k}: a number please')
+    for k, lo, hi in (('daily_sessions', 0, 50), ('start_timeout_s', 10, 900)):
+        if k in b:
+            cfg[k] = ops_int(b[k], OPS_FREE_DEFAULTS[k], lo, hi)
+    for k in ('require_plate', 'require_phone', 'any_card', 'card_needs_plate', 'allow_paid'):
+        if k in b:
+            cfg[k] = bool(b[k])
+    if isinstance(b.get('methods'), dict):
+        for k in ('qr', 'app', 'card'):
+            if k in b['methods']:
+                cfg['methods'][k] = bool(b['methods'][k])
+    ops_settings.save()
+    return ops_json({'ok': True, 'cfg': {k: cfg.get(k) for k in OPS_FREE_DEFAULTS}})
+
+
+async def ops_api_free_stop(request):
+    b = await ops_body(request)
+    s = ops_free_active.data.get(str(b.get('id') or '').upper())
+    if s is None:
+        return ops_err('No such running session', 404)
+    r = await ops_free_stop(s, 'operator')
+    return ops_json(r, status=200 if r.get('ok') else 409)
+
+
+async def ops_api_free_card_save(request):
+    b = await ops_body(request)
+    card = str(b.get('card') or '').strip().upper()
+    if not card or len(card) > 20:
+        return ops_err('Card id (1 - 20 characters)')
+    plate, phone = ops_free_norm_plate(b.get('plate')), ops_free_norm_phone(b.get('phone'))
+    if b.get('plate') and not (4 <= len(plate) <= 12):
+        return ops_err('Vehicle number plate: 4 - 12 letters / digits')
+    if b.get('phone') and not (8 <= len(phone) <= 15):
+        return ops_err('Mobile number: 8 - 15 digits')
+    rec = ops_free_cards.data.get(card) or {'added': round(ops_now())}
+    rec.update(plate=plate, phone=phone, name=str(b.get('name') or '')[:60], note=str(b.get('note') or '')[:120])
+    ops_free_cards.data[card] = rec
+    ops_free_cards.save()
+    if b.get('register') and app_state.get_rfid_card(card) is None:
+        app_state.add_rfid_card(card, 'Accepted', description=('Free charging ' + (rec['name'] or plate or phone)).strip()[:60])
+    return ops_json({'ok': True})
+
+
+async def ops_api_free_card_delete(request):
+    b = await ops_body(request)
+    card = str(b.get('card') or '').strip().upper()
+    if ops_free_cards.data.pop(card, None) is None:
+        return ops_err('Not in the list', 404)
+    ops_free_cards.save()
+    return ops_json({'ok': True})
+
+
+# the QR sticker (/pay/<charger>/<n>) opens the free page while free charging is offered there (?paid=1 = pay anyway)
+_ops_free_orig_pay_page = handle_pay_page
+
+
+async def handle_pay_page(request):
+    cp = request.match_info.get('cp_id') if hasattr(request, 'match_info') else None
+    if cp and request.query.get('paid') != '1' and ops_free_open_at(cp)[0]:
+        conn = request.match_info.get('connector')
+        raise web.HTTPFound(f'/free/{cp}' + (f'/{conn}' if conn else ''))
+    return await _ops_free_orig_pay_page(request)
+
+
+# the BPC EV app shows a "free charging" banner (script injected into the app page)
+_ops_free_orig_app_index = handle_app_index
+
+
+async def handle_app_index(request):
+    resp = await _ops_free_orig_app_index(request)
+    try:
+        if isinstance(resp, web.Response) and resp.text and '</body>' in resp.text:
+            resp.text = resp.text.replace('</body>', '<script src="/free/app.js" defer></script></body>', 1)
+    except Exception:
+        pass
+    return resp
+
+
+OPS_ROUTES += [
+    ('GET', '/free', ops_free_page), ('GET', '/free/', ops_free_page), ('GET', '/free/app.js', ops_free_app_js),
+    ('GET', '/free/{cp_id}', ops_free_page), ('GET', '/free/{cp_id}/{connector}', ops_free_page),
+    ('GET', '/api/free/public/info', ops_free_api_info), ('GET', '/api/free/public/station/{cp_id}', ops_free_api_station),
+    ('POST', '/api/free/public/start', ops_free_api_start), ('GET', '/api/free/public/status', ops_free_api_status),
+    ('POST', '/api/free/public/stop', ops_free_api_stop),
+    ('GET', '/api/ops/free', ops_api_free), ('GET', '/api/ops/free/sessions.csv', ops_api_free_csv),
+    ('POST', '/api/ops/free/config', ops_api_free_config), ('POST', '/api/ops/free/stop', ops_api_free_stop),
+    ('POST', '/api/ops/free/cards/save', ops_api_free_card_save), ('POST', '/api/ops/free/cards/delete', ops_api_free_card_delete),
+]
+
+OPS_FREE_HTML = r'''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>Free charging · BPC</title>
+<link rel="icon" type="image/png" href="/static/bpc_logo.png">
+<style>
+  :root { --g: #1f9d49; --g2: #0a7a3c; --gd: #063d1f; --bg: #f2f7f3; --card: #ffffff; --text: #14321f; --dim: #5b6b61; --line: #d9e5dc; --bad: #c62828; --warn: #b45309; --info: #1d4ed8; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html { -webkit-text-size-adjust: 100%; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Noto Sans', sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
+  .top { background: linear-gradient(135deg, #1b8a44 0%, #063d1f 100%); color: #fff; padding: 0.7rem 1rem; display: flex; align-items: center; gap: 0.7rem; }
+  .top img { height: 44px; width: auto; background: #fff; border-radius: 8px; padding: 2px; }
+  .top .brand { flex: 1; min-width: 0; }
+  .top .brand b { display: block; font-size: 0.9rem; line-height: 1.2; }
+  .top .brand span { display: block; font-size: 0.72rem; opacity: 0.9; }
+  main { max-width: 520px; margin: 0 auto; padding: 0.9rem 0.9rem 3rem; }
+  .card { background: var(--card); border-radius: 16px; box-shadow: 0 4px 18px rgba(6,61,31,0.08); padding: 1rem; margin-bottom: 0.8rem; }
+  .hero { background: linear-gradient(135deg, #eafaf0 0%, #ffffff 70%); border: 1px solid #bfe6cc; }
+  .hero h1 { font-size: 1.25rem; color: var(--g2); margin-bottom: 0.25rem; }
+  .hero p { font-size: 0.86rem; color: var(--dim); line-height: 1.45; }
+  .rules { display: flex; flex-wrap: wrap; gap: 0.35rem; margin-top: 0.6rem; }
+  .chip { display: inline-block; padding: 0.18rem 0.6rem; border-radius: 50px; font-size: 0.72rem; font-weight: 700; background: #e3eee6; color: var(--dim); white-space: nowrap; }
+  .chip.ok { background: #dcfce7; color: #047857; } .chip.warn { background: #fef3c7; color: #b45309; } .chip.bad { background: #fee2e2; color: #b91c1c; } .chip.info { background: #dbeafe; color: #1d4ed8; }
+  .station { display: flex; align-items: center; gap: 0.7rem; }
+  .station .icon { font-size: 1.8rem; }
+  .station .name { font-weight: 800; font-size: 1.05rem; }
+  .station .sub { font-size: 0.78rem; color: var(--dim); }
+  h2 { font-size: 1.02rem; margin-bottom: 0.6rem; }
+  .muted { color: var(--dim); font-size: 0.82rem; line-height: 1.45; }
+  .conns { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 0.5rem; margin-top: 0.4rem; }
+  .conn { border: 2px solid var(--line); border-radius: 12px; padding: 0.6rem; cursor: pointer; background: #fff; text-align: left; font-family: inherit; color: inherit; }
+  .conn.sel { border-color: var(--g); background: #eef8f1; }
+  .conn:disabled { opacity: 0.55; cursor: not-allowed; }
+  .conn b { display: block; font-size: 0.95rem; }
+  label.f { display: block; font-size: 0.78rem; font-weight: 700; color: var(--dim); margin: 0.75rem 0 0.25rem; }
+  input.inp { width: 100%; padding: 0.75rem; border: 1px solid #cbd8cf; border-radius: 12px; font-size: 1.05rem; font-family: inherit; background: #fff; color: var(--text); }
+  input.inp.plate { text-transform: uppercase; letter-spacing: 0.06em; font-weight: 700; }
+  input.inp.plate::placeholder { text-transform: none; letter-spacing: normal; font-weight: 400; }
+  .btn { display: block; width: 100%; margin-top: 0.9rem; padding: 0.9rem; border: none; border-radius: 14px; font-size: 1.05rem; font-weight: 800; cursor: pointer; font-family: inherit;
+         background: linear-gradient(135deg, #1f9d49 0%, #0a7a3c 100%); color: #fff; box-shadow: 0 6px 16px rgba(10,122,60,0.25); }
+  .btn:disabled { opacity: 0.55; cursor: wait; }
+  .btn.ghost { background: #fff; color: var(--g2); border: 2px solid var(--g); box-shadow: none; }
+  .btn.stop { background: linear-gradient(135deg, #ef4444 0%, #b91c1c 100%); box-shadow: 0 6px 16px rgba(185,28,28,0.25); }
+  .err { margin-top: 0.7rem; padding: 0.6rem 0.75rem; border-radius: 12px; background: #fee2e2; color: #991b1b; font-size: 0.85rem; font-weight: 600; display: none; }
+  .note { margin-top: 0.7rem; font-size: 0.78rem; color: var(--dim); line-height: 1.45; }
+  .app { margin-top: 0.6rem; padding: 0.5rem 0.7rem; border-radius: 12px; background: #eff6ff; color: #1e40af; font-size: 0.8rem; font-weight: 600; }
+  .big { font-size: 2.3rem; font-weight: 900; color: var(--g2); line-height: 1.1; }
+  .big small { font-size: 1rem; color: var(--dim); font-weight: 700; }
+  .bar { height: 12px; border-radius: 12px; background: #e3eee6; overflow: hidden; margin: 0.5rem 0 0.2rem; }
+  .bar div { height: 100%; background: linear-gradient(90deg, #22c55e, #0a7a3c); width: 0; transition: width 0.6s; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0.6rem; margin-top: 0.7rem; }
+  .grid div { background: #f6faf7; border-radius: 12px; padding: 0.6rem; }
+  .grid b { display: block; font-size: 1.15rem; }
+  .grid span { font-size: 0.72rem; color: var(--dim); font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; }
+  .state { display: flex; align-items: center; gap: 0.5rem; font-weight: 800; font-size: 1rem; }
+  .pulse { width: 12px; height: 12px; border-radius: 50%; background: var(--g); box-shadow: 0 0 0 0 rgba(31,157,73,0.6); animation: p 1.6s infinite; }
+  @keyframes p { 0% { box-shadow: 0 0 0 0 rgba(31,157,73,0.6); } 70% { box-shadow: 0 0 0 12px rgba(31,157,73,0); } 100% { box-shadow: 0 0 0 0 rgba(31,157,73,0); } }
+  .list a { display: flex; align-items: center; gap: 0.7rem; padding: 0.75rem 0; border-bottom: 1px solid var(--line); color: inherit; text-decoration: none; }
+  .list a:last-child { border-bottom: none; }
+  .list .n { flex: 1; min-width: 0; } .list .n b { display: block; } .list .n span { font-size: 0.78rem; color: var(--dim); }
+  a.link { color: var(--g2); font-weight: 700; }
+  .center { text-align: center; }
+</style>
+</head>
+<body>
+<div class="top"><img src="/static/bpc_logo.png" alt="BPC"><div class="brand"><b>Bhutan Power Corporation Limited</b><span>EV charging · free charging</span></div></div>
+<main id="main"><div class="card center muted">Loading…</div></main>
+<script>
+'use strict';
+(function () {
+  const $ = id => document.getElementById(id);
+  const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+  const parts = location.pathname.replace(/\/+$/, '').split('/').filter(Boolean);
+  const CP = parts[1] ? decodeURIComponent(parts[1]) : '';
+  const CONN = parts[2] ? parseInt(parts[2], 10) || 0 : 0;
+  const KEY = 'bpc_free_session';
+  let cfg = null, station = null, sel = CONN, me = null, timer = null;
+  const STATUS = {Available: ['Available', 'ok'], Preparing: ['Cable connected', 'ok'], Charging: ['Charging', 'info'], SuspendedEV: ['Paused by the car', 'warn'],
+    SuspendedEVSE: ['Paused', 'warn'], Finishing: ['Finishing', 'info'], Reserved: ['Reserved', 'warn'], Faulted: ['Out of order', 'bad'], Unavailable: ['Unavailable', 'bad'], Unknown: ['Unknown', '']};
+  async function api(url, opts) {
+    const r = await fetch(url, Object.assign({headers: {'Content-Type': 'application/json'}}, opts || {}));
+    let j = {};
+    try { j = await r.json(); } catch (e) {}
+    if (!r.ok) { const e = new Error(j.error || ('Error ' + r.status)); e.status = r.status; throw e; }
+    return j;
+  }
+  function rules() {
+    const r = [];
+    if (cfg.session_kwh) r.push('up to ' + cfg.session_kwh + ' kWh per session');
+    if (cfg.session_min) r.push('up to ' + cfg.session_min + ' min');
+    if (cfg.daily_kwh) r.push(cfg.daily_kwh + ' kWh per vehicle per day');
+    if (cfg.daily_sessions) r.push(cfg.daily_sessions + ' sessions per day');
+    if (cfg.hours) r.push(cfg.hours);
+    if (cfg.date_to) r.push('until ' + cfg.date_to);
+    return r.map(x => '<span class="chip ok">' + esc(x) + '</span>').join('');
+  }
+  function hero() {
+    return '<div class="card hero"><h1>⚡ ' + esc(cfg.name || 'Free charging') + '</h1><p>' +
+      (cfg.message ? esc(cfg.message) : 'Charge your EV free of charge. Enter your vehicle number - the charger stops by itself at the limit.') +
+      '</p><div class="rules">' + rules() + '</div></div>';
+  }
+  async function loadMe() {
+    let tok = '';
+    try { tok = localStorage.getItem('bpc_app_token') || ''; } catch (e) {}
+    if (!tok) return;
+    try {
+      const r = await fetch('/api/app/me', {headers: {'Authorization': 'Bearer ' + tok}});
+      if (r.ok) { const j = await r.json(); me = {token: tok, c: j.customer || {}}; }
+    } catch (e) {}
+  }
+  async function list() {
+    const j = await api('/api/free/public/info');
+    cfg = j.cfg;
+    if (!cfg.on || !j.stations.length) {
+      $('main').innerHTML = '<div class="card center"><h2>No free charging right now</h2><p class="muted">Free charging is not offered at the moment. Open the BPC EV app to pay and charge.</p><a class="btn ghost" href="/app/">Open the BPC EV app</a></div>';
+      return;
+    }
+    $('main').innerHTML = hero() + '<div class="card"><h2>Choose a charger</h2><div class="list">' + j.stations.map(s =>
+      '<a href="/free/' + encodeURIComponent(s.id) + '"><span class="icon">🔌</span><span class="n"><b>' + esc(s.name) + '</b><span>' + esc(s.address || s.id) + '</span></span>' +
+      (s.connected ? '<span class="chip ' + (s.available ? 'ok' : 'warn') + '">' + s.available + ' free</span>' : '<span class="chip bad">offline</span>') + '</a>').join('') + '</div></div>';
+  }
+  function connButtons() {
+    return '<div class="conns">' + station.connectors.map(c => {
+      const st = STATUS[c.status] || [c.status, ''];
+      const dis = c.busy || !station.connected;
+      return '<button class="conn' + (sel === c.id ? ' sel' : '') + '" data-c="' + c.id + '"' + (dis ? ' disabled' : '') + '><b>Connector ' + c.id + '</b><span class="chip ' + st[1] + '">' +
+        esc(c.busy && c.status === 'Available' ? 'In use' : st[0]) + '</span></button>';
+    }).join('') + '</div>';
+  }
+  async function stationView() {
+    const j = await api('/api/free/public/station/' + encodeURIComponent(CP));
+    cfg = j.cfg; station = j.station;
+    if (!sel) { const free = station.connectors.filter(c => !c.busy); if (station.connectors.length === 1 && free.length) sel = free[0].id; }
+    const head = '<div class="card station"><span class="icon">🔌</span><div><div class="name">' + esc(station.name) + '</div><div class="sub">' + esc(station.address || station.id) + '</div></div>' +
+      '<span class="chip ' + (station.connected ? 'ok' : 'bad') + '" style="margin-left:auto">' + (station.connected ? 'online' : 'offline') + '</span></div>';
+    if (!station.free) {
+      $('main').innerHTML = head + '<div class="card center"><h2>Free charging is not available here now</h2><p class="muted">' + esc(station.why || '') + '</p>' +
+        (cfg.allow_paid ? '<a class="btn" href="/pay/' + encodeURIComponent(CP) + (sel ? '/' + sel : '') + '?paid=1">Pay &amp; charge instead</a>' : '') + '</div>';
+      return;
+    }
+    const plateNeed = cfg.require_plate, phoneNeed = cfg.require_phone;
+    $('main').innerHTML = hero() + head + '<div class="card"><h2>1 · Choose a connector</h2>' + connButtons() +
+      '<h2 style="margin-top:1rem">2 · Your vehicle</h2>' +
+      '<label class="f" for="plate">Vehicle number plate' + (plateNeed ? ' *' : ' (optional)') + '</label><input class="inp plate" id="plate" maxlength="16" autocomplete="off" placeholder="e.g. BP-1-A1234">' +
+      '<label class="f" for="phone">Mobile number' + (phoneNeed ? ' *' : ' (optional)') + '</label><input class="inp" id="phone" type="tel" inputmode="tel" maxlength="16" autocomplete="tel" placeholder="e.g. 17123456">' +
+      (me ? '<div class="app">📱 Signed in with the BPC EV app' + (me.c.phone ? ' (' + esc(me.c.phone) + ')' : '') + '</div>' : '') +
+      '<button class="btn" id="go">⚡ Start free charging</button><div class="err" id="err"></div>' +
+      '<p class="note">Plug the cable into the connector before or right after you press start. The vehicle number is kept with the charging record for the free charging programme.</p>' +
+      (cfg.allow_paid ? '<p class="note center"><a class="link" href="/pay/' + encodeURIComponent(CP) + (sel ? '/' + sel : '') + '?paid=1">Prefer to pay for an unlimited session?</a></p>' : '') + '</div>';
+    if (me) {
+      if (me.c.plate) $('plate').value = me.c.plate;
+      if (me.c.phone) $('phone').value = me.c.phone;
+    }
+    document.querySelectorAll('.conn').forEach(b => b.onclick = () => { sel = parseInt(b.dataset.c, 10); document.querySelectorAll('.conn').forEach(x => x.classList.toggle('sel', x === b)); });
+    $('go').onclick = start;
+  }
+  async function start() {
+    const err = $('err');
+    err.style.display = 'none';
+    if (!sel) { err.textContent = 'Choose a connector first'; err.style.display = 'block'; return; }
+    $('go').disabled = true;
+    try {
+      const body = {cp_id: CP, connector_id: sel, plate: $('plate').value.trim(), phone: $('phone').value.trim()};
+      if (me) body.app_token = me.token;
+      const j = await api('/api/free/public/start', {method: 'POST', body: JSON.stringify(body)});
+      try { localStorage.setItem(KEY, JSON.stringify({ref: j.ref, token: j.token, cp: CP})); } catch (e) {}
+      show(j.session, j.ref, j.token);
+    } catch (e) {
+      err.textContent = e.message; err.style.display = 'block'; $('go').disabled = false;
+    }
+  }
+  function fmtMin(m) { m = Math.max(0, Math.round(m || 0)); return m < 60 ? m + ' min' : Math.floor(m / 60) + ' h' + (m % 60 ? ' ' + (m % 60) + ' min' : ''); }
+  function show(s, ref, token) {
+    clearTimeout(timer);
+    const active = ['starting', 'charging', 'stopping'].includes(s.state);
+    const mins = s.started ? ((s.stopped || s.now) - s.started) / 60 : 0;
+    const pct = s.limit_kwh ? Math.min(100, 100 * (s.kwh || 0) / s.limit_kwh) : (s.limit_min ? Math.min(100, 100 * mins / s.limit_min) : 0);
+    const title = {starting: 'Plug in your cable…', charging: 'Charging', stopping: 'Stopping…', completed: 'Charging finished', failed: 'Charging did not start'}[s.state] || s.state;
+    let html = '<div class="card"><div class="state">' + (active ? '<span class="pulse"></span>' : (s.state === 'completed' ? '✅' : '⚠️')) + ' ' + esc(title) + '</div>' +
+      '<p class="muted" style="margin-top:0.3rem">' + esc(s.station) + ' · connector ' + esc(s.conn || '') + (s.plate ? ' · ' + esc(s.plate) : '') + '</p>' +
+      (s.state === 'starting' ? '<p class="muted" style="margin-top:0.6rem">The charger is ready. Plug the cable into connector ' + esc(s.conn) + ' - charging starts by itself.</p>' : '') +
+      '<div style="margin-top:0.8rem" class="big">' + (s.kwh || 0).toFixed(2) + ' <small>kWh' + (s.limit_kwh ? ' of ' + s.limit_kwh : '') + '</small></div>' +
+      '<div class="bar"><div style="width:' + pct.toFixed(1) + '%"></div></div>' +
+      '<div class="grid"><div><span>Time</span><b>' + fmtMin(mins) + (s.limit_min ? ' / ' + fmtMin(s.limit_min) : '') + '</b></div><div><span>Power</span><b>' +
+      (active && s.power_w ? (s.power_w / 1000).toFixed(1) + ' kW' : '—') + '</b></div></div>';
+    if (!active) html += '<p class="muted" style="margin-top:0.8rem">' + esc(s.reason_text ? 'Ended: ' + s.reason_text : '') + (s.detail && s.state === 'failed' ? ' (' + esc(s.detail) + ')' : '') + '</p>';
+    html += active ? '<button class="btn stop" id="stop">⏹ Stop charging</button>' : '<a class="btn ghost" href="/free/' + encodeURIComponent(s.cp) + '" id="again">Start another session</a>';
+    html += '<div class="err" id="err"></div><p class="note">Session ' + esc(s.id) + '</p></div>';
+    $('main').innerHTML = hero() + html;
+    if (active) {
+      $('stop').onclick = async () => {
+        $('stop').disabled = true;
+        try { const j = await api('/api/free/public/stop', {method: 'POST', body: JSON.stringify({ref: ref, token: token})}); show(j.session, ref, token); }
+        catch (e) { $('err').textContent = e.message; $('err').style.display = 'block'; $('stop').disabled = false; }
+      };
+      timer = setTimeout(() => poll(ref, token), 3000);
+    } else {
+      try { localStorage.removeItem(KEY); } catch (e) {}
+    }
+  }
+  async function poll(ref, token) {
+    try {
+      const j = await api('/api/free/public/status?ref=' + encodeURIComponent(ref) + '&token=' + encodeURIComponent(token));
+      show(j.session, ref, token);
+    } catch (e) {
+      if (e.status === 404) { try { localStorage.removeItem(KEY); } catch (x) {} return route(); }
+      timer = setTimeout(() => poll(ref, token), 5000);
+    }
+  }
+  async function route() {
+    try {
+      let saved = null;
+      try { saved = JSON.parse(localStorage.getItem(KEY) || 'null'); } catch (e) {}
+      if (saved && saved.ref && (!CP || saved.cp === CP)) {
+        try {
+          const j = await api('/api/free/public/status?ref=' + encodeURIComponent(saved.ref) + '&token=' + encodeURIComponent(saved.token));
+          if (j.session && ['starting', 'charging', 'stopping'].includes(j.session.state)) {
+            const k = await api('/api/free/public/info'); cfg = k.cfg;
+            return show(j.session, saved.ref, saved.token);
+          }
+        } catch (e) {}
+        try { localStorage.removeItem(KEY); } catch (e) {}
+      }
+      await loadMe();
+      if (CP) await stationView(); else await list();
+    } catch (e) {
+      $('main').innerHTML = '<div class="card center"><h2>Something went wrong</h2><p class="muted">' + esc(e.message) + '</p><button class="btn ghost" onclick="location.reload()">Try again</button></div>';
+    }
+  }
+  route();
+})();
+</script>
+</body>
+</html>
+'''
+
+OPS_FREE_APP_JS = r'''/* [OPS] v1.7 BPC EV app: "free charging" banner while the CSMS offers free charging (links to /free/) */
+(function () {
+  'use strict';
+  try { if (sessionStorage.getItem('bpc_free_banner_closed') === '1') return; } catch (e) {}
+  fetch('/api/free/public/info').then(r => r.ok ? r.json() : null).then(j => {
+    if (!j || !j.cfg || !j.cfg.on || !(j.cfg.methods || {}).app || !(j.stations || []).length) return;
+    const c = j.cfg, lim = [];
+    if (c.session_kwh) lim.push('up to ' + c.session_kwh + ' kWh');
+    if (c.session_min) lim.push(c.session_min + ' min');
+    const el = document.createElement('div');
+    el.id = 'bpcFreeBanner';
+    el.setAttribute('style', 'position:fixed;left:10px;right:10px;bottom:calc(var(--nav-h, 60px) + 10px + env(safe-area-inset-bottom));z-index:40;' +
+      'background:linear-gradient(135deg,#1f9d49,#0a7a3c);color:#fff;border-radius:14px;padding:10px 12px;display:flex;align-items:center;gap:10px;' +
+      'box-shadow:0 8px 24px rgba(6,61,31,0.35);font:600 14px/1.35 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;max-width:520px;margin:0 auto');
+    const txt = document.createElement('a');
+    txt.href = '/free/';
+    txt.setAttribute('style', 'flex:1;color:#fff;text-decoration:none');
+    txt.textContent = '⚡ ' + (c.name || 'Free charging') + ' at ' + j.stations.length + ' charger' + (j.stations.length > 1 ? 's' : '') + (lim.length ? ' (' + lim.join(', ') + ')' : '') + ' - tap to start';
+    const x = document.createElement('button');
+    x.type = 'button';
+    x.textContent = '✕';
+    x.setAttribute('aria-label', 'Close');
+    x.setAttribute('style', 'border:none;background:rgba(255,255,255,0.2);color:#fff;border-radius:50%;width:28px;height:28px;font-size:14px;cursor:pointer');
+    x.onclick = () => { el.remove(); try { sessionStorage.setItem('bpc_free_banner_closed', '1'); } catch (e) {} };
+    el.appendChild(txt);
+    el.appendChild(x);
+    document.body.appendChild(el);
+  }).catch(() => {});
+})();
+'''
+
+OPS_CSS_PARTS.append(r'''/* [OPS] v1.7 free charging tab */
+.ops-free-status { border-radius: 10px; padding: 0.6rem 0.8rem; margin: 0.3rem 0 0.9rem; font-size: 0.8rem; line-height: 1.6; border: 1px solid var(--border); }
+.ops-free-status.on { background: rgba(16, 185, 129, 0.08); border-color: rgba(16, 185, 129, 0.45); }
+.ops-free-status.off { background: rgba(100, 116, 139, 0.08); }
+.ops-free-bar { height: 6px; border-radius: 6px; background: rgba(100, 116, 139, 0.18); overflow: hidden; margin-top: 0.25rem; min-width: 80px; }
+.ops-free-bar i { display: block; height: 100%; background: linear-gradient(90deg, #22c55e, #0a7a3c); }
+#view-free h4 { margin: 0.4rem 0; }
+''')
+OPS_JS_PARTS.append(r'''/* [OPS] 🎟️ Free charging tab (v1.7): campaign settings, running sessions with limits, history, cards with vehicle numbers */
+(function () {
+    'use strict';
+    const OPS = window.OPS;
+    if (!OPS) return;
+    const F = {data: null, days: 7, q: ''};
+    const METHODS = {qr: '📷 QR page', app: '📱 App', card: '🎴 Card'};
+    const REASONS = {kwh_limit: 'kWh limit reached', time_limit: 'time limit reached', idle: 'car stopped charging', customer: 'stopped by the driver',
+        operator: 'stopped by the operator', charger: 'stopped at the charger', not_started: 'charging did not start', rejected: 'charger refused to start', cancelled: 'cancelled'};
+    const STATES = {starting: ['Waiting for the cable', '#d97706'], charging: ['Charging', '#2563eb'], stopping: ['Stopping', '#7c3aed'],
+        completed: ['Completed', '#16a34a'], failed: ['Not started', '#94a3b8']};
+    const td = (l, h, c) => OPS.td(l, h, c);
+    const chip = s => '<span class="ops-st" style="--c:' + ((STATES[s] || [])[1] || '#94a3b8') + '">' + OPS.t((STATES[s] || [s])[0]) + '</span>';
+    const who = s => [s.plate ? '🚗 <b>' + OPS.esc(s.plate) + '</b>' : '', s.phone ? '📞 ' + OPS.esc(s.phone) : '', s.card ? '🎴 ' + OPS.esc(s.card) : '',
+        s.name ? '<span class="muted">' + OPS.esc(s.name) + '</span>' : ''].filter(Boolean).join('<br>') || '—';
+
+    function build(v) {
+        v.dataset.built = '1';
+        v.innerHTML = '<section class="kpis ops-kpis">' + OPS.kpi('info', 'Free charging', 'frKOn', '') + OPS.kpi('info', 'Running now', 'frKAct', '') +
+            OPS.kpi('good', 'Today', 'frKToday', '') + OPS.kpi('good', 'This month', 'frKMonth', '') + OPS.kpi('warn', 'Stopped at the limit', 'frKLim', 'today') + '</section>' +
+            '<section class="pay-panel ops-panel"><div class="ops-head"><h3>' + OPS.t('🎟️ Free charging') + '</h3><div class="ops-actions">' +
+            '<a class="tb-btn" href="/free/" target="_blank" rel="noopener">' + OPS.t('🔗 Customer page') + '</a>' +
+            '<a class="tb-btn" id="frCsv" href="#">' + OPS.t('⬇️ CSV') + '</a>' +
+            '<button class="tb-btn primary" id="frCfgBtn">' + OPS.t('⚙️ Settings') + '</button></div></div>' +
+            '<div id="frStatus" class="ops-free-status"></div>' +
+            '<h4>' + OPS.t('Running now') + '</h4><div class="ops-table-wrap"><table class="fleet-table ops-table ops-cards" id="frActive"></table></div>' +
+            '<div class="ops-head" style="margin-top:1rem"><h4>' + OPS.t('Finished sessions') + '</h4><div class="ops-actions ops-filters">' +
+            '<span class="ops-seg" id="frDays">' + [[1, 'Today'], [7, '7 days'], [30, '30 days']].map(d => '<button class="chip" data-d="' + d[0] + '">' + OPS.t(d[1]) + '</button>').join('') + '</span>' +
+            '<input class="tb-inp" type="search" id="frQ" autocomplete="off" placeholder="' + OPS.esc(OPS.tx('Plate, mobile, card, charger…')) + '"></div></div>' +
+            '<div class="ops-table-wrap ops-tall"><table class="fleet-table ops-table ops-cards" id="frRecent"></table></div></section>' +
+            '<section class="pay-panel ops-panel"><div class="ops-head"><h3>' + OPS.t('🪪 Cards for free charging') + '</h3><div class="ops-actions">' +
+            '<button class="tb-btn" id="frCardAdd">' + OPS.t('➕ Add card') + '</button></div></div>' +
+            '<div class="pay-help">' + OPS.t('Vehicle number plate / mobile number of each RFID card - recorded with every free session of the card and used for the daily limits.') + '</div>' +
+            '<div class="ops-table-wrap"><table class="fleet-table ops-table ops-cards" id="frCards"></table></div></section>';
+        OPS.$('frCfgBtn').onclick = settings;
+        OPS.$('frCardAdd').onclick = () => cardEdit(null);
+        OPS.$('frDays').onclick = e => { const b = e.target.closest('[data-d]'); if (b) { F.days = parseInt(b.dataset.d, 10); load(); } };
+        let qt = null;
+        OPS.$('frQ').addEventListener('input', () => { clearTimeout(qt); qt = setTimeout(() => { F.q = OPS.$('frQ').value.trim(); load(); }, 350); });
+        v.addEventListener('click', onClick);
+    }
+
+    function range() {
+        const to = OPS.day();
+        const from = OPS.day(Date.now() / 1000 - (F.days - 1) * 86400);
+        return {from: from, to: to};
+    }
+
+    async function load() {
+        document.querySelectorAll('#frDays [data-d]').forEach(b => b.classList.toggle('active', parseInt(b.dataset.d, 10) === F.days));
+        const r = range();
+        const q = Object.assign({}, r);
+        if (F.q) q.q = F.q;
+        try { F.data = await OPS.api(OPS.csvLink('/api/ops/free', q)); } catch (e) { return OPS.fail(e); }
+        OPS.$('frCsv').href = OPS.csvLink('/api/ops/free/sessions.csv', r);
+        render();
+    }
+
+    function limitsText(c) {
+        const a = [];
+        if (c.session_kwh) a.push(OPS.tx('{n} kWh', {n: c.session_kwh}));
+        if (c.session_min) a.push(OPS.tx('{n} min', {n: c.session_min}));
+        const per = a.length ? OPS.tx('per session: {x}', {x: a.join(' / ')}) : OPS.tx('no session limit');
+        const d = [];
+        if (c.daily_kwh) d.push(OPS.tx('{n} kWh', {n: c.daily_kwh}));
+        if (c.daily_sessions) d.push(OPS.tx('{n} sessions', {n: c.daily_sessions}));
+        return per + (d.length ? ' · ' + OPS.tx('per vehicle per day: {x}', {x: d.join(' / ')}) : '');
+    }
+
+    function render() {
+        const d = F.data, c = d.cfg, st = d.stats, now = d.now;
+        OPS.$('frKOn').innerHTML = c.on ? '<span class="ops-ok">' + OPS.t('ON') + '</span>' : '<span class="muted">' + OPS.t('OFF') + '</span>';
+        OPS.$('frKOnSub').innerHTML = c.on ? OPS.t('open at {n} charger(s) now', {n: d.open_now.length}) : OPS.t('switch it on in Settings');
+        OPS.$('frKAct').textContent = st.active;
+        OPS.$('frKToday').innerHTML = OPS.num(st.today_kwh, 1) + ' <small>kWh</small>';
+        OPS.$('frKTodaySub').innerHTML = OPS.t('{s} sessions · {v} vehicles', {s: st.today_sessions, v: st.today_drivers});
+        OPS.$('frKMonth').innerHTML = OPS.num(st.month_kwh, 1) + ' <small>kWh</small>';
+        OPS.$('frKMonthSub').innerHTML = OPS.t('{s} sessions', {s: st.month_sessions});
+        OPS.$('frKLim').textContent = st.today_at_limit;
+        const m = c.methods || {};
+        OPS.$('frStatus').className = 'ops-free-status ' + (c.on ? 'on' : 'off');
+        OPS.$('frStatus').innerHTML = (c.on ? '<b>' + OPS.t('Free charging is ON') + '</b> · ' + OPS.esc(c.name || '') : '<b>' + OPS.t('Free charging is OFF') + '</b> - ' + OPS.t('customers pay as usual')) +
+            '<br>' + OPS.t('Chargers: {x}', {x: c.chargers ? OPS.esc(c.chargers) : OPS.tx('all')}) +
+            (c.hours_from && c.hours_to ? ' · ' + OPS.t('hours {a} - {b}', {a: OPS.esc(c.hours_from), b: OPS.esc(c.hours_to)}) : '') +
+            (c.date_from || c.date_to ? ' · ' + OPS.t('period {a} - {b}', {a: OPS.esc(c.date_from || '…'), b: OPS.esc(c.date_to || '…')}) : '') +
+            '<br>' + OPS.t('Limits {x}', {x: limitsText(c)}) + (c.idle_stop_min ? ' · ' + OPS.t('stop after {n} min without energy', {n: c.idle_stop_min}) : '') +
+            '<br>' + OPS.t('Start with: {x}', {x: Object.keys(METHODS).filter(k => m[k]).map(k => OPS.tx(METHODS[k])).join(', ') || '—'}) +
+            ' · ' + OPS.t(c.require_plate ? 'vehicle number plate required' : 'vehicle number plate optional') + (c.require_phone ? ' · ' + OPS.t('mobile number required') : '');
+        const act = d.active.map(s => {
+            const kwhPct = s.limit_kwh ? Math.min(100, 100 * (s.kwh || 0) / s.limit_kwh) : 0;
+            const minPct = s.limit_min && s.minutes != null ? Math.min(100, 100 * s.minutes / s.limit_min) : 0;
+            return '<tr>' + td('Session', '<b>' + OPS.esc(s.id) + '</b><br>' + chip(s.state)) + td('Charger', OPS.esc(s.station) + (s.conn ? ' #' + s.conn : '') +
+                '<br><span class="muted">' + OPS.esc(s.cp) + '</span>') + td('Driver', who(s)) + td('Method', OPS.t(METHODS[s.method] || s.method)) +
+                td('Energy', OPS.num(s.kwh, 2) + ' / ' + (s.limit_kwh ? OPS.num(s.limit_kwh, 1) : '∞') + ' kWh<div class="ops-free-bar"><i style="width:' + kwhPct.toFixed(0) + '%"></i></div>') +
+                td('Time', (s.minutes != null ? OPS.num(s.minutes, 0) : '0') + ' / ' + (s.limit_min ? OPS.num(s.limit_min, 0) : '∞') + ' min<div class="ops-free-bar"><i style="width:' + minPct.toFixed(0) + '%"></i></div>') +
+                td('Power', s.power_w ? OPS.num(s.power_w / 1000, 1) + ' kW' : '—') +
+                td('', OPS.can('control') ? '<button class="tb-btn ops-mini" data-fr-stop="' + OPS.esc(s.id) + '">' + OPS.t('⏹ Stop') + '</button>' : '') + '</tr>';
+        }).join('');
+        OPS.$('frActive').innerHTML = '<thead><tr><th>' + OPS.t('Session') + '</th><th>' + OPS.t('Charger') + '</th><th>' + OPS.t('Driver') + '</th><th>' + OPS.t('Method') +
+            '</th><th>' + OPS.t('Energy') + '</th><th>' + OPS.t('Time') + '</th><th>' + OPS.t('Power') + '</th><th></th></tr></thead><tbody>' +
+            (act || '<tr><td colspan="8" class="muted">' + OPS.t('No free session running') + '</td></tr>') + '</tbody>';
+        const rec = d.recent.map(s => '<tr>' + td('Ended', OPS.fmt(s.stopped || s.t)) + td('Charger', OPS.esc(s.station) + (s.conn ? ' #' + s.conn : '')) +
+            td('Driver', who(s)) + td('Method', OPS.t(METHODS[s.method] || s.method)) + td('Energy', OPS.num(s.kwh, 2) + ' kWh') +
+            td('Time', s.minutes != null ? OPS.num(s.minutes, 0) + ' min' : '—') +
+            td('Result', chip(s.state) + '<br><span class="muted">' + OPS.t(REASONS[s.reason] || s.reason || '') + (s.detail ? ' · ' + OPS.esc(s.detail) : '') + '</span>') + '</tr>').join('');
+        OPS.$('frRecent').innerHTML = '<thead><tr><th>' + OPS.t('Ended') + '</th><th>' + OPS.t('Charger') + '</th><th>' + OPS.t('Driver') + '</th><th>' + OPS.t('Method') +
+            '</th><th>' + OPS.t('Energy') + '</th><th>' + OPS.t('Time') + '</th><th>' + OPS.t('Result') + '</th></tr></thead><tbody>' +
+            (rec || '<tr><td colspan="7" class="muted">' + OPS.t('No free sessions in this period') + '</td></tr>') + '</tbody>';
+        const cards = d.cards.map(x => '<tr>' + td('Card', '<b>' + OPS.esc(x.card) + '</b>' + (x.registered ? '' : '<br><span class="ops-warn">' + OPS.t('not in RFID Cards') + '</span>')) +
+            td('Vehicle', x.plate ? '🚗 ' + OPS.esc(x.plate) : '—') + td('Mobile', OPS.esc(x.phone || '—')) + td('Owner', OPS.esc(x.name || '') + (x.note ? '<br><span class="muted">' + OPS.esc(x.note) + '</span>' : '')) +
+            td('', OPS.can('config') ? '<button class="tb-btn ops-mini" data-fr-card="' + OPS.esc(x.card) + '">' + OPS.t('✏️ Edit') + '</button><button class="tb-btn ops-mini" data-fr-carddel="' + OPS.esc(x.card) + '">🗑️</button>' : '') + '</tr>').join('');
+        OPS.$('frCards').innerHTML = '<thead><tr><th>' + OPS.t('Card') + '</th><th>' + OPS.t('Vehicle') + '</th><th>' + OPS.t('Mobile') + '</th><th>' + OPS.t('Owner') + '</th><th></th></tr></thead><tbody>' +
+            (cards || '<tr><td colspan="5" class="muted">' + OPS.t('No cards yet - registered RFID cards also work; add a card here to record its vehicle number.') + '</td></tr>') + '</tbody>';
+        OPS.$('frCfgBtn').style.display = OPS.can('config') ? '' : 'none';
+        OPS.$('frCardAdd').style.display = OPS.can('config') ? '' : 'none';
+    }
+
+    async function onClick(e) {
+        const s = e.target.closest('[data-fr-stop]');
+        if (s) {
+            if (!OPS.confirm('Stop free session {id}?', {id: s.dataset.frStop})) return;
+            try { await OPS.post('/api/ops/free/stop', {id: s.dataset.frStop}); OPS.toast(OPS.tx('Stop sent'), 'success'); } catch (err) { OPS.fail(err); }
+            return load();
+        }
+        const c = e.target.closest('[data-fr-card]');
+        if (c) return cardEdit((F.data.cards || []).find(x => x.card === c.dataset.frCard));
+        const del = e.target.closest('[data-fr-carddel]');
+        if (del) {
+            if (!OPS.confirm('Remove card {c} from the list? (It stays in RFID Cards.)', {c: del.dataset.frCarddel})) return;
+            try { await OPS.post('/api/ops/free/cards/delete', {card: del.dataset.frCarddel}); } catch (err) { OPS.fail(err); }
+            load();
+        }
+    }
+
+    function cardEdit(x) {
+        const isNew = !x;
+        x = x || {card: '', plate: '', phone: '', name: '', note: ''};
+        const dl = '<datalist id="frCardList">' + (F.data.rfid_cards || []).map(c => '<option value="' + OPS.esc(c) + '">').join('') + '</datalist>';
+        const html = '<div class="ops-form"><label>' + OPS.t('Card id') + '<input class="tb-inp" id="frCdId" list="frCardList" maxlength="20" value="' + OPS.esc(x.card) + '"' + (isNew ? '' : ' readonly') + '>' + dl + '</label>' +
+            '<label>' + OPS.t('Vehicle number plate') + '<input class="tb-inp" id="frCdPlate" maxlength="16" value="' + OPS.esc(x.plate || '') + '"></label>' +
+            '<label>' + OPS.t('Mobile number') + '<input class="tb-inp" id="frCdPhone" maxlength="16" value="' + OPS.esc(x.phone || '') + '"></label>' +
+            '<label>' + OPS.t('Owner') + '<input class="tb-inp" id="frCdName" maxlength="60" value="' + OPS.esc(x.name || '') + '"></label>' +
+            '<label class="wide">' + OPS.t('Note') + '<input class="tb-inp" id="frCdNote" maxlength="120" value="' + OPS.esc(x.note || '') + '"></label>' +
+            (isNew ? '<label class="wide ops-check"><input type="checkbox" id="frCdReg" checked> ' + OPS.t('Also add the card to RFID Cards (accepted) if it is not there yet') + '</label>' : '') + '</div>';
+        OPS.modal(isNew ? 'Add a card for free charging' : 'Card {c}', html, [{label: 'Cancel'}, {label: '💾 Save', cls: 'primary', run: async box => {
+            await OPS.post('/api/ops/free/cards/save', {card: OPS.val(box, '#frCdId'), plate: OPS.val(box, '#frCdPlate'), phone: OPS.val(box, '#frCdPhone'),
+                name: OPS.val(box, '#frCdName'), note: OPS.val(box, '#frCdNote'), register: isNew && box.querySelector('#frCdReg').checked});
+            OPS.toast(OPS.tx('Saved'), 'success');
+            load();
+            return true;
+        }}], {vars: {c: x.card}});
+    }
+
+    function settings() {
+        const c = F.data.cfg, m = c.methods || {};
+        const inp = (id, label, v, extra) => '<label>' + OPS.t(label) + '<input class="tb-inp" id="' + id + '" value="' + OPS.esc(v == null ? '' : v) + '"' + (extra || '') + '></label>';
+        const chk = (id, label, v) => '<label class="ops-check"><input type="checkbox" id="' + id + '"' + (v ? ' checked' : '') + '> ' + OPS.t(label) + '</label>';
+        const html = '<div class="ops-form">' + chk('frOn', 'Free charging is ON', c.on) + inp('frName', 'Campaign name', c.name, ' maxlength="80"') +
+            '<label class="wide">' + OPS.t('Message on the customer page') + '<input class="tb-inp" id="frMsg" maxlength="200" value="' + OPS.esc(c.message || '') + '"></label>' +
+            '<label class="wide">' + OPS.t('Only these chargers (comma separated, empty = all)') + '<input class="tb-inp" id="frCps" value="' + OPS.esc(c.chargers || '') + '"></label>' +
+            inp('frDf', 'From date (YYYY-MM-DD)', c.date_from, ' type="date"') + inp('frDt', 'To date (YYYY-MM-DD)', c.date_to, ' type="date"') +
+            inp('frHf', 'Daily from (HH:MM, BTT)', c.hours_from, ' type="time"') + inp('frHt', 'Daily until (HH:MM, BTT)', c.hours_to, ' type="time"') +
+            inp('frSk', 'kWh per session (0 = no limit)', c.session_kwh, ' type="number" min="0" step="0.5"') + inp('frSm', 'Minutes per session (0 = no limit)', c.session_min, ' type="number" min="0"') +
+            inp('frDk', 'kWh per vehicle per day (0 = no limit)', c.daily_kwh, ' type="number" min="0" step="0.5"') + inp('frDs', 'Sessions per vehicle per day (0 = no limit)', c.daily_sessions, ' type="number" min="0"') +
+            inp('frIdle', 'Stop when the car takes no energy for (min, 0 = off)', c.idle_stop_min, ' type="number" min="0"') +
+            '<div class="wide ops-inline"><b>' + OPS.t('Start with') + '</b>' + chk('frMq', '📷 QR page', m.qr) + chk('frMa', '📱 App', m.app) + chk('frMc', '🎴 Card', m.card) + '</div>' +
+            chk('frRp', 'Vehicle number plate required (QR page / app)', c.require_plate) + chk('frRm', 'Mobile number required (QR page / app)', c.require_phone) +
+            chk('frAny', 'Accept RFID cards that are not registered (limits per card)', c.any_card) + chk('frCnp', 'Cards need a vehicle number or mobile on file', c.card_needs_plate) +
+            chk('frPaid', 'Customers may still pay for an unlimited session', c.allow_paid) + '</div>' +
+            '<div class="pay-help">' + OPS.t('While free charging is on, the QR code on the charger opens the free charging page. The CSMS stops each session at the kWh or time limit and refuses new sessions when a vehicle, mobile number or card has used its daily allowance.') + '</div>';
+        OPS.modal('⚙️ Free charging settings', html, [{label: 'Cancel'}, {label: '💾 Save', cls: 'primary', run: async box => {
+            const v = id => OPS.val(box, '#' + id);
+            await OPS.post('/api/ops/free/config', {on: v('frOn'), name: v('frName'), message: v('frMsg'), chargers: v('frCps'), date_from: v('frDf'), date_to: v('frDt'),
+                hours_from: v('frHf'), hours_to: v('frHt'), session_kwh: v('frSk'), session_min: v('frSm'), daily_kwh: v('frDk'), daily_sessions: v('frDs'),
+                idle_stop_min: v('frIdle'), methods: {qr: v('frMq'), app: v('frMa'), card: v('frMc')}, require_plate: v('frRp'), require_phone: v('frRm'),
+                any_card: v('frAny'), card_needs_plate: v('frCnp'), allow_paid: v('frPaid')});
+            OPS.toast(OPS.tx('Saved'), 'success');
+            load();
+            return true;
+        }}], {wide: true});
+    }
+
+    OPS.register({tab: 'free', perm: 'view', every: 5,
+        show: function () { const v = OPS.$('view-free'); if (!v) return; if (!v.dataset.built) build(v); load(); },
+        refresh: load,
+        relang: function () { const v = OPS.$('view-free'); if (v) { v.dataset.built = ''; v.innerHTML = ''; OPS.mods.free.show(); } }
+    });
+
+    OPS.addI18n({
+        '🎟️ Free charging': ['', '🎟️ ชาร์จฟรี'], 'Free charging': ['', 'ชาร์จฟรี'], 'Running now': ['', 'กำลังชาร์จอยู่'], 'Today': ['', 'วันนี้'], 'This month': ['', 'เดือนนี้'],
+        'Stopped at the limit': ['', 'หยุดเมื่อครบกำหนด'], 'today': ['', 'วันนี้'], '🔗 Customer page': ['', '🔗 หน้าลูกค้า'], '⬇️ CSV': ['', '⬇️ CSV'], '⚙️ Settings': ['', '⚙️ ตั้งค่า'],
+        'Finished sessions': ['', 'รายการที่จบแล้ว'], '7 days': ['', '7 วัน'], '30 days': ['', '30 วัน'], 'Plate, mobile, card, charger…': ['', 'ทะเบียน เบอร์โทร บัตร ตู้…'],
+        '🪪 Cards for free charging': ['', '🪪 บัตรสำหรับชาร์จฟรี'], '➕ Add card': ['', '➕ เพิ่มบัตร'],
+        'Vehicle number plate / mobile number of each RFID card - recorded with every free session of the card and used for the daily limits.': ['', 'ทะเบียนรถ / เบอร์โทรของบัตร RFID แต่ละใบ - บันทึกไว้กับทุกครั้งที่ใช้บัตรชาร์จฟรี และใช้คิดโควตาต่อวัน'],
+        '{n} kWh': ['', '{n} kWh'], '{n} min': ['', '{n} นาที'], 'per session: {x}': ['', 'ต่อครั้ง: {x}'], 'no session limit': ['', 'ไม่จำกัดต่อครั้ง'], '{n} sessions': ['', '{n} ครั้ง'],
+        'per vehicle per day: {x}': ['', 'ต่อคันต่อวัน: {x}'], 'ON': ['', 'เปิด'], 'OFF': ['', 'ปิด'], 'open at {n} charger(s) now': ['', 'เปิดให้ชาร์จฟรี {n} ตู้ตอนนี้'],
+        'switch it on in Settings': ['', 'เปิดได้ที่ตั้งค่า'], '{s} sessions · {v} vehicles': ['', '{s} ครั้ง · {v} คัน'], '{s} sessions': ['', '{s} ครั้ง'],
+        'Free charging is ON': ['', 'เปิดชาร์จฟรีอยู่'], 'Free charging is OFF': ['', 'ปิดชาร์จฟรี'], 'customers pay as usual': ['', 'ลูกค้าจ่ายเงินตามปกติ'], 'Chargers: {x}': ['', 'ตู้: {x}'],
+        'all': ['', 'ทุกตู้'], 'hours {a} - {b}': ['', 'เวลา {a} - {b}'], 'period {a} - {b}': ['', 'ช่วง {a} - {b}'], 'Limits {x}': ['', 'จำกัด {x}'],
+        'stop after {n} min without energy': ['', 'หยุดเมื่อรถไม่รับไฟ {n} นาที'], 'Start with: {x}': ['', 'เริ่มด้วย: {x}'], '📷 QR page': ['', '📷 หน้า QR'], '📱 App': ['', '📱 แอป'], '🎴 Card': ['', '🎴 บัตร'],
+        'vehicle number plate required': ['', 'ต้องใส่ทะเบียนรถ'], 'vehicle number plate optional': ['', 'ทะเบียนรถไม่บังคับ'], 'mobile number required': ['', 'ต้องใส่เบอร์โทร'],
+        'Session': ['', 'รายการ'], 'Driver': ['', 'ผู้ใช้'], 'Method': ['', 'วิธี'], 'Energy': ['', 'พลังงาน'], 'Power': ['', 'กำลังไฟ'], '⏹ Stop': ['', '⏹ หยุด'],
+        'No free session running': ['', 'ไม่มีการชาร์จฟรีที่กำลังทำงาน'], 'Ended': ['', 'จบเมื่อ'], 'Result': ['', 'ผล'], 'No free sessions in this period': ['', 'ไม่มีการชาร์จฟรีในช่วงนี้'],
+        'Waiting for the cable': ['', 'รอเสียบสาย'], 'Charging': ['', 'กำลังชาร์จ'], 'Stopping': ['', 'กำลังหยุด'], 'Completed': ['', 'เสร็จ'], 'Not started': ['', 'ไม่ได้เริ่ม'],
+        'kWh limit reached': ['', 'ครบ kWh ที่กำหนด'], 'time limit reached': ['', 'ครบเวลาที่กำหนด'], 'car stopped charging': ['', 'รถหยุดรับไฟ'], 'stopped by the driver': ['', 'ผู้ใช้หยุดเอง'],
+        'stopped by the operator': ['', 'เจ้าหน้าที่หยุด'], 'stopped at the charger': ['', 'หยุดที่ตู้'], 'charging did not start': ['', 'ไม่ได้เริ่มชาร์จ'], 'charger refused to start': ['', 'ตู้ไม่ยอมเริ่ม'], 'cancelled': ['', 'ยกเลิก'],
+        'Card': ['', 'บัตร'], 'Vehicle': ['', 'รถ'], 'Mobile': ['', 'เบอร์โทร'], 'Owner': ['', 'เจ้าของ'], 'not in RFID Cards': ['', 'ไม่อยู่ในรายการบัตร RFID'],
+        'No cards yet - registered RFID cards also work; add a card here to record its vehicle number.': ['', 'ยังไม่มีบัตร - บัตร RFID ที่ลงทะเบียนแล้วใช้ได้เลย เพิ่มบัตรที่นี่เพื่อบันทึกทะเบียนรถ'],
+        'Stop free session {id}?': ['', 'หยุดการชาร์จฟรี {id}?'], 'Stop sent': ['', 'ส่งคำสั่งหยุดแล้ว'], 'Remove card {c} from the list? (It stays in RFID Cards.)': ['', 'ลบบัตร {c} ออกจากรายการ? (บัตรยังอยู่ในรายการบัตร RFID)'],
+        'Card id': ['', 'เลขบัตร'], 'Vehicle number plate': ['', 'ทะเบียนรถ'], 'Mobile number': ['', 'เบอร์โทร'], 'Note': ['', 'หมายเหตุ'],
+        'Also add the card to RFID Cards (accepted) if it is not there yet': ['', 'เพิ่มบัตรในรายการบัตร RFID (Accepted) ด้วยถ้ายังไม่มี'], 'Add a card for free charging': ['', 'เพิ่มบัตรสำหรับชาร์จฟรี'],
+        'Card {c}': ['', 'บัตร {c}'], 'Campaign name': ['', 'ชื่อโครงการ'], 'Message on the customer page': ['', 'ข้อความบนหน้าลูกค้า'],
+        'Only these chargers (comma separated, empty = all)': ['', 'เฉพาะตู้เหล่านี้ (คั่นด้วยจุลภาค ว่าง = ทุกตู้)'], 'From date (YYYY-MM-DD)': ['', 'ตั้งแต่วันที่'], 'To date (YYYY-MM-DD)': ['', 'ถึงวันที่'],
+        'Daily from (HH:MM, BTT)': ['', 'ทุกวันตั้งแต่ (BTT)'], 'Daily until (HH:MM, BTT)': ['', 'ถึงเวลา (BTT)'], 'kWh per session (0 = no limit)': ['', 'kWh ต่อครั้ง (0 = ไม่จำกัด)'],
+        'Minutes per session (0 = no limit)': ['', 'นาทีต่อครั้ง (0 = ไม่จำกัด)'], 'kWh per vehicle per day (0 = no limit)': ['', 'kWh ต่อคันต่อวัน (0 = ไม่จำกัด)'],
+        'Sessions per vehicle per day (0 = no limit)': ['', 'จำนวนครั้งต่อคันต่อวัน (0 = ไม่จำกัด)'], 'Stop when the car takes no energy for (min, 0 = off)': ['', 'หยุดเมื่อรถไม่รับไฟนาน (นาที, 0 = ปิด)'],
+        'Start with': ['', 'เริ่มด้วย'], 'Vehicle number plate required (QR page / app)': ['', 'ต้องใส่ทะเบียนรถ (หน้า QR / แอป)'], 'Mobile number required (QR page / app)': ['', 'ต้องใส่เบอร์โทร (หน้า QR / แอป)'],
+        'Accept RFID cards that are not registered (limits per card)': ['', 'รับบัตร RFID ที่ไม่ได้ลงทะเบียน (จำกัดต่อบัตร)'], 'Cards need a vehicle number or mobile on file': ['', 'บัตรต้องมีทะเบียนรถหรือเบอร์โทรในระบบ'],
+        'Customers may still pay for an unlimited session': ['', 'ลูกค้ายังเลือกจ่ายเงินเพื่อชาร์จแบบไม่จำกัดได้'],
+        'While free charging is on, the QR code on the charger opens the free charging page. The CSMS stops each session at the kWh or time limit and refuses new sessions when a vehicle, mobile number or card has used its daily allowance.': ['', 'เมื่อเปิดชาร์จฟรี QR บนตู้จะเปิดหน้าชาร์จฟรี CSMS จะหยุดแต่ละครั้งเมื่อครบ kWh หรือเวลา และไม่ให้เริ่มใหม่เมื่อทะเบียนรถ เบอร์โทร หรือบัตรใช้โควตาต่อวันครบแล้ว'],
+        '⚙️ Free charging settings': ['', '⚙️ ตั้งค่าชาร์จฟรี'], 'Free charging sessions': ['', 'จำนวนครั้งชาร์จฟรี'], 'Free charging kWh': ['', 'kWh ชาร์จฟรี'], 'Free charging vehicles / drivers': ['', 'จำนวนรถ / ผู้ใช้ชาร์จฟรี']
+    });
+})();
+''')
+
+
+# ---- [OPS] v1.8 load management: the power limit of a site (feeder / transformer) shared by its chargers through
+#      SetChargingProfile - TxProfile per running session, TxDefaultProfile as a fail-safe while the CSMS is unreachable
+OPS_FEATURES.append('loadmgmt')
+ops_lm_sites = OpsDocStore('lm_sites', 'ops_lm_sites')
+OPS_LM_LOG = OpsEventLog('loadmgmt', 'ops_lm_log', keep_days=30)
+OPS_LM_SITE_DEFAULTS = {'name': '', 'on': True, 'limit_kw': 100.0, 'reserve_kw': 0.0, 'chargers': [], 'mode': 'equal', 'min_kw': 5.0,
+                        'conn_max_kw': 60.0, 'unit': 'W', 'voltage': 230, 'phases': 3, 'dynamic': True, 'failsafe_kw': 0.0,
+                        'interval_s': 30, 'max': {}, 'prio': {}, 'offline_hold_min': 10, 'ramp_s': 90, 'over_s': 60}
+OPS_LM_MODES = ('equal', 'priority', 'fifo')
+OPS_LM_TX_ID = 77000                            # chargingProfileId = 77000 + connector (TxProfile of the running session)
+OPS_LM_DEFAULT_ID = 76999                       # chargingProfileId of the fail-safe TxDefaultProfile (connector 0)
+OPS_LM_STATE: Dict[str, dict] = {}              # site id -> live allocation, history, over-limit timer
+_OPS_LM_LOCKS: Dict[str, asyncio.Lock] = {}
+_OPS_LM_DUE: Dict[str, float] = {}              # site id -> rebalance not before (debounce)
+_OPS_LM_DISC: Dict[str, float] = {}             # charger -> disconnected at (sessions held for offline_hold_min)
+for _p in ('/api/ops/lm/site', '/api/ops/lm/site/delete', '/api/ops/lm/clear'):
+    ops_perm_rule('POST', _p, 'config')
+ops_perm_rule('POST', '/api/ops/lm/rebalance', 'control')
+OPS_TAB_PERMS['lm'] = 'view'
+
+
+def ops_lm_site_of(cp_id: str):
+    for sid, s in ops_lm_sites.data.items():
+        if cp_id in (s.get('chargers') or []):
+            return sid
+    return None
+
+
+def _ops_lm_site(sid: str) -> dict:
+    s = ops_lm_sites.data.get(sid) or {}
+    for k, v in OPS_LM_SITE_DEFAULTS.items():
+        s.setdefault(k, json.loads(json.dumps(v)))
+    return s
+
+
+def _ops_lm_state(sid: str) -> dict:
+    return OPS_LM_STATE.setdefault(sid, {'alloc': {}, 'last': 0.0, 'hist': [], 'over_since': None, 'reject': {}, 'last_reason': ''})
+
+
+def ops_lm_schedule(sid: str, delay: float = 1.0, reason: str = ''):
+    if not sid or sid not in ops_lm_sites.data:
+        return
+    due = ops_now() + delay
+    if sid in _OPS_LM_DUE and _OPS_LM_DUE[sid] <= due:
+        return
+    _OPS_LM_DUE[sid] = due
+    _ops_lm_state(sid)['last_reason'] = reason or _ops_lm_state(sid).get('last_reason', '')
+
+    async def _later():
+        await asyncio.sleep(max(0.0, delay))
+        if _OPS_LM_DUE.get(sid, 0) <= ops_now() + 0.05:
+            _OPS_LM_DUE.pop(sid, None)
+            await ops_lm_rebalance(sid, reason)
+    try:
+        asyncio.get_running_loop().create_task(_later())
+    except RuntimeError:
+        pass
+
+
+def _ops_lm_sessions(sid: str, s: dict, now: float):
+    """Running sessions of the site chargers: [(key, cp, conn, txn, online, power_kw, started)]."""
+    out, hold = [], max(1, ops_int(s.get('offline_hold_min'), 10)) * 60
+    for cp in s.get('chargers') or []:
+        data = app_state.cp_data.get(cp)
+        if data is None:
+            continue
+        online = cp in app_state.charge_points
+        if not online and now - _OPS_LM_DISC.get(cp, now) > hold:
+            continue                                   # offline for long: its sessions are not counted any more
+        for txn, t in list((getattr(data, 'transactions', None) or {}).items()):
+            conn = int(t.get('connector_id') or 0)
+            snap = (getattr(data, 'meter', None) or {}).get(conn) or {}
+            p_kw = max(0.0, float(snap.get('power_w') or 0)) / 1000.0
+            started = OPS_LM_STATE.get(sid, {}).get('alloc', {}).get(f'{cp}#{conn}', {}).get('since') or now
+            out.append({'key': f'{cp}#{conn}', 'cp': cp, 'conn': conn, 'txn': txn, 'online': online, 'p_kw': p_kw, 'since': started})
+    return out
+
+
+def ops_lm_allocate(s: dict, sessions: list, prev: dict, now: float) -> Dict[str, float]:
+    """kW per session: minimum first (in priority / arrival order), then water-filling up to what each car can take."""
+    budget = max(0.0, float(s.get('limit_kw') or 0) - float(s.get('reserve_kw') or 0))
+    mn = max(0.0, float(s.get('min_kw') or 0))
+    cap_default = max(0.1, float(s.get('conn_max_kw') or 60))
+    mode = s.get('mode') if s.get('mode') in OPS_LM_MODES else 'equal'
+    alloc, demand = {}, {}
+    held = [x for x in sessions if not x['online']]
+    live = [x for x in sessions if x['online']]
+    for x in held:                                     # offline charger: keep its last limit reserved (it may still charge)
+        keep = float((prev.get(x['key']) or {}).get('kw') or (s.get('max') or {}).get(x['cp']) or cap_default)
+        alloc[x['key']] = keep
+        budget -= keep
+    budget = max(0.0, budget)
+    for x in live:
+        cap = float((s.get('max') or {}).get(x['cp']) or cap_default)
+        d = cap
+        last = float((prev.get(x['key']) or {}).get('kw') or 0)
+        if s.get('dynamic') and last > 0 and now - x['since'] >= float(s['ramp_s'] if s.get('ramp_s') is not None else 90) and x['p_kw'] > 0.05 and x['p_kw'] < 0.85 * last:
+            d = min(cap, max(mn, x['p_kw'] * 1.15 + 1.0))  # the car takes less than it was given: lend the rest to others
+        demand[x['key']] = max(0.0, d)
+    prio = lambda x: -int((s.get('prio') or {}).get(x['cp']) or 2) if mode == 'priority' else 0  # noqa: E731
+    order = sorted(live, key=lambda x: (prio(x), x['since'], x['key']))
+    granted = []
+    for x in order:                                    # 1) the minimum, as long as it lasts (later arrivals wait at 0)
+        need = min(mn, demand[x['key']]) if mn else 0.0
+        if need <= budget + 1e-9:
+            alloc[x['key']] = need
+            budget -= need
+            granted.append(x)
+        else:
+            alloc[x['key']] = 0.0
+    if mode == 'fifo':
+        for x in granted:
+            extra = min(budget, demand[x['key']] - alloc[x['key']])
+            alloc[x['key']] += max(0.0, extra)
+            budget -= max(0.0, extra)
+    else:
+        groups = {}
+        for x in granted:
+            groups.setdefault(prio(x), []).append(x)
+        for g in sorted(groups):                       # 2) water-filling inside each priority class
+            pending = sorted(groups[g], key=lambda x: demand[x['key']] - alloc[x['key']])
+            while pending and budget > 1e-6:
+                share = budget / len(pending)
+                x = pending[0]
+                want = demand[x['key']] - alloc[x['key']]
+                if want <= share:
+                    alloc[x['key']] += max(0.0, want)
+                    budget -= max(0.0, want)
+                    pending.pop(0)
+                else:
+                    for y in pending:
+                        alloc[y['key']] += share
+                    budget = 0.0
+                    pending = []
+    return {k: round(max(0.0, v), 2) for k, v in alloc.items()}
+
+
+def _ops_lm_limit_value(s: dict, kw: float):
+    """(OCPP limit, unit) for kW: W, or A per phase for AC chargers."""
+    if s.get('unit') == 'A':
+        v = float(s.get('voltage') or 230) * max(1, int(s.get('phases') or 3))
+        return round(int(kw * 1000.0 / v * 10) / 10.0, 1), 'A'
+    return round(kw * 1000.0, 0), 'W'
+
+
+async def _ops_lm_send(cs, cp: str, conn: int, txn, s: dict, kw: float, purpose: str = 'TxProfile'):
+    limit, unit = _ops_lm_limit_value(s, kw)
+    pid = OPS_LM_TX_ID + int(conn) if purpose == 'TxProfile' else OPS_LM_DEFAULT_ID
+    prof = {'chargingProfileId': pid, 'stackLevel': 1 if purpose == 'TxProfile' else 0, 'chargingProfilePurpose': purpose,
+            'chargingProfileKind': 'Absolute',
+            'chargingSchedule': {'chargingRateUnit': unit, 'startSchedule': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                                 'chargingSchedulePeriod': [{'startPeriod': 0, 'limit': limit}]}}
+    if purpose == 'TxProfile' and txn is not None:
+        prof['transactionId'] = int(txn)
+    app_state.add_log('➡️ OUT', cp, 'SetChargingProfile', {'connector': conn, 'purpose': purpose, 'limit': f'{limit}{unit}',
+                                                           'by': 'load management'})
+    try:
+        r = await asyncio.wait_for(cs.call(call.SetChargingProfile(connector_id=int(conn), cs_charging_profiles=prof)), 30)
+        return str(getattr(r, 'status', '')).split('.')[-1] or 'Accepted'
+    except Exception as e:
+        return f'error {type(e).__name__}'
+
+
+async def ops_lm_failsafe(sid: str, cp: str):
+    """Fail-safe TxDefaultProfile on connector 0: new sessions start at a safe share until the CSMS sets their limit."""
+    s = _ops_lm_site(sid)
+    cs = app_state.charge_points.get(cp)
+    if cs is None or not s.get('on'):
+        return None
+    kw = float(s.get('failsafe_kw') or 0)
+    if kw <= 0:
+        n = 0
+        for c in s.get('chargers') or []:
+            st = (getattr(app_state.cp_data.get(c), 'status', None) or {}) if app_state.cp_data.get(c) else {}
+            n += max(1, len([k for k in st if str(k).isdigit() and int(k) > 0]) or 2)
+        kw = max(float(s.get('min_kw') or 0), float(s.get('limit_kw') or 0) / max(1, n))
+    st = await _ops_lm_send(cs, cp, 0, None, s, kw, 'TxDefaultProfile')
+    _ops_lm_state(sid).setdefault('failsafe', {})[cp] = {'kw': round(kw, 2), 'status': st, 't': ops_now()}
+    OPS_LM_LOG.add({'site': sid, 'cp': cp, 'c': 0, 'kw': round(kw, 2), 'st': st, 'k': 'failsafe'})
+    return st
+
+
+async def ops_lm_rebalance(sid: str, reason: str = ''):
+    if sid not in ops_lm_sites.data:
+        return None
+    lock = _OPS_LM_LOCKS.setdefault(sid, asyncio.Lock())
+    async with lock:
+        s, now, stt = _ops_lm_site(sid), ops_now(), _ops_lm_state(sid)
+        stt['last'] = now
+        if not s.get('on'):
+            stt['alloc'] = {}
+            return None
+        sessions = _ops_lm_sessions(sid, s, now)
+        prev = stt['alloc']
+        for x in sessions:
+            if x['key'] not in prev or prev[x['key']].get('txn') != x['txn']:
+                x['since'] = now
+        alloc = ops_lm_allocate(s, sessions, prev, now)
+        cap_default = float(s.get('conn_max_kw') or 60)
+        new_state, sends = {}, []
+        for x in sessions:
+            old = prev.get(x['key']) if prev.get(x['key'], {}).get('txn') == x['txn'] else None
+            kw = alloc.get(x['key'], 0.0)
+            ent = {'cp': x['cp'], 'conn': x['conn'], 'txn': x['txn'], 'kw': kw, 'p_kw': round(x['p_kw'], 2), 'online': x['online'],
+                   'since': (old or {}).get('since') or now, 'sent_kw': (old or {}).get('sent_kw'), 'sent_at': (old or {}).get('sent_at'),
+                   'status': (old or {}).get('status', 'pending' if x['online'] else 'offline'), 'fails': (old or {}).get('fails', 0)}
+            new_state[x['key']] = ent
+            if not x['online']:
+                continue
+            cap = float((s.get('max') or {}).get(x['cp']) or cap_default)
+            sent = ent['sent_kw']
+            step = max(0.5, 0.03 * cap)
+            retry_s = 600 if int(ent.get('fails') or 0) >= 3 else 60     # a charger that keeps refusing is asked less often
+            if sent is None or abs(kw - sent) >= step or (kw == 0) != (sent == 0) or (ent['status'] != 'Accepted' and now - (ent['sent_at'] or 0) > retry_s):
+                if sent is not None and kw > sent and now - (ent['sent_at'] or 0) < max(5, int(s.get('interval_s') or 30)) / 2 and ent['status'] == 'Accepted':
+                    continue                           # raise limits at most every half interval (reductions go at once)
+                sends.append((kw < (sent if sent is not None else 1e9), x, kw))
+        stt['alloc'] = new_state
+        for down in (True, False):                     # reductions first, then increases
+            batch = [(x, kw, app_state.charge_points.get(x['cp'])) for d, x, kw in sends if d == down]
+            batch = [b for b in batch if b[2] is not None]
+            if not batch:
+                continue
+            res = await asyncio.gather(*[_ops_lm_send(cs_, x['cp'], x['conn'], x['txn'], s, kw) for x, kw, cs_ in batch],
+                                       return_exceptions=True)
+            for (x, kw, _cs), st in zip(batch, res):
+                st = st if isinstance(st, str) else f'error {type(st).__name__}'
+                ent = new_state[x['key']]
+                ent['status'] = st
+                ent['sent_at'] = ops_now()
+                if st == 'Accepted':
+                    ent['sent_kw'], ent['fails'] = kw, 0
+                else:
+                    ent['fails'] = int(ent.get('fails') or 0) + 1
+                OPS_LM_LOG.add({'site': sid, 'cp': x['cp'], 'c': x['conn'], 'txn': x['txn'], 'kw': kw, 'st': st, 'k': 'limit',
+                                'r': reason or stt.get('last_reason') or ''})
+        tot_p = round(sum(e['p_kw'] for e in new_state.values()), 2)
+        tot_a = round(sum(e['kw'] for e in new_state.values()), 2)
+        hist = stt['hist']
+        if not hist or now - hist[-1][0] >= 20:
+            hist.append((round(now), tot_p, tot_a))
+            del hist[:-360]                            # 2 hours at 20 s
+        lim = float(s.get('limit_kw') or 0)
+        if lim and tot_p > lim * 1.05:
+            stt['over_since'] = stt.get('over_since') or now
+        else:
+            stt['over_since'] = None
+        stt['power_kw'], stt['alloc_kw'] = tot_p, tot_a
+        return new_state
+
+
+@ops_on('tx_start')
+def _ops_lm_tx_start(cp_id=None, **kw):
+    ops_lm_schedule(ops_lm_site_of(cp_id), 1.0, 'session started')
+
+
+@ops_on('tx_stop')
+def _ops_lm_tx_stop(cp_id=None, **kw):
+    ops_lm_schedule(ops_lm_site_of(cp_id), 1.0, 'session ended')
+
+
+@ops_on('meter')
+def _ops_lm_meter(cp_id=None, **kw):
+    sid = ops_lm_site_of(cp_id)
+    if not sid:
+        return
+    s = _ops_lm_site(sid)
+    if ops_now() - _ops_lm_state(sid)['last'] >= max(5, int(s.get('interval_s') or 30)):
+        ops_lm_schedule(sid, 0.5, 'meter values')
+
+
+@ops_on('boot')
+def _ops_lm_boot(cp_id=None, **kw):
+    sid = ops_lm_site_of(cp_id)
+    if sid:
+        _OPS_LM_DISC.pop(cp_id, None)
+
+        async def _go():
+            await asyncio.sleep(2.0)                   # after the BootNotification answer
+            await ops_lm_failsafe(sid, cp_id)
+            await ops_lm_rebalance(sid, 'charger started')
+        try:
+            asyncio.get_running_loop().create_task(_go())
+        except RuntimeError:
+            pass
+
+
+@ops_on('disconnect')
+def _ops_lm_disconnect(cp_id=None, **kw):
+    sid = ops_lm_site_of(cp_id)
+    if sid:
+        _OPS_LM_DISC[cp_id] = ops_now()
+        ops_lm_schedule(sid, 1.0, 'charger offline')
+
+
+async def ops_lm_loop():
+    while True:
+        await asyncio.sleep(max(1.0, min(5.0, float(os.environ.get('OPS_TICK', '5') or 5))))
+        now = ops_now()
+        for sid in list(ops_lm_sites.data):
+            s = _ops_lm_site(sid)
+            if s.get('on') and now - _ops_lm_state(sid)['last'] >= max(5, int(s.get('interval_s') or 30)):
+                try:
+                    await ops_lm_rebalance(sid, 'periodic')
+                except Exception as e:
+                    logger.error(f"ops: load management of site {sid} failed: {e}")
+
+OPS_TASKS.append(ops_lm_loop)
+
+
+def _ops_lm_issues(add, now):
+    for sid, stt in OPS_LM_STATE.items():
+        s = ops_lm_sites.data.get(sid)
+        if not s or not s.get('on'):
+            continue
+        if stt.get('over_since') and now - stt['over_since'] >= float(s['over_s'] if s.get('over_s') is not None else 60) and s.get('chargers'):
+            add('lm_over', sorted(s['chargers'])[0], 0, 'major', stt['over_since'], 'Site {site} draws {p} kW - limit {l} kW',
+                site=s.get('name') or sid, p=stt.get('power_kw'), l=s.get('limit_kw'))
+        for e in (stt.get('alloc') or {}).values():
+            if int(e.get('fails') or 0) >= 2 and e.get('online'):
+                add('lm_refused', e['cp'], e['conn'], 'minor', e.get('sent_at') or now, 'Charging limit refused by the charger ({st})',
+                    st=e.get('status') or '')
+
+OPS_ISSUE_PROVIDERS.append(_ops_lm_issues)
+OPS_ISSUE_TITLES.update({'lm_over': 'Site over its power limit', 'lm_refused': 'Charging limit refused'})
+OPS_ALERT_RULES_DEFAULT.update({'lm_over': {'on': True, 'sev': 'major', 'delay_min': 0, 'notify': True, 'ticket': False},
+                                'lm_refused': {'on': True, 'sev': 'minor', 'delay_min': 0, 'notify': False, 'ticket': False}})
+
+
+# ---- API --------------------------------------------------------------------------------------------------------------------
+def _ops_lm_public(sid: str) -> dict:
+    s, stt = _ops_lm_site(sid), _ops_lm_state(sid)
+    rows = []
+    for key, e in sorted((stt.get('alloc') or {}).items()):
+        data = app_state.cp_data.get(e['cp'])
+        st = (getattr(data, 'status', None) or {}) if data else {}
+        rows.append(dict(e, key=key, conn_status=str(st.get(e['conn']) or st.get(str(e['conn'])) or ''),
+                         station=(station_info.data.get(e['cp']) or {}).get('name') or e['cp']))
+    out = {k: s.get(k) for k in OPS_LM_SITE_DEFAULTS}
+    out.update(id=sid, rows=rows, power_kw=stt.get('power_kw', 0.0), alloc_kw=stt.get('alloc_kw', 0.0), last=stt.get('last'),
+               over_since=stt.get('over_since'), failsafe=stt.get('failsafe') or {}, hist=stt.get('hist', [])[-180:],
+               online=[c for c in s.get('chargers') or [] if c in app_state.charge_points])
+    return out
+
+
+async def ops_api_lm(request):
+    now = ops_now()
+    sites = [_ops_lm_public(sid) for sid in sorted(ops_lm_sites.data)]
+    members = {c: sid for sid, s in ops_lm_sites.data.items() for c in s.get('chargers') or []}
+    chargers = []
+    for st in app_state.station_records():
+        cid = st.get('id') or ''
+        n = len([k for k in (st.get('status') or {}) if str(k).isdigit() and int(k) > 0]) or 2
+        chargers.append({'id': cid, 'name': (station_info.data.get(cid) or {}).get('name') or '', 'online': bool(st.get('connected')),
+                         'connectors': n, 'site': members.get(cid), 'model': st.get('model') or ''})
+    events = await asyncio.to_thread(OPS_LM_LOG.query, now - 86400, now + 1, None, 200, True)
+    return ops_json({'sites': sites, 'chargers': chargers, 'events': events, 'now': now, 'modes': list(OPS_LM_MODES)})
+
+
+async def ops_api_lm_site(request):
+    b = await ops_body(request)
+    sid = str(b.get('id') or '').strip()
+    if sid and sid not in ops_lm_sites.data:
+        return ops_err('No such site', 404)
+    if not sid:
+        n = 1
+        while f'S-{n:03d}' in ops_lm_sites.data:
+            n += 1
+        sid = f'S-{n:03d}'
+    old = json.loads(json.dumps(ops_lm_sites.data.get(sid) or {}))
+    s = dict(old or {'created': round(ops_now())})
+    name = str(b.get('name', s.get('name') or '')).strip()[:80]
+    if not name:
+        return ops_err('Give the site a name')
+    s['name'] = name
+    for k, lo, hi in (('limit_kw', 1, 100000), ('reserve_kw', 0, 100000), ('min_kw', 0, 1000), ('conn_max_kw', 1, 1000),
+                      ('failsafe_kw', 0, 1000)):
+        if k in b:
+            try:
+                s[k] = max(lo, min(hi, round(float(b[k] or 0), 2)))
+            except (TypeError, ValueError):
+                return ops_err(f'{k}: a number please')
+    for k, lo, hi in (('voltage', 100, 1000), ('phases', 1, 3), ('interval_s', 5, 600), ('offline_hold_min', 1, 240), ('ramp_s', 0, 900),
+                      ('over_s', 0, 3600)):
+        if k in b:
+            s[k] = ops_int(b[k], OPS_LM_SITE_DEFAULTS[k], lo, hi)
+    for k in ('on', 'dynamic'):
+        if k in b:
+            s[k] = bool(b[k])
+    if 'mode' in b:
+        if b['mode'] not in OPS_LM_MODES:
+            return ops_err('Unknown mode')
+        s['mode'] = b['mode']
+    if 'unit' in b:
+        s['unit'] = 'A' if b['unit'] == 'A' else 'W'
+    if 'chargers' in b:
+        cps = [str(c).strip() for c in (b.get('chargers') or []) if str(c).strip()]
+        for c in cps:
+            other = ops_lm_site_of(c)
+            if other and other != sid:
+                return ops_err(f'{c} already belongs to site {ops_lm_sites.data[other].get("name") or other}', 409)
+        s['chargers'] = sorted(set(cps))
+    if isinstance(b.get('max'), dict):
+        s['max'] = {c: max(1.0, min(1000.0, float(v))) for c, v in b['max'].items() if c in s.get('chargers', []) and v not in (None, '', 0, '0')}
+    if isinstance(b.get('prio'), dict):
+        s['prio'] = {c: ops_int(v, 2, 1, 3) for c, v in b['prio'].items() if c in s.get('chargers', [])}
+    if float(s.get('min_kw') or 0) > float(s.get('limit_kw') or 0):
+        return ops_err('The minimum per session is higher than the site limit')
+    ops_lm_sites.data[sid] = s
+    ops_lm_sites.save()
+    removed = [c for c in (old.get('chargers') or []) if c not in s.get('chargers', [])]
+    for c in removed + ([] if s.get('on') else list(s.get('chargers') or [])):
+        await _ops_lm_clear_cp(c)
+    if s.get('on'):
+        for c in s.get('chargers') or []:
+            if c in app_state.charge_points:
+                await ops_lm_failsafe(sid, c)
+        for e in (_ops_lm_state(sid).get('alloc') or {}).values():
+            e['sent_kw'] = None                        # unit / limits may have changed: send every limit again
+        await ops_lm_rebalance(sid, 'settings changed')
+    else:
+        _ops_lm_state(sid)['alloc'] = {}
+    OPS_LM_LOG.add({'site': sid, 'k': 'settings', 'r': f"limit {s.get('limit_kw')} kW, {len(s.get('chargers') or [])} chargers, {'on' if s.get('on') else 'off'}",
+                    'by': ops_request_user(request).get('username') or ''})
+    return ops_json({'ok': True, 'site': _ops_lm_public(sid)})
+
+
+async def _ops_lm_clear_cp(cp: str) -> list:
+    cs = app_state.charge_points.get(cp)
+    if cs is None:
+        return []
+    out = []
+    data = app_state.cp_data.get(cp)
+    conns = sorted({int(k) for k in (getattr(data, 'status', None) or {}) if str(k).isdigit() and int(k) > 0} or {1, 2})
+    for pid in [OPS_LM_DEFAULT_ID] + [OPS_LM_TX_ID + c for c in conns]:
+        try:
+            r = await asyncio.wait_for(cs.call(call.ClearChargingProfile(id=pid)), 20)
+            out.append(str(getattr(r, 'status', '')).split('.')[-1])
+        except Exception as e:
+            out.append(f'error {type(e).__name__}')
+    app_state.add_log('➡️ OUT', cp, 'ClearChargingProfile', {'ids': 'load management', 'result': ','.join(out)})
+    return out
+
+
+async def ops_api_lm_delete(request):
+    b = await ops_body(request)
+    sid = str(b.get('id') or '')
+    s = ops_lm_sites.data.pop(sid, None)
+    if s is None:
+        return ops_err('No such site', 404)
+    ops_lm_sites.save()
+    for c in s.get('chargers') or []:
+        await _ops_lm_clear_cp(c)
+    OPS_LM_STATE.pop(sid, None)
+    OPS_LM_LOG.add({'site': sid, 'k': 'deleted', 'r': s.get('name') or '', 'by': ops_request_user(request).get('username') or ''})
+    return ops_json({'ok': True})
+
+
+async def ops_api_lm_rebalance(request):
+    b = await ops_body(request)
+    sid = str(b.get('id') or '')
+    if sid not in ops_lm_sites.data:
+        return ops_err('No such site', 404)
+    for c in _ops_lm_site(sid).get('chargers') or []:
+        if c in app_state.charge_points:
+            await ops_lm_failsafe(sid, c)
+    st = _ops_lm_state(sid)
+    for e in (st.get('alloc') or {}).values():
+        e['sent_kw'] = None                            # send every limit again
+    await ops_lm_rebalance(sid, 'rebalance requested')
+    return ops_json({'ok': True, 'site': _ops_lm_public(sid)})
+
+
+async def ops_api_lm_clear(request):
+    b = await ops_body(request)
+    sid = str(b.get('id') or '')
+    if sid not in ops_lm_sites.data:
+        return ops_err('No such site', 404)
+    res = {c: await _ops_lm_clear_cp(c) for c in _ops_lm_site(sid).get('chargers') or []}
+    for e in (_ops_lm_state(sid).get('alloc') or {}).values():
+        e['sent_kw'], e['status'] = None, 'cleared'
+    return ops_json({'ok': True, 'result': res})
+
+
+OPS_ROUTES += [
+    ('GET', '/api/ops/lm', ops_api_lm), ('POST', '/api/ops/lm/site', ops_api_lm_site), ('POST', '/api/ops/lm/site/delete', ops_api_lm_delete),
+    ('POST', '/api/ops/lm/rebalance', ops_api_lm_rebalance), ('POST', '/api/ops/lm/clear', ops_api_lm_clear),
+]
+
+OPS_CSS_PARTS.append(r'''/* [OPS] v1.8 load management tab */
+.ops-lm-site { border: 1px solid var(--border); border-radius: 12px; padding: 0.7rem 0.8rem; margin-top: 0.8rem; }
+.ops-lm-site.off { opacity: 0.7; }
+.ops-lm-site h4 { margin: 0; }
+.ops-lm-gauge { position: relative; height: 14px; border-radius: 8px; background: rgba(100, 116, 139, 0.15); overflow: hidden; margin: 0.4rem 0 0.3rem; }
+.ops-lm-gauge .ops-lm-alloc { position: absolute; inset: 0 auto 0 0; background: rgba(148, 163, 184, 0.55); }
+.ops-lm-gauge .ops-lm-used { position: absolute; inset: 3px auto 3px 0; border-radius: 6px; background: linear-gradient(90deg, #22c55e, #2a78d6); }
+.ops-lm-gauge .ops-lm-used.over { background: linear-gradient(90deg, #f97316, #ef4444); }
+.ops-lm-nums { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 0.4rem; font-size: 0.78rem; margin-bottom: 0.5rem; }
+.ops-lm-chart { width: 100%; height: 150px; display: block; }
+.ops-lm-ax { font-size: 10px; fill: var(--text-dim); }
+.ops-lm-legend { display: flex; gap: 0.8rem; font-size: 0.72rem; color: var(--text-dim); margin-top: 0.2rem; }
+.ops-lm-legend i { display: inline-block; width: 10px; height: 3px; border-radius: 2px; margin-right: 0.3rem; vertical-align: middle; }
+.ops-lm-nochart { padding: 2.5rem 0.5rem; text-align: center; font-size: 0.8rem; }
+.ops-lm-fs { font-size: 0.72rem; margin-top: 0.4rem; }
+.ops-lm-small { width: 90px !important; min-width: 0 !important; }
+.ops-lm-empty { padding: 1.2rem 0; text-align: center; }
+''')
+OPS_JS_PARTS.append(r'''/* [OPS] ⚡ Load management tab (v1.8): site power limits shared by the chargers (SetChargingProfile) */
+(function () {
+    'use strict';
+    const OPS = window.OPS;
+    if (!OPS) return;
+    const L = {data: null};
+    OPS.ISSUE_KINDS = OPS.ISSUE_KINDS || {};
+    OPS.ISSUE_KINDS.lm_over = 'Site over its power limit';
+    OPS.ISSUE_KINDS.lm_refused = 'Charging limit refused';
+    const MODES = {equal: 'Equal share', priority: 'By priority', fifo: 'First come, first served'};
+    const td = (l, h, c) => OPS.td(l, h, c);
+    const kw = v => OPS.num(v, 1) + ' <small>kW</small>';
+    const stPill = st => {
+        if (!st) return '—';
+        const ok = st === 'Accepted';
+        const cls = ok ? 'ops-ok' : (st === 'pending' || st === 'offline' || st === 'cleared' ? 'muted' : 'ops-bad');
+        return '<span class="' + cls + '">' + (ok ? '✅ ' : (cls === 'ops-bad' ? '⚠️ ' : '')) + OPS.esc(OPS.tx(st)) + '</span>';
+    };
+
+    function build(v) {
+        v.dataset.built = '1';
+        v.innerHTML = '<section class="kpis ops-kpis">' + OPS.kpi('info', 'Sites', 'lmKSites', '') + OPS.kpi('info', 'Chargers managed', 'lmKCps', '') +
+            OPS.kpi('info', 'Sessions now', 'lmKSess', '') + OPS.kpi('good', 'Power now', 'lmKPow', '') + OPS.kpi('warn', 'Limits refused', 'lmKRef', 'by chargers') + '</section>' +
+            '<section class="pay-panel ops-panel"><div class="ops-head"><h3>' + OPS.t('⚡ Load management') + '</h3><div class="ops-actions">' +
+            '<button class="tb-btn primary" id="lmNew">' + OPS.t('➕ New site') + '</button></div></div>' +
+            '<div class="pay-help">' + OPS.t('A site is a group of chargers on one supply (feeder, transformer or building connection). The CSMS shares the site limit between the running sessions and sends each charger its limit (OCPP SetChargingProfile); a fail-safe default keeps new sessions low while the CSMS cannot be reached.') + '</div>' +
+            '<div id="lmSites"></div></section>' +
+            '<section class="pay-panel ops-panel"><details id="lmEvBox"><summary><b>' + OPS.t('📜 Limits sent (24 h)') + '</b></summary><div class="ops-table-wrap ops-tall"><table class="fleet-table ops-table ops-cards" id="lmEvents"></table></div></details></section>';
+        OPS.$('lmNew').onclick = () => edit(null);
+        v.addEventListener('click', onClick);
+    }
+
+    async function load() {
+        try { L.data = await OPS.api('/api/ops/lm'); } catch (e) { return OPS.fail(e); }
+        render();
+    }
+
+    function chart(site) {
+        const h = site.hist || [];
+        if (h.length < 2) return '<div class="muted ops-lm-nochart">' + OPS.t('The power chart fills in while sessions run') + '</div>';
+        const W = 640, H = 150, pl = 40, pr = 8, pt = 8, pb = 20;
+        const t0 = h[0][0], t1 = h[h.length - 1][0], span = Math.max(60, t1 - t0);
+        const max = Math.max(site.limit_kw * 1.1, ...h.map(x => Math.max(x[1], x[2])), 1);
+        const X = t => pl + (W - pl - pr) * (t - t0) / span, Y = v => pt + (H - pt - pb) * (1 - v / max);
+        const line = (i, color, dash) => '<polyline fill="none" stroke="' + color + '" stroke-width="2"' + (dash ? ' stroke-dasharray="4 3"' : '') + ' points="' +
+            h.map(x => X(x[0]).toFixed(1) + ',' + Y(x[i]).toFixed(1)).join(' ') + '"/>';
+        const yl = [0, max / 2, max].map(v => '<text x="' + (pl - 4) + '" y="' + (Y(v) + 4).toFixed(1) + '" text-anchor="end" class="ops-lm-ax">' + Math.round(v) + '</text>').join('');
+        const lim = '<line x1="' + pl + '" x2="' + (W - pr) + '" y1="' + Y(site.limit_kw).toFixed(1) + '" y2="' + Y(site.limit_kw).toFixed(1) + '" stroke="#ef4444" stroke-width="1.5" stroke-dasharray="6 4"/>';
+        const tl = [t0, t1].map((t, i) => '<text x="' + (i ? W - pr : pl) + '" y="' + (H - 4) + '" text-anchor="' + (i ? 'end' : 'start') + '" class="ops-lm-ax">' + OPS.fmt(t).slice(11) + '</text>').join('');
+        return '<svg class="ops-lm-chart" viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none">' + lim + line(2, '#94a3b8', true) + line(1, '#2a78d6', false) + yl + tl + '</svg>' +
+            '<div class="ops-lm-legend"><span><i style="background:#2a78d6"></i>' + OPS.t('measured') + '</span><span><i style="background:#94a3b8"></i>' + OPS.t('limits given') + '</span><span><i style="background:#ef4444"></i>' + OPS.t('site limit') + '</span></div>';
+    }
+
+    function siteCard(s) {
+        const pct = s.limit_kw ? Math.min(100, 100 * (s.power_kw || 0) / s.limit_kw) : 0;
+        const apct = s.limit_kw ? Math.min(100, 100 * (s.alloc_kw || 0) / s.limit_kw) : 0;
+        const rows = (s.rows || []).map(r => '<tr>' + td('Charger', '<b>' + OPS.esc(r.station) + '</b> #' + r.conn + '<br><span class="muted">' + OPS.esc(r.cp) + (r.online ? '' : ' · ' + OPS.tx('offline - its limit is kept')) + '</span>') +
+            td('Session', OPS.esc(r.txn) + '<br><span class="muted">' + OPS.esc(OPS.tx(r.conn_status || '')) + '</span>') +
+            td('Limit', kw(r.kw) + (r.sent_kw != null && Math.abs(r.sent_kw - r.kw) > 0.05 ? '<br><span class="muted">' + OPS.t('sent {k} kW', {k: OPS.num(r.sent_kw, 1)}) + '</span>' : '')) +
+            td('Measured', kw(r.p_kw)) + td('Charger answer', stPill(r.status)) + '</tr>').join('');
+        const fs = Object.keys(s.failsafe || {}).map(cp => OPS.esc(cp) + ' ' + OPS.num(s.failsafe[cp].kw, 1) + ' kW ' + (s.failsafe[cp].status === 'Accepted' ? '✅' : '⚠️ ' + OPS.esc(s.failsafe[cp].status))).join(' · ');
+        return '<div class="ops-lm-site' + (s.on ? '' : ' off') + '" data-site="' + OPS.esc(s.id) + '"><div class="ops-head"><h4>' + OPS.esc(s.name) + ' <span class="muted">' + OPS.esc(s.id) + '</span> ' +
+            (s.on ? '<span class="pill ops-live">' + OPS.t('ON') + '</span>' : '<span class="pill">' + OPS.t('OFF') + '</span>') +
+            (s.over_since ? ' <span class="ops-bad">⚠️ ' + OPS.t('over the limit') + '</span>' : '') + '</h4><div class="ops-actions">' +
+            (OPS.can('control') ? '<button class="tb-btn ops-mini" data-lm="rebalance" data-id="' + OPS.esc(s.id) + '">' + OPS.t('🔄 Send limits again') + '</button>' : '') +
+            (OPS.can('config') ? '<button class="tb-btn ops-mini" data-lm="edit" data-id="' + OPS.esc(s.id) + '">' + OPS.t('✏️ Edit') + '</button>' +
+                '<button class="tb-btn ops-mini" data-lm="clear" data-id="' + OPS.esc(s.id) + '">' + OPS.t('🧹 Clear limits on the chargers') + '</button>' +
+                '<button class="tb-btn ops-mini" data-lm="delete" data-id="' + OPS.esc(s.id) + '">🗑️</button>' : '') + '</div></div>' +
+            '<div class="ops-lm-gauge"><div class="ops-lm-alloc" style="width:' + apct.toFixed(1) + '%"></div><div class="ops-lm-used' + (pct > 100 ? ' over' : '') + '" style="width:' + pct.toFixed(1) + '%"></div></div>' +
+            '<div class="ops-lm-nums"><span>' + OPS.t('Now {p} kW of {l} kW', {p: OPS.num(s.power_kw, 1), l: OPS.num(s.limit_kw, 0)}) + '</span><span class="muted">' +
+            OPS.t('limits given {a} kW', {a: OPS.num(s.alloc_kw, 1)}) + ' · ' + OPS.t(MODES[s.mode] || s.mode) + ' · ' + OPS.t('min {m} kW per session', {m: OPS.num(s.min_kw, 1)}) +
+            (s.reserve_kw ? ' · ' + OPS.t('{r} kW kept for other loads', {r: OPS.num(s.reserve_kw, 1)}) : '') + ' · ' + OPS.t('{n} chargers ({o} online)', {n: (s.chargers || []).length, o: (s.online || []).length}) + '</span></div>' +
+            '<div class="ops-grid2"><div><div class="ops-table-wrap"><table class="fleet-table ops-table ops-cards"><thead><tr><th>' + OPS.t('Charger') + '</th><th>' + OPS.t('Session') + '</th><th>' +
+            OPS.t('Limit') + '</th><th>' + OPS.t('Measured') + '</th><th>' + OPS.t('Charger answer') + '</th></tr></thead><tbody>' +
+            (rows || '<tr><td colspan="5" class="muted">' + OPS.t('No session running at this site') + '</td></tr>') + '</tbody></table></div>' +
+            (fs ? '<div class="muted ops-lm-fs">' + OPS.t('Fail-safe default per connector: {x}', {x: fs}) + '</div>' : '') + '</div><div>' + chart(s) + '</div></div></div>';
+    }
+
+    function render() {
+        const d = L.data;
+        let cps = 0, sess = 0, pow = 0, lim = 0, ref = 0;
+        d.sites.forEach(s => {
+            cps += (s.chargers || []).length;
+            sess += (s.rows || []).length;
+            if (s.on) { pow += s.power_kw || 0; lim += s.limit_kw || 0; }
+            ref += (s.rows || []).filter(r => r.status && r.status !== 'Accepted' && r.status !== 'pending' && r.status !== 'offline' && r.status !== 'cleared').length;
+        });
+        OPS.$('lmKSites').textContent = d.sites.length;
+        OPS.$('lmKCps').textContent = cps;
+        OPS.$('lmKSess').textContent = sess;
+        OPS.$('lmKPow').innerHTML = OPS.num(pow, 1) + ' <small>kW</small>';
+        OPS.$('lmKPowSub').innerHTML = OPS.t('of {l} kW site limits', {l: OPS.num(lim, 0)});
+        OPS.$('lmKRef').textContent = ref;
+        OPS.$('lmNew').style.display = OPS.can('config') ? '' : 'none';
+        OPS.$('lmSites').innerHTML = d.sites.length ? d.sites.map(siteCard).join('') :
+            '<div class="muted ops-lm-empty">' + OPS.t('No site yet. Add one: name, power limit and the chargers on that supply.') + '</div>';
+        OPS.$('lmEvents').innerHTML = '<thead><tr><th>' + OPS.t('Time') + '</th><th>' + OPS.t('Site') + '</th><th>' + OPS.t('Charger') + '</th><th>' + OPS.t('Limit') + '</th><th>' + OPS.t('Charger answer') + '</th><th>' + OPS.t('Why') + '</th></tr></thead><tbody>' +
+            ((d.events || []).map(e => '<tr>' + td('Time', OPS.fmt(e.t, true)) + td('Site', OPS.esc(e.site || '')) + td('Charger', OPS.esc(e.cp || '') + (e.c ? ' #' + e.c : (e.k === 'failsafe' ? ' (' + OPS.tx('fail-safe') + ')' : ''))) +
+                td('Limit', e.kw != null ? OPS.num(e.kw, 1) + ' kW' : '—') + td('Charger answer', e.st ? stPill(e.st) : '—') + td('Why', OPS.esc(OPS.tx(e.r || e.k || '')) + (e.by ? ' · ' + OPS.esc(e.by) : '')) + '</tr>').join('') ||
+                '<tr><td colspan="6" class="muted">' + OPS.t('Nothing yet') + '</td></tr>') + '</tbody>';
+    }
+
+    async function onClick(e) {
+        const b = e.target.closest('[data-lm]');
+        if (!b) return;
+        const id = b.dataset.id, act = b.dataset.lm;
+        try {
+            if (act === 'edit') return edit((L.data.sites || []).find(s => s.id === id));
+            if (act === 'rebalance') { await OPS.post('/api/ops/lm/rebalance', {id: id}); OPS.toast(OPS.tx('Limits sent'), 'success'); }
+            if (act === 'clear') {
+                if (!OPS.confirm('Remove the load-management limits from the chargers of this site? They charge at full power until the next rebalance (switch the site off first to keep it that way).')) return;
+                await OPS.post('/api/ops/lm/clear', {id: id});
+            }
+            if (act === 'delete') {
+                if (!OPS.confirm('Delete this site? Its limits are removed from the chargers.')) return;
+                await OPS.post('/api/ops/lm/site/delete', {id: id});
+            }
+        } catch (err) { return OPS.fail(err); }
+        load();
+    }
+
+    function edit(s) {
+        const isNew = !s;
+        s = s || {name: '', on: true, limit_kw: 100, reserve_kw: 0, chargers: [], mode: 'equal', min_kw: 5, conn_max_kw: 60, unit: 'W', voltage: 230, phases: 3,
+            dynamic: true, failsafe_kw: 0, interval_s: 30, max: {}, prio: {}, offline_hold_min: 10};
+        const chargers = (L.data.chargers || []).filter(c => !c.site || c.site === s.id);
+        const num = (id, label, v, extra) => '<label>' + OPS.t(label) + '<input class="tb-inp" type="number" id="' + id + '" value="' + OPS.esc(v) + '"' + (extra || '') + '></label>';
+        const list = chargers.map(c => {
+            const on = (s.chargers || []).includes(c.id);
+            return '<tr><td><label class="ops-check"><input type="checkbox" data-cp="' + OPS.esc(c.id) + '"' + (on ? ' checked' : '') + '> <b>' + OPS.esc(c.id) + '</b></label>' +
+                (c.name ? '<br><span class="muted">' + OPS.esc(c.name) + '</span>' : '') + '</td><td>' + (c.online ? '🟢' : '⚪') + ' ' + c.connectors + '</td>' +
+                '<td><input class="tb-inp ops-lm-small" type="number" min="1" step="1" data-max="' + OPS.esc(c.id) + '" placeholder="' + OPS.esc(String(s.conn_max_kw)) + '" value="' + OPS.esc((s.max || {})[c.id] || '') + '"></td>' +
+                '<td><select class="tb-sel ops-lm-small" data-prio="' + OPS.esc(c.id) + '">' + [3, 2, 1].map(p => OPS.opt(p, ['', 'Low', 'Normal', 'High'][p], ((s.prio || {})[c.id] || 2) === p)).join('') + '</select></td></tr>';
+        }).join('');
+        const html = '<div class="ops-form"><label>' + OPS.t('Site name') + '<input class="tb-inp" id="lmName" maxlength="80" value="' + OPS.esc(s.name) + '"></label>' +
+            num('lmLimit', 'Power limit of the site (kW)', s.limit_kw, ' min="1" step="1"') + num('lmReserve', 'Kept for other loads (kW)', s.reserve_kw, ' min="0" step="1"') +
+            '<label>' + OPS.t('Sharing') + '<select class="tb-sel" id="lmMode">' + Object.keys(MODES).map(m => OPS.opt(m, MODES[m], s.mode === m)).join('') + '</select></label>' +
+            num('lmMin', 'Minimum per session (kW)', s.min_kw, ' min="0" step="0.5"') + num('lmCap', 'Maximum per connector (kW)', s.conn_max_kw, ' min="1" step="1"') +
+            num('lmFs', 'Fail-safe per connector (kW, 0 = automatic)', s.failsafe_kw, ' min="0" step="0.5"') + num('lmInt', 'Check every (s)', s.interval_s, ' min="10" step="5"') +
+            '<label>' + OPS.t('Limit unit') + '<select class="tb-sel" id="lmUnit">' + OPS.opt('W', 'Power (W) - DC chargers', s.unit !== 'A') + OPS.opt('A', 'Current (A per phase) - AC chargers', s.unit === 'A') + '</select></label>' +
+            num('lmVolt', 'Phase voltage (V, for A)', s.voltage, ' min="100"') + num('lmPh', 'Phases (for A)', s.phases, ' min="1" max="3"') +
+            num('lmHold', 'Offline charger: keep its limit reserved for (min)', s.offline_hold_min, ' min="1"') +
+            '<label class="ops-check"><input type="checkbox" id="lmDyn"' + (s.dynamic ? ' checked' : '') + '> ' + OPS.t('Give power a car does not use to the others') + '</label>' +
+            '<label class="ops-check"><input type="checkbox" id="lmOn"' + (s.on ? ' checked' : '') + '> ' + OPS.t('Load management on') + '</label></div>' +
+            '<h4 style="margin:0.8rem 0 0.3rem">' + OPS.t('Chargers on this supply') + '</h4><div class="ops-table-wrap ops-tall"><table class="fleet-table ops-table"><thead><tr><th>' + OPS.t('Charger') + '</th><th>' +
+            OPS.t('Connectors') + '</th><th>' + OPS.t('Max kW per connector') + '</th><th>' + OPS.t('Priority') + '</th></tr></thead><tbody>' +
+            (list || '<tr><td colspan="4" class="muted">' + OPS.t('No charger available (each charger can belong to one site)') + '</td></tr>') + '</tbody></table></div>';
+        OPS.modal(isNew ? '⚡ New site' : '⚡ Site {n}', html, [{label: 'Cancel'}, {label: '💾 Save', cls: 'primary', run: async box => {
+            const cps = Array.from(box.querySelectorAll('input[data-cp]')).filter(x => x.checked).map(x => x.dataset.cp);
+            const max = {}, prio = {};
+            box.querySelectorAll('input[data-max]').forEach(x => { if (x.value) max[x.dataset.max] = parseFloat(x.value); });
+            box.querySelectorAll('select[data-prio]').forEach(x => { prio[x.dataset.prio] = parseInt(x.value, 10); });
+            const body = {name: OPS.val(box, '#lmName'), limit_kw: OPS.val(box, '#lmLimit'), reserve_kw: OPS.val(box, '#lmReserve'), mode: OPS.val(box, '#lmMode'),
+                min_kw: OPS.val(box, '#lmMin'), conn_max_kw: OPS.val(box, '#lmCap'), failsafe_kw: OPS.val(box, '#lmFs'), interval_s: OPS.val(box, '#lmInt'),
+                unit: OPS.val(box, '#lmUnit'), voltage: OPS.val(box, '#lmVolt'), phases: OPS.val(box, '#lmPh'), offline_hold_min: OPS.val(box, '#lmHold'),
+                dynamic: OPS.val(box, '#lmDyn'), on: OPS.val(box, '#lmOn'), chargers: cps, max: max, prio: prio};
+            if (!isNew) body.id = s.id;
+            await OPS.post('/api/ops/lm/site', body);
+            OPS.toast(OPS.tx('Saved - limits sent to the chargers'), 'success');
+            load();
+            return true;
+        }}], {wide: true, vars: {n: s.name}});
+    }
+
+    OPS.register({tab: 'lm', perm: 'view', every: 5,
+        show: function () { const v = OPS.$('view-lm'); if (!v) return; if (!v.dataset.built) build(v); load(); },
+        refresh: load,
+        relang: function () { const v = OPS.$('view-lm'); if (v) { v.dataset.built = ''; v.innerHTML = ''; OPS.mods.lm.show(); } }
+    });
+
+    OPS.addI18n({
+        '⚡ Load management': ['', '⚡ จัดการกำลังไฟ'], 'Sites': ['', 'สถานี (ไซต์)'], 'Chargers managed': ['', 'ตู้ที่ควบคุม'], 'Sessions now': ['', 'กำลังชาร์จ'], 'Power now': ['', 'กำลังไฟตอนนี้'],
+        'Limits refused': ['', 'ตู้ไม่รับค่าจำกัด'], 'by chargers': ['', 'โดยตู้'], '➕ New site': ['', '➕ ไซต์ใหม่'],
+        'A site is a group of chargers on one supply (feeder, transformer or building connection). The CSMS shares the site limit between the running sessions and sends each charger its limit (OCPP SetChargingProfile); a fail-safe default keeps new sessions low while the CSMS cannot be reached.': ['', 'ไซต์คือกลุ่มตู้ที่ใช้แหล่งจ่ายไฟเดียวกัน (สายป้อน หม้อแปลง หรือมิเตอร์อาคาร) CSMS แบ่งกำลังไฟของไซต์ให้การชาร์จที่กำลังทำงาน แล้วส่งค่าจำกัดให้แต่ละตู้ (OCPP SetChargingProfile) และตั้งค่าเริ่มต้นแบบปลอดภัยไว้ที่ตู้ เผื่อตู้ติดต่อ CSMS ไม่ได้'],
+        '📜 Limits sent (24 h)': ['', '📜 ค่าจำกัดที่ส่ง (24 ชม.)'], 'The power chart fills in while sessions run': ['', 'กราฟกำลังไฟจะแสดงเมื่อมีการชาร์จ'], 'measured': ['', 'วัดได้'], 'limits given': ['', 'ค่าจำกัดที่ให้'],
+        'site limit': ['', 'ขีดจำกัดของไซต์'], 'offline - its limit is kept': ['', 'ออฟไลน์ - กันกำลังไฟไว้ให้'], 'Limit': ['', 'ค่าจำกัด'], 'Measured': ['', 'วัดได้'], 'Charger answer': ['', 'ตู้ตอบ'],
+        'sent {k} kW': ['', 'ส่งไป {k} kW'], 'ON': ['', 'เปิด'], 'OFF': ['', 'ปิด'], 'over the limit': ['', 'เกินขีดจำกัด'], '🔄 Send limits again': ['', '🔄 ส่งค่าจำกัดอีกครั้ง'],
+        '🧹 Clear limits on the chargers': ['', '🧹 ลบค่าจำกัดที่ตู้'], 'Now {p} kW of {l} kW': ['', 'ตอนนี้ {p} kW จาก {l} kW'], 'limits given {a} kW': ['', 'ให้ไป {a} kW'],
+        'Equal share': ['', 'แบ่งเท่ากัน'], 'By priority': ['', 'ตามลำดับความสำคัญ'], 'First come, first served': ['', 'มาก่อนได้ก่อน'], 'min {m} kW per session': ['', 'ขั้นต่ำ {m} kW ต่อการชาร์จ'],
+        '{r} kW kept for other loads': ['', 'กันไว้ให้โหลดอื่น {r} kW'], '{n} chargers ({o} online)': ['', '{n} ตู้ (ออนไลน์ {o})'], 'No session running at this site': ['', 'ไม่มีการชาร์จที่ไซต์นี้'],
+        'Fail-safe default per connector: {x}': ['', 'ค่าปลอดภัยต่อหัว: {x}'], 'of {l} kW site limits': ['', 'จากขีดจำกัดรวม {l} kW'],
+        'No site yet. Add one: name, power limit and the chargers on that supply.': ['', 'ยังไม่มีไซต์ เพิ่มไซต์: ชื่อ ขีดจำกัดกำลังไฟ และตู้ที่ใช้แหล่งจ่ายนั้น'], 'Site': ['', 'ไซต์'], 'Why': ['', 'เหตุผล'],
+        'fail-safe': ['', 'ค่าปลอดภัย'], 'Limits sent': ['', 'ส่งค่าจำกัดแล้ว'],
+        'Remove the load-management limits from the chargers of this site? They charge at full power until the next rebalance (switch the site off first to keep it that way).': ['', 'ลบค่าจำกัดที่ตู้ของไซต์นี้? ตู้จะชาร์จเต็มกำลังจนกว่าจะคำนวณใหม่ (ปิดไซต์ก่อนถ้าต้องการให้เป็นแบบนั้นต่อไป)'],
+        'Delete this site? Its limits are removed from the chargers.': ['', 'ลบไซต์นี้? ค่าจำกัดที่ตู้จะถูกลบด้วย'], 'Site name': ['', 'ชื่อไซต์'], 'Power limit of the site (kW)': ['', 'ขีดจำกัดกำลังไฟของไซต์ (kW)'],
+        'Kept for other loads (kW)': ['', 'กันไว้ให้โหลดอื่น (kW)'], 'Sharing': ['', 'วิธีแบ่ง'], 'Minimum per session (kW)': ['', 'ขั้นต่ำต่อการชาร์จ (kW)'], 'Maximum per connector (kW)': ['', 'สูงสุดต่อหัว (kW)'],
+        'Fail-safe per connector (kW, 0 = automatic)': ['', 'ค่าปลอดภัยต่อหัว (kW, 0 = อัตโนมัติ)'], 'Check every (s)': ['', 'คำนวณใหม่ทุก (วินาที)'], 'Limit unit': ['', 'หน่วยค่าจำกัด'],
+        'Power (W) - DC chargers': ['', 'กำลังไฟ (W) - ตู้ DC'], 'Current (A per phase) - AC chargers': ['', 'กระแส (A ต่อเฟส) - ตู้ AC'], 'Phase voltage (V, for A)': ['', 'แรงดันต่อเฟส (V, สำหรับ A)'],
+        'Phases (for A)': ['', 'จำนวนเฟส (สำหรับ A)'], 'Offline charger: keep its limit reserved for (min)': ['', 'ตู้ออฟไลน์: กันกำลังไฟไว้นาน (นาที)'],
+        'Give power a car does not use to the others': ['', 'ให้กำลังไฟที่รถไม่ได้ใช้กับตู้อื่น'], 'Load management on': ['', 'เปิดการจัดการกำลังไฟ'], 'Chargers on this supply': ['', 'ตู้ที่ใช้แหล่งจ่ายนี้'],
+        'Connectors': ['', 'หัวชาร์จ'], 'Max kW per connector': ['', 'kW สูงสุดต่อหัว'], 'Priority': ['', 'ความสำคัญ'], 'Low': ['', 'ต่ำ'], 'Normal': ['', 'ปกติ'], 'High': ['', 'สูง'],
+        'No charger available (each charger can belong to one site)': ['', 'ไม่มีตู้ที่เลือกได้ (ตู้หนึ่งอยู่ได้ไซต์เดียว)'], '⚡ New site': ['', '⚡ ไซต์ใหม่'], '⚡ Site {n}': ['', '⚡ ไซต์ {n}'],
+        'Saved - limits sent to the chargers': ['', 'บันทึกแล้ว - ส่งค่าจำกัดให้ตู้แล้ว'], 'Site over its power limit': ['', 'ไซต์ใช้ไฟเกินขีดจำกัด'], 'Charging limit refused': ['', 'ตู้ไม่รับค่าจำกัดการชาร์จ'],
+        'Site {site} draws {p} kW - limit {l} kW': ['', 'ไซต์ {site} ใช้ไฟ {p} kW - ขีดจำกัด {l} kW'], 'Charging limit refused by the charger ({st})': ['', 'ตู้ไม่รับค่าจำกัดการชาร์จ ({st})'],
+        'session started': ['', 'เริ่มชาร์จ'], 'session ended': ['', 'จบการชาร์จ'], 'meter values': ['', 'ค่ามิเตอร์'], 'charger started': ['', 'ตู้เริ่มทำงาน'], 'charger offline': ['', 'ตู้ออฟไลน์'],
+        'periodic': ['', 'ตามรอบ'], 'settings changed': ['', 'เปลี่ยนการตั้งค่า'], 'rebalance requested': ['', 'สั่งคำนวณใหม่'], 'pending': ['', 'รอส่ง'], 'cleared': ['', 'ลบแล้ว']
+    });
+})();
+''')
+
+
+# ---- [OPS] v1.9 production readiness: backups (scheduled / manual / command line) + checked restore, /healthz and /readyz
+#      for load balancers and monitors, server status (memory, event-loop lag, database, disk), server health issues
+OPS_FEATURES.append('server')
+import zipfile as _ops_zip
+import shutil as _ops_shutil
+import platform as _ops_platform
+import collections as _ops_collections
+
+OPS_SERVER_DEFAULTS = {'backup_on': True, 'backup_time': '02:30', 'backup_keep': 14, 'backup_logs': False, 'backup_dir': 'backups',
+                       'mem_limit_mb': 0, 'disk_min_gb': 1.0, 'lag_warn_s': 2.0}
+OPS_DATA_FILES = ['cp_registrations.json', 'rfid_cards.json', 'config_overrides.json', 'ocpp_default_config.json',
+                  'payment_settings.json', 'payments.json', 'customers.json', 'app_settings.json', 'station_info.json']
+OPS_NEVER_BACKUP = {'database.json', 'csms_config.json', 'csms_runtime.json'}   # database address / console password: per installation
+OPS_RESTART_EXIT_CODE = 76                      # the launcher starts the CSMS again (Render restarts any exit)
+OPS_BACKUP_RE = _ops_re.compile(r'^csms_backup_\d{8}_\d{6}_[a-z-]+\.zip$')
+_OPS_SRV = {'started': _ops_time.time(), 'lag': _ops_collections.deque(maxlen=240), 'db_ok': None, 'db_checked': 0.0, 'db_err': '',
+            'last_backup': None, 'backup_running': False, 'restoring': False, 'md5': '', 'cpu': None}
+OPS_TAB_PERMS['server'] = 'admin'
+ops_perm_rule('*', '/api/ops/server', 'admin', prefix=True)
+PUBLIC_PATHS.update({'/healthz', '/readyz'})
+
+
+def ops_server_cfg() -> dict:
+    return ops_cfg('server', OPS_SERVER_DEFAULTS)
+
+
+def ops_backup_dir() -> str:
+    d = str(ops_server_cfg().get('backup_dir') or 'backups')
+    return d if os.path.isabs(d) else str(APP_DIR / d)
+
+
+def _ops_sha256(path: str) -> str:
+    h = _ops_hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _ops_json_util():
+    try:
+        from bson import json_util
+        return json_util
+    except Exception:
+        return None
+
+
+def ops_backup_sources(include_logs: bool):
+    """(archive name, absolute path) of every data file to save."""
+    out, cwd = [], os.getcwd()
+    for name in OPS_DATA_FILES:
+        p = os.path.join(cwd, name)
+        if os.path.isfile(p):
+            out.append(('files/' + name, p))
+    if os.path.isdir(OPS_DIR):
+        for name in sorted(os.listdir(OPS_DIR)):
+            p = os.path.join(OPS_DIR, name)
+            if os.path.isfile(p) and name.endswith(('.json', '.jsonl')):
+                out.append(('files/ops_data/' + name, p))
+    if include_logs:
+        for name in sorted(os.listdir(cwd)):
+            if name.startswith('ocpp_logs_') and name.endswith(('.json', '.jsonl')):
+                out.append(('files/' + name, os.path.join(cwd, name)))
+    return [x for x in out if os.path.basename(x[1]) not in OPS_NEVER_BACKUP]
+
+
+def ops_backup_create(kind: str = 'manual', include_logs: bool = None, db=None, out_dir: str = None, files: bool = True) -> dict:
+    """Blocking (run in a thread): one zip with manifest.json, the data files and - in MongoDB mode - every collection."""
+    cfg = ops_server_cfg()
+    include_logs = bool(cfg.get('backup_logs')) if include_logs is None else bool(include_logs)
+    db = _db() if db is None else db
+    out_dir = out_dir or ops_backup_dir()
+    os.makedirs(out_dir, exist_ok=True)
+    name = 'csms_backup_%s_%s.zip' % (ops_dt().strftime('%Y%m%d_%H%M%S'), _ops_re.sub(r'[^a-z-]', '', kind.lower()) or 'manual')
+    path = os.path.join(out_dir, name)
+    tmp = path + '.part'
+    t0 = _ops_time.time()
+    manifest = {'format': 'bpc-csms-backup/1', 'created': ops_iso(), 'created_t': round(t0, 3), 'kind': kind,
+                'version': OPS_VERSION, 'csms_md5': _OPS_SRV.get('md5') or '', 'mode': 'mongodb' if db is not None else 'json',
+                'host': _ops_platform.node()[:60], 'include_logs': include_logs, 'files': [], 'collections': {}}
+    ju = _ops_json_util()
+    with _ops_zip.ZipFile(tmp, 'w', _ops_zip.ZIP_DEFLATED, allowZip64=True) as z:
+        for arc, p in (ops_backup_sources(include_logs) if files else []):
+            try:
+                data = ops_backup_read_file(p)   # [OPS] v1.10 a file being rewritten is read again until whole
+            except OSError as e:
+                manifest.setdefault('skipped', []).append(f'{arc}: {e}')
+                continue
+            z.writestr(arc, data)
+            manifest['files'].append({'path': arc, 'size': len(data), 'sha256': _ops_hashlib.sha256(data).hexdigest()})
+        if db is not None:
+            for coll in DB_COLLECTIONS:
+                if coll == 'ocpp_logs' and not include_logs:
+                    continue
+                h, n = _ops_hashlib.sha256(), 0
+                with z.open(f'mongo/{coll}.jsonl', 'w', force_zip64=True) as w:
+                    for doc in db.db[coll].find({}):
+                        line = ((ju.dumps(doc) if ju else json.dumps(doc, default=str, ensure_ascii=False)) + '\n').encode('utf-8')
+                        w.write(line)
+                        h.update(line)
+                        n += 1
+                manifest['collections'][coll] = {'count': n, 'sha256': h.hexdigest()}
+        manifest['seconds'] = round(_ops_time.time() - t0, 2)
+        z.writestr('manifest.json', json.dumps(manifest, indent=1, ensure_ascii=False))
+    os.replace(tmp, path)
+    info = {'name': name, 'path': path, 'size': os.path.getsize(path), 'created': manifest['created'], 'kind': kind,
+            'files': len(manifest['files']), 'collections': {k: v['count'] for k, v in manifest['collections'].items()},
+            'mode': manifest['mode'], 'seconds': manifest['seconds']}
+    logger.info(f"💾 backup {name}: {info['files']} files, {sum(info['collections'].values())} database documents, "
+                f"{info['size'] / 1e6:.1f} MB in {info['seconds']} s")
+    return info
+
+
+def ops_backup_read_manifest(path: str):
+    with _ops_zip.ZipFile(path) as z:
+        return json.loads(z.read('manifest.json').decode('utf-8'))
+
+
+def ops_backup_list() -> List[dict]:
+    d = ops_backup_dir()
+    out = []
+    if os.path.isdir(d):
+        for name in sorted(os.listdir(d), reverse=True):
+            if not OPS_BACKUP_RE.match(name):
+                continue
+            p = os.path.join(d, name)
+            row = {'name': name, 'size': os.path.getsize(p), 'mtime': os.path.getmtime(p)}
+            try:
+                m = ops_backup_read_manifest(p)
+                row.update(created=m.get('created'), kind=m.get('kind'), mode=m.get('mode'), version=m.get('version'),
+                           files=len(m.get('files') or []), collections={k: v.get('count') for k, v in (m.get('collections') or {}).items()})
+            except Exception as e:
+                row['error'] = f'unreadable ({type(e).__name__})'
+            out.append(row)
+    return out
+
+
+def ops_backup_prune(keep: int) -> List[str]:
+    """Scheduled backups beyond 'keep' are deleted (manual / pre-restore ones stay until the admin removes them)."""
+    autos = [b for b in ops_backup_list() if b['name'].endswith('_auto.zip')]
+    gone = []
+    for b in autos[max(1, int(keep)):]:
+        try:
+            os.remove(os.path.join(ops_backup_dir(), b['name']))
+            gone.append(b['name'])
+        except OSError as e:
+            logger.error(f"ops: removing old backup {b['name']} failed: {e}")
+    return gone
+
+
+def ops_backup_verify(path: str) -> dict:
+    problems = []
+    try:
+        with _ops_zip.ZipFile(path) as z:
+            m = json.loads(z.read('manifest.json').decode('utf-8'))
+            if not str(m.get('format', '')).startswith('bpc-csms-backup/'):
+                problems.append('not a BPC CSMS backup (manifest format)')
+            names = set(z.namelist())
+            for f in m.get('files') or []:
+                if f['path'] not in names:
+                    problems.append(f"missing {f['path']}")
+                    continue
+                if _ops_hashlib.sha256(z.read(f['path'])).hexdigest() != f.get('sha256'):
+                    problems.append(f"checksum differs: {f['path']}")
+                if '..' in f['path'] or f['path'].startswith('/') or not f['path'].startswith('files/'):
+                    problems.append(f"unsafe path {f['path']}")
+            for coll, c in (m.get('collections') or {}).items():
+                arc = f'mongo/{coll}.jsonl'
+                if arc not in names:
+                    problems.append(f'missing {arc}')
+                    continue
+                h, n = _ops_hashlib.sha256(), 0
+                with z.open(arc) as r:
+                    for line in r:
+                        h.update(line)
+                        n += 1
+                if h.hexdigest() != c.get('sha256') or n != c.get('count'):
+                    problems.append(f'checksum / count differs: {arc}')
+    except Exception as e:
+        return {'ok': False, 'problems': [f'cannot read the backup: {type(e).__name__}: {e}'], 'manifest': None}
+    return {'ok': not problems, 'problems': problems, 'manifest': m}
+
+
+def ops_restore(path: str, apply: bool = False, db=None, data_dir: str = None, safety: dict = None) -> dict:
+    """Check a backup and say what it would change; apply=True writes it (after a pre-restore backup of the current data)."""
+    v = ops_backup_verify(path)
+    if not v['ok']:
+        return {'ok': False, 'problems': v['problems']}
+    m = v['manifest']
+    db = _db() if db is None else db
+    data_dir = data_dir or os.getcwd()
+    plan = {'files': [], 'collections': [], 'manifest': {k: m.get(k) for k in ('created', 'kind', 'version', 'mode', 'host', 'include_logs')}}
+    for f in m.get('files') or []:
+        rel = f['path'][len('files/'):]
+        dest = os.path.join(OPS_DIR, rel[len('ops_data/'):]) if rel.startswith('ops_data/') else os.path.join(data_dir, rel)
+        plan['files'].append({'path': rel, 'size': f['size'], 'exists': os.path.exists(dest),
+                              'same': os.path.exists(dest) and _ops_sha256(dest) == f['sha256']})
+    for coll, c in (m.get('collections') or {}).items():
+        now_n = None
+        if db is not None:
+            try:
+                now_n = db.db[coll].estimated_document_count()
+            except Exception:
+                now_n = None
+        plan['collections'].append({'name': coll, 'count': c.get('count'), 'now': now_n})
+    if m.get('collections') and db is None:
+        plan['warning'] = 'the backup holds MongoDB collections but this CSMS runs on JSON files - only the files are restored'
+    if not apply:
+        return {'ok': True, 'plan': plan}
+    safety = safety or ops_backup_create('pre-restore', include_logs=False, db=db)
+    moved_dir = os.path.join(ops_backup_dir(), 'replaced_' + ops_dt().strftime('%Y%m%d_%H%M%S'))
+    in_backup = {f['path'] for f in plan['files']}
+    if os.path.isdir(OPS_DIR):                         # ops files that are newer than the backup go aside (not deleted)
+        for name in os.listdir(OPS_DIR):
+            if name.endswith(('.json', '.jsonl')) and 'ops_data/' + name not in in_backup:
+                os.makedirs(moved_dir, exist_ok=True)
+                _ops_shutil.move(os.path.join(OPS_DIR, name), os.path.join(moved_dir, name))
+    ju = _ops_json_util()
+    with _ops_zip.ZipFile(path) as z:
+        for f in m.get('files') or []:
+            rel = f['path'][len('files/'):]
+            dest = os.path.join(OPS_DIR, rel[len('ops_data/'):]) if rel.startswith('ops_data/') else os.path.join(data_dir, rel)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            tmp = dest + '.restore'
+            with open(tmp, 'wb') as w:
+                w.write(z.read(f['path']))
+            os.replace(tmp, dest)
+        if db is not None:
+            for coll in (m.get('collections') or {}):
+                docs, n = [], 0
+                db.db[coll].delete_many({})
+                with z.open(f'mongo/{coll}.jsonl') as r:
+                    for line in r:
+                        line = line.decode('utf-8').strip()
+                        if not line:
+                            continue
+                        docs.append(ju.loads(line) if ju else json.loads(line))
+                        if len(docs) >= 1000:
+                            db.db[coll].insert_many(docs, ordered=False)
+                            n += len(docs)
+                            docs = []
+                if docs:
+                    db.db[coll].insert_many(docs, ordered=False)
+                    n += len(docs)
+    logger.warning(f"♻️ restored {os.path.basename(path)} ({len(plan['files'])} files, {len(plan['collections'])} collections); "
+                   f"previous data kept in {safety['name']}")
+    return {'ok': True, 'plan': plan, 'applied': True, 'safety_backup': safety['name'],
+            'moved_aside': moved_dir if os.path.isdir(moved_dir) else ''}
+
+
+def ops_restart_mode() -> str:
+    if os.environ.get('CSMS_LAUNCHER') == '1':
+        return 'launcher'
+    if os.environ.get('RENDER') or os.environ.get('RENDER_SERVICE_ID'):
+        return 'platform'
+    return 'manual'
+
+
+def ops_request_restart(delay: float = 1.5):
+    """Leave without saving anything (the restored data must not be overwritten by what is in memory)."""
+    _OPS_SRV['restoring'] = True
+    logger.warning(f"🔄 CSMS restarts in {delay:g} s ({ops_restart_mode()})")
+    asyncio.get_running_loop().call_later(delay, os._exit, OPS_RESTART_EXIT_CODE)
+
+
+# ---- measurements -----------------------------------------------------------------------------------------------------------
+def ops_mem_mb():
+    try:
+        import psutil
+        return round(psutil.Process().memory_info().rss / 1e6, 1)
+    except Exception:
+        pass
+    try:
+        with open('/proc/self/status') as f:
+            for line in f:
+                if line.startswith('VmRSS:'):
+                    return round(int(line.split()[1]) / 1000.0, 1)
+    except OSError:
+        pass
+    if os.name == 'nt':
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class _PMC(ctypes.Structure):
+                _fields_ = [('cb', wintypes.DWORD), ('PageFaultCount', wintypes.DWORD), ('PeakWorkingSetSize', ctypes.c_size_t),
+                            ('WorkingSetSize', ctypes.c_size_t), ('QuotaPeakPagedPoolUsage', ctypes.c_size_t),
+                            ('QuotaPagedPoolUsage', ctypes.c_size_t), ('QuotaPeakNonPagedPoolUsage', ctypes.c_size_t),
+                            ('QuotaNonPagedPoolUsage', ctypes.c_size_t), ('PagefileUsage', ctypes.c_size_t),
+                            ('PeakPagefileUsage', ctypes.c_size_t)]
+            pmc = _PMC()
+            pmc.cb = ctypes.sizeof(_PMC)
+            ctypes.windll.psapi.GetProcessMemoryInfo(ctypes.windll.kernel32.GetCurrentProcess(), ctypes.byref(pmc), pmc.cb)
+            return round(pmc.WorkingSetSize / 1e6, 1)
+        except Exception:
+            pass
+    return None
+
+
+def ops_cpu_pct():
+    t, cpu = _ops_time.time(), sum(os.times()[:2])
+    last = _OPS_SRV.get('cpu')
+    _OPS_SRV['cpu'] = (t, cpu) if not last or t - last[0] > 5 else last
+    if not last or t - last[0] < 1:
+        return None
+    return round(100.0 * (cpu - last[1]) / (t - last[0]), 1)
+
+
+def ops_lag_stats(window: float = 60.0) -> dict:
+    now = ops_now()
+    vals = sorted(l for t, l in _OPS_SRV['lag'] if t > now - window)
+    if not vals:
+        return {'max': None, 'p95': None, 'n': 0}
+    return {'max': round(vals[-1], 3), 'p95': round(vals[min(len(vals) - 1, int(len(vals) * 0.95))], 3), 'n': len(vals)}
+
+
+def ops_disk() -> dict:
+    try:
+        u = _ops_shutil.disk_usage(str(APP_DIR))
+        return {'total_gb': round(u.total / 1e9, 1), 'free_gb': round(u.free / 1e9, 2), 'free_pct': round(100.0 * u.free / max(1, u.total), 1)}
+    except Exception:
+        return {}
+
+
+def _ops_data_size() -> int:
+    total = 0
+    for arc, p in ops_backup_sources(True):
+        try:
+            total += os.path.getsize(p)
+        except OSError:
+            pass
+    return total
+
+
+def ops_ready_checks() -> dict:
+    """What /readyz reports: event loop, database, OCPP, last backup."""
+    now, cfg = ops_now(), ops_server_cfg()
+    lag = ops_lag_stats(30)
+    checks = {'event_loop': {'ok': lag['max'] is None or lag['max'] < float(cfg.get('lag_warn_s') or 2) * 2, 'lag_max_s': lag['max']}}
+    if DB_SETTINGS.get('type') == 'mongodb' and DB_SETTINGS.get('uri'):
+        checks['database'] = {'ok': _db() is not None and _OPS_SRV['db_ok'] is not False, 'mode': 'mongodb',
+                              'checked_s_ago': round(now - _OPS_SRV['db_checked']) if _OPS_SRV['db_checked'] else None}
+    else:
+        checks['database'] = {'ok': True, 'mode': 'json'}
+    checks['restoring'] = {'ok': not _OPS_SRV['restoring']}
+    return checks
+
+
+async def ops_healthz(request):
+    return web.json_response({'status': 'ok', 'version': OPS_VERSION, 'uptime_s': round(ops_now() - _OPS_SRV['started'])},
+                             headers={'Cache-Control': 'no-store'})
+
+
+async def ops_readyz(request):
+    checks = ops_ready_checks()
+    ok = all(c.get('ok') for c in checks.values())
+    return web.json_response({'status': 'ready' if ok else 'not ready', 'version': OPS_VERSION, 'checks': checks,
+                              'chargers_online': len(app_state.charge_points)}, status=200 if ok else 503,
+                             headers={'Cache-Control': 'no-store'})
+
+
+# ---- background ------------------------------------------------------------------------------------------------------------
+async def ops_lag_loop():
+    loop = asyncio.get_running_loop()
+    while True:
+        t = loop.time()
+        await asyncio.sleep(0.5)
+        _OPS_SRV['lag'].append((ops_now(), max(0.0, loop.time() - t - 0.5)))
+
+OPS_TASKS.append(ops_lag_loop)
+
+
+async def ops_db_check_loop():
+    while True:
+        db = _db()
+        if db is not None:
+            def _ping():
+                db.db.client.admin.command('ping')
+            try:
+                await asyncio.wait_for(asyncio.to_thread(_ping), 15)
+                _OPS_SRV['db_ok'], _OPS_SRV['db_err'] = True, ''
+            except Exception as e:
+                _OPS_SRV['db_ok'], _OPS_SRV['db_err'] = False, f'{type(e).__name__}: {str(e)[:160]}'
+            _OPS_SRV['db_checked'] = ops_now()
+        await asyncio.sleep(30)
+
+OPS_TASKS.append(ops_db_check_loop)
+
+
+async def ops_backup_now(kind: str, include_logs=None) -> dict:
+    if _OPS_SRV['backup_running']:
+        raise RuntimeError('a backup is running already')
+    _OPS_SRV['backup_running'] = True
+    try:
+        if _db() is None:
+            try:
+                db_sync_everything(False)               # JSON mode: the files are written now (nothing waits in memory)
+            except Exception as e:
+                logger.error(f"ops: saving before the backup failed: {e}")
+        info = await asyncio.to_thread(ops_backup_create, kind, include_logs)
+        _OPS_SRV['last_backup'] = dict(info, ok=True, t=ops_now())
+        if kind == 'auto':
+            info['pruned'] = await asyncio.to_thread(ops_backup_prune, ops_int(ops_server_cfg().get('backup_keep'), 14, 1, 365))
+        return info
+    except Exception as e:
+        _OPS_SRV['last_backup'] = {'ok': False, 'error': f'{type(e).__name__}: {e}', 't': ops_now(), 'kind': kind}
+        logger.error(f"ops: backup failed: {e}")
+        raise
+    finally:
+        _OPS_SRV['backup_running'] = False
+
+
+async def ops_backup_loop():
+    while True:
+        await asyncio.sleep(30)
+        cfg = ops_server_cfg()
+        if not cfg.get('backup_on'):
+            continue
+        hm = _ops_free_hm(cfg.get('backup_time')) if '_ops_free_hm' in globals() else None
+        if hm is None:
+            continue
+        now = ops_dt()
+        if now.hour * 60 + now.minute < hm:
+            continue
+        today = now.strftime('%Y%m%d')
+        if any(b['name'].startswith(f'csms_backup_{today}_') and b['name'].endswith('_auto.zip') for b in ops_backup_list()):
+            continue
+        last = _OPS_SRV.get('last_backup') or {}
+        if not last.get('ok', True) and last.get('kind') == 'auto' and ops_now() - last.get('t', 0) < 1800:
+            continue                                   # failed less than 30 min ago: wait before trying again
+        try:
+            await ops_backup_now('auto')
+        except Exception:
+            pass
+
+OPS_TASKS.append(ops_backup_loop)
+
+
+def _ops_server_issues(add, now):
+    cfg = ops_server_cfg()
+    if DB_SETTINGS.get('type') == 'mongodb' and DB_SETTINGS.get('uri'):
+        if _db() is None:
+            add('server', 'CSMS', 0, 'critical', _OPS_SRV['started'], 'Database not connected - running on the JSON files')
+        elif _OPS_SRV['db_ok'] is False:
+            add('server', 'CSMS', 0, 'critical', _OPS_SRV['db_checked'], 'Database not answering: {e}', e=_OPS_SRV['db_err'])
+    lag = ops_lag_stats(60)
+    warn = float(cfg.get('lag_warn_s') or 2)
+    if lag['n'] and sum(1 for t, l in _OPS_SRV['lag'] if t > now - 60 and l > warn) >= 3:
+        add('server', 'CSMS', 1, 'major', now - 60, 'Server slow: event loop delays up to {s} s', s=lag['max'])
+    d = ops_disk()
+    if d and (d.get('free_gb', 99) < float(cfg.get('disk_min_gb') or 1) or d.get('free_pct', 99) < 5):
+        add('server', 'CSMS', 2, 'major', now, 'Disk almost full: {f} GB free', f=d.get('free_gb'))
+    mem, lim = ops_mem_mb(), float(cfg.get('mem_limit_mb') or 0)
+    if mem and lim and mem > 0.85 * lim:
+        add('server', 'CSMS', 3, 'minor', now, 'Memory {m} MB of {l} MB', m=mem, l=lim)
+    lb = _OPS_SRV.get('last_backup') or {}
+    if cfg.get('backup_on') and lb and not lb.get('ok', True):
+        add('server', 'CSMS', 4, 'minor', lb.get('t') or now, 'Backup failed: {e}', e=lb.get('error', ''))
+
+OPS_ISSUE_PROVIDERS.append(_ops_server_issues)
+OPS_ISSUE_TITLES['server'] = 'CSMS server'
+OPS_ALERT_RULES_DEFAULT['server'] = {'on': True, 'sev': 'auto', 'delay_min': 0, 'notify': True, 'ticket': False}
+
+
+def _ops_server_startup():
+    def _md5():
+        try:
+            src = sys.argv[0] if FROZEN else __file__
+            h = _ops_hashlib.md5()
+            with open(src, 'rb') as f:
+                for chunk in iter(lambda: f.read(1 << 20), b''):
+                    h.update(chunk)
+            _OPS_SRV['md5'] = h.hexdigest()
+        except Exception:
+            _OPS_SRV['md5'] = ''
+    _ops_threading.Thread(target=_md5, daemon=True).start()
+
+OPS_STARTUP.append(_ops_server_startup)
+
+
+# ---- API ---------------------------------------------------------------------------------------------------------------------
+async def ops_api_server(request):
+    now, cfg = ops_now(), ops_server_cfg()
+    db_writer = None
+    try:
+        db_writer = _db().writer.q.qsize() if _db() is not None else None
+    except Exception:
+        db_writer = None
+    data = {'version': OPS_VERSION, 'md5': _OPS_SRV.get('md5'), 'features': OPS_FEATURES, 'started': _OPS_SRV['started'],
+            'uptime_s': round(now - _OPS_SRV['started']), 'python': sys.version.split()[0], 'platform': _ops_platform.platform()[:80],
+            'pid': os.getpid(), 'frozen': FROZEN, 'mem_mb': ops_mem_mb(), 'cpu_pct': ops_cpu_pct(), 'lag': ops_lag_stats(60),
+            'lag_series': [(round(t), round(l, 3)) for t, l in list(_OPS_SRV['lag'])[-120:]], 'disk': ops_disk(),
+            'data_bytes': await asyncio.to_thread(_ops_data_size), 'chargers_online': len(app_state.charge_points),
+            'web_clients': len(getattr(app_state, 'web_clients', []) or []), 'sessions': len(ACTIVE_SESSIONS),
+            'db': {'mode': DB_STATE.get('source'), 'error': DB_STATE.get('error'), 'ok': _OPS_SRV['db_ok'], 'err': _OPS_SRV['db_err'],
+                   'checked': _OPS_SRV['db_checked'], 'queue': db_writer, 'name': DB_SETTINGS.get('db_name') if _db() is not None else None},
+            'restart_mode': ops_restart_mode(), 'ready': ops_ready_checks(), 'cfg': {k: cfg.get(k) for k in OPS_SERVER_DEFAULTS},
+            'backups': await asyncio.to_thread(ops_backup_list), 'backup_dir': ops_backup_dir(), 'last_backup': _OPS_SRV.get('last_backup'),
+            'backup_running': _OPS_SRV['backup_running'], 'now': now,
+            'last_restore': _app_json_load(_ops_last_restore_path(), None)}
+    return ops_json(data)
+
+
+async def ops_api_server_config(request):
+    b = await ops_body(request)
+    cfg = ops_server_cfg()
+    if 'backup_on' in b:
+        cfg['backup_on'] = bool(b['backup_on'])
+    if 'backup_logs' in b:
+        cfg['backup_logs'] = bool(b['backup_logs'])
+    if 'backup_time' in b:
+        v = str(b['backup_time'] or '').strip()[:5]
+        if _ops_re.match(r'^\d{1,2}:\d{2}$', v) is None or int(v.split(':')[0]) > 23 or int(v.split(':')[1]) > 59:
+            return ops_err('backup time: HH:MM (Bhutan Time)')
+        cfg['backup_time'] = v.zfill(5)
+    if 'backup_keep' in b:
+        cfg['backup_keep'] = ops_int(b['backup_keep'], 14, 1, 365)
+    if 'backup_dir' in b:
+        d = str(b['backup_dir'] or '').strip()[:300] or 'backups'
+        if '..' in d.replace('\\', '/').split('/'):
+            return ops_err('backup folder: no ".." please')
+        cfg['backup_dir'] = d
+    for k, lo, hi in (('mem_limit_mb', 0, 1000000), ('disk_min_gb', 0, 10000), ('lag_warn_s', 0.2, 60)):
+        if k in b:
+            try:
+                cfg[k] = max(lo, min(hi, float(b[k] or 0)))
+            except (TypeError, ValueError):
+                return ops_err(f'{k}: a number please')
+    ops_settings.save()
+    return ops_json({'ok': True, 'cfg': {k: cfg.get(k) for k in OPS_SERVER_DEFAULTS}})
+
+
+async def ops_api_backup_now(request):
+    b = await ops_body(request)
+    try:
+        info = await ops_backup_now('manual', b.get('include_logs'))
+    except Exception as e:
+        return ops_err(f'Backup failed: {e}', 500)
+    return ops_json({'ok': True, 'backup': {k: v for k, v in info.items() if k != 'path'}})
+
+
+def _ops_backup_path(name: str):
+    name = os.path.basename(str(name or ''))
+    if not OPS_BACKUP_RE.match(name):
+        return None
+    p = os.path.join(ops_backup_dir(), name)
+    return p if os.path.isfile(p) else None
+
+
+async def ops_api_backup_download(request):
+    p = _ops_backup_path(request.query.get('name'))
+    if p is None:
+        return ops_err('No such backup', 404)
+    ops_audit(ops_request_user(request).get('username', '?'), 'backup downloaded', role='admin', ip=_client_ip(request),
+              method='GET', path=request.path, status=200, detail={'name': os.path.basename(p)})
+    return web.FileResponse(p, headers={'Content-Disposition': f'attachment; filename="{os.path.basename(p)}"',
+                                        'Content-Type': 'application/zip', 'Cache-Control': 'no-store'})
+
+
+async def ops_api_backup_delete(request):
+    b = await ops_body(request)
+    p = _ops_backup_path(b.get('name'))
+    if p is None:
+        return ops_err('No such backup', 404)
+    os.remove(p)
+    return ops_json({'ok': True})
+
+
+async def ops_api_backup_upload(request):
+    """multipart/form-data 'file' = a backup zip -> saved as csms_backup_<now>_uploaded.zip after it was checked."""
+    reader = await request.multipart()
+    part = await reader.next()
+    if part is None or part.name != 'file':
+        return ops_err('Send the backup as the form field "file"')
+    os.makedirs(ops_backup_dir(), exist_ok=True)
+    name = 'csms_backup_%s_uploaded.zip' % ops_dt().strftime('%Y%m%d_%H%M%S')
+    p = os.path.join(ops_backup_dir(), name)
+    size = 0
+    with open(p + '.part', 'wb') as f:
+        while True:
+            chunk = await part.read_chunk(1 << 20)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > 2 * 1024 ** 3:
+                f.close()
+                os.remove(p + '.part')
+                return ops_err('The file is larger than 2 GB', 413)
+            f.write(chunk)
+    v = await asyncio.to_thread(ops_backup_verify, p + '.part')
+    if not v['ok']:
+        os.remove(p + '.part')
+        return ops_err('Not a valid backup: ' + '; '.join(v['problems'][:5]))
+    os.replace(p + '.part', p)
+    return ops_json({'ok': True, 'name': name})
+
+
+_ops_orig_sync_everything = db_sync_everything
+
+
+def db_sync_everything(force_files: bool = False):
+    """[OPS] v1.9: while a restore is written nothing in memory may be saved over it (also not by the shutdown flush)."""
+    if _OPS_SRV.get('restoring'):
+        logger.warning('restore in progress - the in-memory data is not saved')
+        return []
+    return _ops_orig_sync_everything(force_files)
+
+
+def _ops_last_restore_path() -> str:
+    return os.path.join(ops_backup_dir(), 'last_restore.json')
+
+
+async def ops_api_restore(request):
+    """{name, apply: false} = check + what would change; {name, apply: true, confirm: 'RESTORE'} = restore, then the CSMS
+    leaves at once (no answer) and is started again by the launcher / the hosting platform."""
+    b = await ops_body(request)
+    p = _ops_backup_path(b.get('name'))
+    if p is None:
+        return ops_err('No such backup', 404)
+    if not b.get('apply'):
+        return ops_json(await asyncio.to_thread(ops_restore, p, False))
+    if str(b.get('confirm') or '') != 'RESTORE':
+        return ops_err('Type RESTORE to confirm')
+    if _OPS_SRV['backup_running']:
+        return ops_err('A backup is running - try again in a moment', 409)
+    v = await asyncio.to_thread(ops_backup_verify, p)
+    if not v['ok']:
+        return ops_err('Not a valid backup: ' + '; '.join(v['problems'][:5]))
+    who = ops_request_user(request).get('username', '?')
+    _OPS_SRV['backup_running'] = True
+    try:
+        safety = await asyncio.to_thread(ops_backup_create, 'pre-restore', False)
+    finally:
+        _OPS_SRV['backup_running'] = False
+    ops_audit(who, 'backup restored', role='admin', ip=_client_ip(request), method='POST', path=request.path, status=200,
+              detail={'name': os.path.basename(p), 'safety_backup': safety['name']})
+    # from here on nothing else may write: the event loop is held by this call and the database writer is stopped
+    _OPS_SRV['restoring'] = True
+    db = _db()
+    if db is not None:
+        try:
+            db.writer.put = lambda *a, **k: None
+            while not db.writer.q.empty():
+                db.writer.q.get_nowait()
+            _ops_time.sleep(1.0)
+        except Exception as e:
+            logger.error(f"ops: stopping the database writer failed: {e}")
+    try:
+        res = ops_restore(p, True, db=db, safety=safety)
+    except Exception as e:
+        res = {'ok': False, 'problems': [f'{type(e).__name__}: {e}']}
+        logger.error(f"ops: restore failed: {e}")
+    res['restart_mode'] = ops_restart_mode()
+    try:
+        _app_atomic_write(_ops_last_restore_path(), {'t': ops_now(), 'name': os.path.basename(p), 'by': who, 'ok': res.get('ok'),
+                                                     'safety_backup': safety['name'], 'problems': res.get('problems') or [],
+                                                     'files': len((res.get('plan') or {}).get('files') or []),
+                                                     'collections': len((res.get('plan') or {}).get('collections') or [])})
+    except Exception:
+        pass
+    if b.get('restart', True):
+        logger.warning('♻️ restore written - the CSMS restarts now')
+        for h in logging.getLogger().handlers:
+            try:
+                h.flush()
+            except Exception:
+                pass
+        os._exit(OPS_RESTART_EXIT_CODE)
+    return ops_json(res)
+
+
+async def ops_api_server_restart(request):
+    if ops_restart_mode() == 'manual':
+        return ops_err('This CSMS was not started by the launcher or a hosting platform - restart it by hand', 409)
+    ops_audit(ops_request_user(request).get('username', '?'), 'server restart', role='admin', ip=_client_ip(request), method='POST',
+              path=request.path, status=200)
+    try:
+        db_sync_everything(False)
+    except Exception as e:
+        logger.error(f"ops: saving before the restart failed: {e}")
+    ops_request_restart(1.5)
+    return ops_json({'ok': True, 'restart_mode': ops_restart_mode()})
+
+
+OPS_ROUTES += [
+    ('GET', '/healthz', ops_healthz), ('GET', '/readyz', ops_readyz),
+    ('GET', '/api/ops/server', ops_api_server), ('POST', '/api/ops/server/config', ops_api_server_config),
+    ('POST', '/api/ops/server/backup', ops_api_backup_now), ('GET', '/api/ops/server/backup/download', ops_api_backup_download),
+    ('POST', '/api/ops/server/backup/delete', ops_api_backup_delete), ('POST', '/api/ops/server/backup/upload', ops_api_backup_upload),
+    ('POST', '/api/ops/server/restore', ops_api_restore), ('POST', '/api/ops/server/restart', ops_api_server_restart),
+]
+
+
+# ---- command line: python csms_web_ui_flexxfast1.py --backup [file.zip] | --verify-backup f.zip | --restore f.zip [--yes] -----
+def ops_cli(argv: List[str]) -> int:
+    def arg_after(flag):
+        i = argv.index(flag)
+        return argv[i + 1] if i + 1 < len(argv) and not argv[i + 1].startswith('--') else ''
+    db = None
+    settings = db_load_settings()
+    if settings.get('type') == 'mongodb' and settings.get('uri') and '--json-only' not in argv:
+        try:
+            db = db_connect(settings)
+            print(f"MongoDB {settings.get('db_name') or 'bpc_csms'}: connected")
+        except Exception as e:
+            print(f'MongoDB not reachable ({e}) - files only')
+            db = None
+    ops_settings.load()
+    if '--backup' in argv:
+        target = arg_after('--backup')
+        if '--db-only' in argv and db is None:
+            print('--db-only: no database configured (database.json / CSMS_MONGODB_URI)')
+            return 2
+        info = ops_backup_create('cli', include_logs='--include-logs' in argv, db=db, files='--db-only' not in argv,
+                                 out_dir=os.path.dirname(os.path.abspath(target)) if target else None)
+        if target:
+            os.replace(info['path'], os.path.abspath(target))
+            info['path'] = os.path.abspath(target)
+        print(f"backup written: {info['path']} ({info['files']} files, {sum(info['collections'].values())} documents, "
+              f"{info['size'] / 1e6:.1f} MB)")
+        return 0
+    if '--verify-backup' in argv:
+        v = ops_backup_verify(arg_after('--verify-backup'))
+        m = v.get('manifest') or {}
+        print(('OK' if v['ok'] else 'PROBLEMS') + f" - created {m.get('created')}, version {m.get('version')}, mode {m.get('mode')}, "
+              f"{len(m.get('files') or [])} files, {len(m.get('collections') or {})} collections")
+        for p in v['problems']:
+            print('  - ' + p)
+        return 0 if v['ok'] else 2
+    if '--restore' in argv:
+        path = arg_after('--restore')
+        r = ops_restore(path, False, db=db)
+        if not r.get('ok'):
+            print('cannot restore: ' + '; '.join(r.get('problems') or []))
+            return 2
+        plan = r['plan']
+        print(f"backup of {plan['manifest'].get('created')} (version {plan['manifest'].get('version')}, {plan['manifest'].get('mode')})")
+        for f in plan['files']:
+            print(f"  file  {f['path']:<40} {'same' if f['same'] else ('replace' if f['exists'] else 'new')}")
+        for c in plan['collections']:
+            print(f"  coll  {c['name']:<40} {c['count']} documents (now {c['now']})")
+        if plan.get('warning'):
+            print('  ! ' + plan['warning'])
+        if '--yes' not in argv:
+            print('Stop the CSMS first, then run again with --yes to restore.')
+            return 0
+        r = ops_restore(path, True, db=db)
+        print(f"restored. The previous data is in {r.get('safety_backup')}" + (f" and {r['moved_aside']}" if r.get('moved_aside') else ''))
+        return 0
+    return 1
+
+OPS_CSS_PARTS.append(r'''/* [OPS] v1.9 server tab */
+#view-server table.ops-table th { text-align: left; white-space: nowrap; color: var(--text-dim); font-weight: 600; width: 1%; padding-right: 1rem; }
+.ops-sv-lag svg { width: 100%; height: 70px; display: block; margin-top: 0.6rem; }
+.ops-sv-lag .muted { font-size: 0.72rem; }
+.ops-sv-info { font-size: 0.8rem; line-height: 1.6; margin: 0.2rem 0 0.6rem; }
+#svUploadL { cursor: pointer; }
+.tb-btn.danger { background: #dc2626; color: #fff; border-color: #dc2626; }
+''')
+OPS_JS_PARTS.append(r'''/* [OPS] 🖥️ Server tab (v1.9): status, readiness checks, backups + checked restore (admin) */
+(function () {
+    'use strict';
+    const OPS = window.OPS;
+    if (!OPS) return;
+    const V = {data: null};
+    OPS.ISSUE_KINDS = OPS.ISSUE_KINDS || {};
+    OPS.ISSUE_KINDS.server = 'CSMS server';
+    const td = (l, h, c) => OPS.td(l, h, c);
+    const mb = b => (b == null ? '—' : (b >= 1e9 ? OPS.num(b / 1e9, 2) + ' GB' : (b >= 1e6 ? OPS.num(b / 1e6, 1) + ' MB' : OPS.num(b / 1e3, 0) + ' kB')));
+    const yes = ok => (ok ? '<span class="ops-ok">✅ ' + OPS.t('OK') + '</span>' : '<span class="ops-bad">⚠️ ' + OPS.t('Problem') + '</span>');
+
+    function build(v) {
+        v.dataset.built = '1';
+        v.innerHTML = '<section class="kpis ops-kpis">' + OPS.kpi('info', 'Running for', 'svKUp', '') + OPS.kpi('info', 'Version', 'svKVer', '') +
+            OPS.kpi('info', 'Memory', 'svKMem', '') + OPS.kpi('good', 'Event loop delay', 'svKLag', 'last minute, max') + OPS.kpi('info', 'Database', 'svKDb', '') +
+            OPS.kpi('info', 'Disk free', 'svKDisk', '') + '</section>' +
+            '<section class="pay-panel ops-panel"><div class="ops-head"><h3>' + OPS.t('🖥️ Server') + '</h3><div class="ops-actions">' +
+            '<a class="tb-btn" href="/healthz" target="_blank" rel="noopener">/healthz</a><a class="tb-btn" href="/readyz" target="_blank" rel="noopener">/readyz</a>' +
+            '<button class="tb-btn" id="svRestart">' + OPS.t('🔄 Restart the CSMS') + '</button></div></div>' +
+            '<div class="ops-grid2"><div><table class="fleet-table ops-table" id="svFacts"></table></div><div><h4>' + OPS.t('Ready checks') + '</h4><table class="fleet-table ops-table" id="svChecks"></table>' +
+            '<div class="ops-sv-lag" id="svLagChart"></div></div></div>' +
+            '<div class="pay-help">' + OPS.t('/healthz answers while the program runs (for the hosting platform); /readyz also checks the database and the event loop (for monitors and load balancers). Server problems also appear in the Health tab as "CSMS server" and can raise alerts.') + '</div></section>' +
+            '<section class="pay-panel ops-panel"><div class="ops-head"><h3>' + OPS.t('💾 Backups') + '</h3><div class="ops-actions">' +
+            '<button class="tb-btn primary" id="svBackup">' + OPS.t('💾 Back up now') + '</button>' +
+            '<label class="tb-btn" id="svUploadL">' + OPS.t('⬆️ Upload a backup') + '<input type="file" id="svUpload" accept=".zip" hidden></label>' +
+            '<button class="tb-btn" id="svBkCfg">' + OPS.t('⚙️ Settings') + '</button></div></div>' +
+            '<div id="svBkInfo" class="ops-sv-info"></div><div class="ops-table-wrap ops-tall"><table class="fleet-table ops-table ops-cards" id="svBackups"></table></div>' +
+            '<div class="pay-help">' + OPS.t('A backup holds every data file (stations, cards, payments, customers, users, history, settings) and, with MongoDB, every collection, with a checksum per part. The database address and the console password are never in a backup. Restoring first saves the current data as a "pre-restore" backup, then writes the backup and restarts the CSMS. Keep copies of the backups off this server as well.') + '</div></section>';
+        OPS.$('svBackup').onclick = backupNow;
+        OPS.$('svBkCfg').onclick = settings;
+        OPS.$('svRestart').onclick = restart;
+        OPS.$('svUpload').onchange = upload;
+        v.addEventListener('click', onClick);
+    }
+
+    async function load() {
+        try { V.data = await OPS.api('/api/ops/server'); } catch (e) { return OPS.fail(e); }
+        render();
+    }
+
+    function lagChart(series) {
+        if (!series || series.length < 2) return '';
+        const W = 360, H = 70, max = Math.max(0.05, ...series.map(x => x[1]));
+        const pts = series.map((x, i) => (i * W / (series.length - 1)).toFixed(1) + ',' + (H - 4 - (H - 8) * x[1] / max).toFixed(1)).join(' ');
+        return '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none"><polyline fill="none" stroke="#2a78d6" stroke-width="1.5" points="' + pts + '"/></svg>' +
+            '<div class="muted">' + OPS.t('event loop delay, last minute (max {m} s)', {m: OPS.num(max, 3)}) + '</div>';
+    }
+
+    function render() {
+        const d = V.data;
+        OPS.$('svKUp').textContent = OPS.dur(d.uptime_s);
+        OPS.$('svKVer').textContent = d.version;
+        OPS.$('svKVerSub').textContent = (d.md5 || '').slice(0, 10);
+        OPS.$('svKMem').innerHTML = d.mem_mb == null ? '—' : OPS.num(d.mem_mb, 0) + ' <small>MB</small>';
+        OPS.$('svKMemSub').textContent = d.cpu_pct == null ? '' : OPS.tx('CPU {c}%', {c: OPS.num(d.cpu_pct, 0)});
+        OPS.$('svKLag').innerHTML = d.lag.max == null ? '—' : OPS.num(d.lag.max * 1000, 0) + ' <small>ms</small>';
+        OPS.$('svKDb').innerHTML = d.db.mode === 'mongodb' ? (d.db.ok === false ? '<span class="ops-bad">MongoDB ⚠️</span>' : 'MongoDB') : OPS.t('JSON files');
+        OPS.$('svKDbSub').textContent = d.db.mode === 'mongodb' ? (d.db.err || (d.db.queue != null ? OPS.tx('{n} writes waiting', {n: d.db.queue}) : '')) : (d.db.error || '');
+        OPS.$('svKDisk').innerHTML = d.disk.free_gb == null ? '—' : OPS.num(d.disk.free_gb, 1) + ' <small>GB</small>';
+        OPS.$('svKDiskSub').textContent = d.disk.free_pct == null ? '' : OPS.tx('{p}% of {t} GB', {p: OPS.num(d.disk.free_pct, 0), t: OPS.num(d.disk.total_gb, 0)});
+        const facts = [['Version', d.version + ' · ' + (d.md5 || '')], ['Started', OPS.fmt(d.started, true)], ['Python', d.python + (d.frozen ? ' (exe)' : '')],
+            ['Platform', d.platform], ['Process id', d.pid], ['Chargers online', d.chargers_online], ['Console sessions', d.sessions + ' · ' + OPS.tx('{n} live screens', {n: d.web_clients})],
+            ['Data size', mb(d.data_bytes)], ['Restart', OPS.tx({launcher: 'by the launcher', platform: 'by the hosting platform', manual: 'by hand (no launcher)'}[d.restart_mode] || d.restart_mode)],
+            ['Features', (d.features || []).join(', ')]];
+        OPS.$('svFacts').innerHTML = '<tbody>' + facts.map(f => '<tr><th>' + OPS.t(f[0]) + '</th><td>' + OPS.esc(f[1]) + '</td></tr>').join('') + '</tbody>';
+        const ck = d.ready || {};
+        OPS.$('svChecks').innerHTML = '<tbody>' + Object.keys(ck).map(k => '<tr><th>' + OPS.t({event_loop: 'Event loop', database: 'Database', restoring: 'Not restoring'}[k] || k) + '</th><td>' +
+            yes(ck[k].ok) + (ck[k].lag_max_s != null ? ' <span class="muted">' + OPS.num(ck[k].lag_max_s * 1000, 0) + ' ms</span>' : '') +
+            (ck[k].mode ? ' <span class="muted">' + OPS.esc(ck[k].mode) + '</span>' : '') + '</td></tr>').join('') + '</tbody>';
+        OPS.$('svLagChart').innerHTML = lagChart(d.lag_series);
+        OPS.$('svRestart').style.display = d.restart_mode === 'manual' ? 'none' : '';
+        const c = d.cfg, lb = d.last_backup, lr = d.last_restore;
+        OPS.$('svBkInfo').innerHTML = (c.backup_on ? OPS.t('Automatic backup every day at {t} (Bhutan Time), the last {k} are kept', {t: OPS.esc(c.backup_time), k: c.backup_keep})
+            : '<span class="ops-warn">' + OPS.t('Automatic backups are off') + '</span>') + ' · ' + OPS.t('folder {d}', {d: d.backup_dir}) +
+            (lb ? '<br>' + (lb.ok ? OPS.t('Last backup: {n}', {n: OPS.esc(lb.name)}) : '<span class="ops-bad">' + OPS.t('Last backup failed: {e}', {e: OPS.esc(lb.error)}) + '</span>') : '') +
+            (lr ? '<br>' + (lr.ok ? '♻️ ' + OPS.t('Restored {n} on {t} by {b} (previous data: {s})', {n: OPS.esc(lr.name), t: OPS.fmt(lr.t), b: OPS.esc(lr.by), s: OPS.esc(lr.safety_backup)})
+                : '<span class="ops-bad">' + OPS.t('Restore of {n} failed: {e}', {n: OPS.esc(lr.name), e: OPS.esc((lr.problems || []).join('; '))}) + '</span>') : '') +
+            (d.backup_running ? '<br><span class="ops-info">⏳ ' + OPS.t('Backup running…') + '</span>' : '');
+        const KIND = {auto: 'automatic', manual: 'by hand', cli: 'command line', 'pre-restore': 'before a restore', uploaded: 'uploaded'};
+        OPS.$('svBackups').innerHTML = '<thead><tr><th>' + OPS.t('Backup') + '</th><th>' + OPS.t('Made') + '</th><th>' + OPS.t('Contents') + '</th><th>' + OPS.t('Size') + '</th><th></th></tr></thead><tbody>' +
+            (d.backups.map(b => {
+                const docs = Object.values(b.collections || {}).reduce((a, x) => a + (x || 0), 0);
+                return '<tr>' + td('Backup', '<b>' + OPS.esc(b.name) + '</b><br><span class="muted">' + OPS.t(KIND[b.kind] || b.kind || '') + (b.version ? ' · v' + OPS.esc(b.version) : '') + '</span>') +
+                    td('Made', OPS.esc((b.created || '').replace('T', ' ').slice(0, 19))) +
+                    td('Contents', b.error ? '<span class="ops-bad">' + OPS.esc(b.error) + '</span>' : OPS.t('{f} files', {f: b.files}) + (b.mode === 'mongodb' ? ' · ' + OPS.t('{d} database documents', {d: docs}) : '')) +
+                    td('Size', mb(b.size)) + td('', '<div class="ops-btns"><a class="tb-btn ops-mini" href="/api/ops/server/backup/download?name=' + encodeURIComponent(b.name) + '">' + OPS.t('⬇️ Download') + '</a>' +
+                        '<button class="tb-btn ops-mini" data-sv="restore" data-n="' + OPS.esc(b.name) + '">' + OPS.t('♻️ Restore…') + '</button>' +
+                        '<button class="tb-btn ops-mini" data-sv="del" data-n="' + OPS.esc(b.name) + '">🗑️</button></div>') + '</tr>';
+            }).join('') || '<tr><td colspan="5" class="muted">' + OPS.t('No backup yet') + '</td></tr>') + '</tbody>';
+    }
+
+    async function backupNow() {
+        const btn = OPS.$('svBackup');
+        btn.disabled = true;
+        try {
+            const j = await OPS.post('/api/ops/server/backup', {});
+            OPS.toast(OPS.tx('Backup {n} made', {n: j.backup.name}), 'success');
+        } catch (e) { OPS.fail(e); }
+        btn.disabled = false;
+        load();
+    }
+
+    async function upload() {
+        const f = OPS.$('svUpload').files[0];
+        if (!f) return;
+        const fd = new FormData();
+        fd.append('file', f);
+        try {
+            const r = await fetch('/api/ops/server/backup/upload', {method: 'POST', body: fd, credentials: 'same-origin'});
+            const j = await r.json();
+            if (!r.ok) throw new Error(j.error || r.status);
+            OPS.toast(OPS.tx('Backup uploaded as {n}', {n: j.name}), 'success');
+        } catch (e) { OPS.toast(String(e.message || e), 'error'); }
+        OPS.$('svUpload').value = '';
+        load();
+    }
+
+    async function onClick(e) {
+        const b = e.target.closest('[data-sv]');
+        if (!b) return;
+        const n = b.dataset.n;
+        if (b.dataset.sv === 'del') {
+            if (!OPS.confirm('Delete backup {n}?', {n: n})) return;
+            try { await OPS.post('/api/ops/server/backup/delete', {name: n}); } catch (err) { OPS.fail(err); }
+            return load();
+        }
+        if (b.dataset.sv === 'restore') return restoreDialog(n);
+    }
+
+    async function restoreDialog(name) {
+        let r;
+        try { r = await OPS.post('/api/ops/server/restore', {name: name, apply: false}); } catch (e) { return OPS.fail(e); }
+        if (!r.ok) return OPS.toast(OPS.tx('Not a valid backup: {p}', {p: (r.problems || []).join('; ')}), 'error');
+        const p = r.plan, m = p.manifest;
+        const ch = p.files.filter(f => !f.same).length;
+        const html = '<p>' + OPS.t('Backup of {t} (version {v}, {m}).', {t: OPS.esc((m.created || '').replace('T', ' ').slice(0, 19)), v: OPS.esc(m.version), m: OPS.esc(m.mode)}) + '</p>' +
+            '<p>' + OPS.t('{n} files - {c} differ from the data now.', {n: p.files.length, c: ch}) + '</p>' +
+            (p.collections.length ? '<table class="fleet-table ops-table"><thead><tr><th>' + OPS.t('Collection') + '</th><th>' + OPS.t('In the backup') + '</th><th>' + OPS.t('Now') + '</th></tr></thead><tbody>' +
+                p.collections.map(c => '<tr><td>' + OPS.esc(c.name) + '</td><td>' + c.count + '</td><td>' + (c.now == null ? '—' : c.now) + '</td></tr>').join('') + '</tbody></table>' : '') +
+            (p.warning ? '<p class="ops-warn">' + OPS.esc(p.warning) + '</p>' : '') +
+            '<p class="ops-bad">' + OPS.t('Everything changed since this backup is replaced (the current data is saved first as a "pre-restore" backup). The CSMS restarts and everyone signs in again.') + '</p>' +
+            '<div class="ops-form"><label class="wide">' + OPS.t('Type RESTORE to confirm') + '<input class="tb-inp" id="svConfirm" autocomplete="off"></label></div>';
+        OPS.modal('♻️ Restore {n}', html, [{label: 'Cancel'}, {label: '♻️ Restore now', cls: 'danger', run: async box => {
+            const c = box.querySelector('#svConfirm').value.trim();
+            if (c !== 'RESTORE') { OPS.toast(OPS.tx('Type RESTORE to confirm'), 'error'); return false; }
+            try { await fetch('/api/ops/server/restore', {method: 'POST', credentials: 'same-origin', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({name: name, apply: true, confirm: 'RESTORE'})}); } catch (e) { /* the CSMS leaves at once */ }
+            waitRestart();
+            return true;
+        }}], {vars: {n: name}, wide: true});
+    }
+
+    function waitRestart() {
+        const w = OPS.modal('🔄 The CSMS is restarting', '<p id="svWait">' + OPS.t('Waiting for the CSMS…') + '</p>', [{label: 'Close'}]);
+        const t0 = Date.now();
+        const tick = async () => {
+            try {
+                const r = await fetch('/healthz', {cache: 'no-store'});
+                const j = await r.json();
+                if (r.ok && j.uptime_s < (Date.now() - t0) / 1000 + 5) { location.href = '/login'; return; }
+            } catch (e) { /* not back yet */ }
+            const el = w.querySelector('#svWait');
+            if (el) el.textContent = OPS.tx('Waiting for the CSMS… {s} s', {s: Math.round((Date.now() - t0) / 1000)}) + (Date.now() - t0 > 60000 ? ' - ' + OPS.tx('if it was started by hand, start it again') : '');
+            setTimeout(tick, 2000);
+        };
+        setTimeout(tick, 2500);
+    }
+
+    async function restart() {
+        if (!OPS.confirm('Restart the CSMS now? Chargers reconnect by themselves; everyone signs in again.')) return;
+        try { await OPS.post('/api/ops/server/restart', {}); } catch (e) { return OPS.fail(e); }
+        waitRestart();
+    }
+
+    function settings() {
+        const c = V.data.cfg;
+        const html = '<div class="ops-form"><label class="ops-check"><input type="checkbox" id="svOn"' + (c.backup_on ? ' checked' : '') + '> ' + OPS.t('Automatic backup every day') + '</label>' +
+            '<label>' + OPS.t('At (HH:MM, Bhutan Time)') + '<input class="tb-inp" type="time" id="svTime" value="' + OPS.esc(c.backup_time) + '"></label>' +
+            '<label>' + OPS.t('Keep the last … automatic backups') + '<input class="tb-inp" type="number" min="1" max="365" id="svKeep" value="' + OPS.esc(c.backup_keep) + '"></label>' +
+            '<label class="wide">' + OPS.t('Backup folder (relative to the program or a full path, e.g. a network drive)') + '<input class="tb-inp" id="svDir" value="' + OPS.esc(c.backup_dir) + '"></label>' +
+            '<label class="ops-check"><input type="checkbox" id="svLogs"' + (c.backup_logs ? ' checked' : '') + '> ' + OPS.t('Include the OCPP message logs (much bigger)') + '</label>' +
+            '<label>' + OPS.t('Warn when memory is above 85% of (MB, 0 = off)') + '<input class="tb-inp" type="number" min="0" id="svMem" value="' + OPS.esc(c.mem_limit_mb) + '"></label>' +
+            '<label>' + OPS.t('Warn when the disk has less than (GB)') + '<input class="tb-inp" type="number" min="0" step="0.5" id="svDisk" value="' + OPS.esc(c.disk_min_gb) + '"></label>' +
+            '<label>' + OPS.t('Warn when the event loop is late by more than (s)') + '<input class="tb-inp" type="number" min="0.2" step="0.1" id="svLagW" value="' + OPS.esc(c.lag_warn_s) + '"></label></div>';
+        OPS.modal('⚙️ Backup & server settings', html, [{label: 'Cancel'}, {label: '💾 Save', cls: 'primary', run: async box => {
+            await OPS.post('/api/ops/server/config', {backup_on: OPS.val(box, '#svOn'), backup_time: OPS.val(box, '#svTime'), backup_keep: OPS.val(box, '#svKeep'),
+                backup_dir: OPS.val(box, '#svDir'), backup_logs: OPS.val(box, '#svLogs'), mem_limit_mb: OPS.val(box, '#svMem'), disk_min_gb: OPS.val(box, '#svDisk'),
+                lag_warn_s: OPS.val(box, '#svLagW')});
+            OPS.toast(OPS.tx('Saved'), 'success');
+            load();
+            return true;
+        }}], {wide: true});
+    }
+
+    OPS.register({tab: 'server', perm: 'admin', every: 10,
+        show: function () { const v = OPS.$('view-server'); if (!v) return; if (!v.dataset.built) build(v); load(); },
+        refresh: load,
+        relang: function () { const v = OPS.$('view-server'); if (v) { v.dataset.built = ''; v.innerHTML = ''; OPS.mods.server.show(); } }
+    });
+
+    OPS.addI18n({
+        '🖥️ Server': ['', '🖥️ เซิร์ฟเวอร์'], 'Running for': ['', 'ทำงานมาแล้ว'], 'Version': ['', 'เวอร์ชัน'], 'Memory': ['', 'หน่วยความจำ'], 'Event loop delay': ['', 'ความหน่วง event loop'],
+        'last minute, max': ['', 'สูงสุดใน 1 นาที'], 'Database': ['', 'ฐานข้อมูล'], 'Disk free': ['', 'พื้นที่ดิสก์ว่าง'], '🔄 Restart the CSMS': ['', '🔄 รีสตาร์ท CSMS'], 'Ready checks': ['', 'การตรวจความพร้อม'],
+        '/healthz answers while the program runs (for the hosting platform); /readyz also checks the database and the event loop (for monitors and load balancers). Server problems also appear in the Health tab as "CSMS server" and can raise alerts.': ['', '/healthz ตอบเมื่อโปรแกรมทำงานอยู่ (สำหรับผู้ให้บริการโฮสต์) /readyz ตรวจฐานข้อมูลและ event loop ด้วย (สำหรับระบบเฝ้าดูและ load balancer) ปัญหาของเซิร์ฟเวอร์จะแสดงในแท็บสุขภาพเป็น "CSMS server" และส่งการแจ้งเตือนได้'],
+        '💾 Backups': ['', '💾 การสำรองข้อมูล'], '💾 Back up now': ['', '💾 สำรองข้อมูลตอนนี้'], '⬆️ Upload a backup': ['', '⬆️ อัปโหลดไฟล์สำรอง'], '⚙️ Settings': ['', '⚙️ ตั้งค่า'],
+        'A backup holds every data file (stations, cards, payments, customers, users, history, settings) and, with MongoDB, every collection, with a checksum per part. The database address and the console password are never in a backup. Restoring first saves the current data as a "pre-restore" backup, then writes the backup and restarts the CSMS. Keep copies of the backups off this server as well.': ['', 'ไฟล์สำรองเก็บข้อมูลทุกไฟล์ (สถานี บัตร การชำระเงิน ลูกค้า ผู้ใช้ ประวัติ การตั้งค่า) และทุก collection เมื่อใช้ MongoDB พร้อม checksum ทุกส่วน ไม่มีที่อยู่ฐานข้อมูลและรหัสผ่านคอนโซลในไฟล์สำรอง การกู้คืนจะสำรองข้อมูลปัจจุบันเป็น "pre-restore" ก่อน แล้วจึงเขียนข้อมูลจากไฟล์สำรองและรีสตาร์ท CSMS ควรเก็บสำเนาไฟล์สำรองไว้นอกเซิร์ฟเวอร์นี้ด้วย'],
+        'OK': ['', 'ปกติ'], 'Problem': ['', 'มีปัญหา'], 'event loop delay, last minute (max {m} s)': ['', 'ความหน่วง event loop ใน 1 นาที (สูงสุด {m} วินาที)'], 'CPU {c}%': ['', 'CPU {c}%'],
+        'JSON files': ['', 'ไฟล์ JSON'], '{n} writes waiting': ['', 'รอเขียน {n} รายการ'], '{p}% of {t} GB': ['', '{p}% ของ {t} GB'], 'Started': ['', 'เริ่มเมื่อ'], 'Platform': ['', 'แพลตฟอร์ม'],
+        'Process id': ['', 'Process id'], 'Chargers online': ['', 'ตู้ที่ออนไลน์'], 'Console sessions': ['', 'การเข้าระบบคอนโซล'], '{n} live screens': ['', 'หน้าจอสด {n}'], 'Data size': ['', 'ขนาดข้อมูล'],
+        'Restart': ['', 'การรีสตาร์ท'], 'by the launcher': ['', 'โดย launcher'], 'by the hosting platform': ['', 'โดยผู้ให้บริการโฮสต์'], 'by hand (no launcher)': ['', 'ด้วยมือ (ไม่มี launcher)'], 'Features': ['', 'ฟีเจอร์'],
+        'Event loop': ['', 'Event loop'], 'Not restoring': ['', 'ไม่ได้กู้คืนอยู่'], 'Automatic backup every day at {t} (Bhutan Time), the last {k} are kept': ['', 'สำรองข้อมูลอัตโนมัติทุกวันเวลา {t} (เวลาภูฏาน) เก็บไว้ {k} ชุดล่าสุด'],
+        'Automatic backups are off': ['', 'ปิดการสำรองอัตโนมัติ'], 'folder {d}': ['', 'โฟลเดอร์ {d}'], 'Last backup: {n}': ['', 'สำรองล่าสุด: {n}'], 'Last backup failed: {e}': ['', 'สำรองล่าสุดล้มเหลว: {e}'],
+        'Restored {n} on {t} by {b} (previous data: {s})': ['', 'กู้คืน {n} เมื่อ {t} โดย {b} (ข้อมูลเดิม: {s})'], 'Restore of {n} failed: {e}': ['', 'กู้คืน {n} ไม่สำเร็จ: {e}'], 'Backup running…': ['', 'กำลังสำรองข้อมูล…'],
+        'automatic': ['', 'อัตโนมัติ'], 'by hand': ['', 'ด้วยมือ'], 'command line': ['', 'command line'], 'before a restore': ['', 'ก่อนกู้คืน'], 'uploaded': ['', 'อัปโหลด'],
+        'Backup': ['', 'ไฟล์สำรอง'], 'Made': ['', 'สร้างเมื่อ'], 'Contents': ['', 'เนื้อหา'], 'Size': ['', 'ขนาด'], '{f} files': ['', '{f} ไฟล์'], '{d} database documents': ['', 'เอกสารฐานข้อมูล {d}'],
+        '⬇️ Download': ['', '⬇️ ดาวน์โหลด'], '♻️ Restore…': ['', '♻️ กู้คืน…'], 'No backup yet': ['', 'ยังไม่มีไฟล์สำรอง'], 'Backup {n} made': ['', 'สร้างไฟล์สำรอง {n} แล้ว'], 'Backup uploaded as {n}': ['', 'อัปโหลดแล้วเป็น {n}'],
+        'Delete backup {n}?': ['', 'ลบไฟล์สำรอง {n}?'], 'Not a valid backup: {p}': ['', 'ไม่ใช่ไฟล์สำรองที่ถูกต้อง: {p}'], 'Backup of {t} (version {v}, {m}).': ['', 'ไฟล์สำรองเมื่อ {t} (เวอร์ชัน {v}, {m})'],
+        '{n} files - {c} differ from the data now.': ['', '{n} ไฟล์ - ต่างจากข้อมูลปัจจุบัน {c} ไฟล์'], 'Collection': ['', 'Collection'], 'In the backup': ['', 'ในไฟล์สำรอง'], 'Now': ['', 'ตอนนี้'],
+        'Everything changed since this backup is replaced (the current data is saved first as a "pre-restore" backup). The CSMS restarts and everyone signs in again.': ['', 'ทุกอย่างที่เปลี่ยนหลังไฟล์สำรองนี้จะถูกแทนที่ (ข้อมูลปัจจุบันจะถูกสำรองเป็น "pre-restore" ก่อน) CSMS จะรีสตาร์ทและทุกคนต้องเข้าระบบใหม่'],
+        'Type RESTORE to confirm': ['', 'พิมพ์ RESTORE เพื่อยืนยัน'], '♻️ Restore {n}': ['', '♻️ กู้คืน {n}'], '♻️ Restore now': ['', '♻️ กู้คืนเลย'], '🔄 The CSMS is restarting': ['', '🔄 CSMS กำลังรีสตาร์ท'],
+        'Waiting for the CSMS…': ['', 'รอ CSMS…'], 'Waiting for the CSMS… {s} s': ['', 'รอ CSMS… {s} วินาที'], 'if it was started by hand, start it again': ['', 'ถ้าเปิดด้วยมือ ให้เปิดใหม่อีกครั้ง'],
+        'Restart the CSMS now? Chargers reconnect by themselves; everyone signs in again.': ['', 'รีสตาร์ท CSMS ตอนนี้? ตู้จะเชื่อมต่อใหม่เอง ทุกคนต้องเข้าระบบใหม่'], 'Automatic backup every day': ['', 'สำรองข้อมูลอัตโนมัติทุกวัน'],
+        'At (HH:MM, Bhutan Time)': ['', 'เวลา (เวลาภูฏาน)'], 'Keep the last … automatic backups': ['', 'เก็บไฟล์สำรองอัตโนมัติล่าสุด … ชุด'],
+        'Backup folder (relative to the program or a full path, e.g. a network drive)': ['', 'โฟลเดอร์สำรอง (เทียบกับโปรแกรมหรือพาธเต็ม เช่น ไดรฟ์เครือข่าย)'], 'Include the OCPP message logs (much bigger)': ['', 'รวม log ข้อความ OCPP (ไฟล์ใหญ่ขึ้นมาก)'],
+        'Warn when memory is above 85% of (MB, 0 = off)': ['', 'เตือนเมื่อหน่วยความจำเกิน 85% ของ (MB, 0 = ปิด)'], 'Warn when the disk has less than (GB)': ['', 'เตือนเมื่อดิสก์เหลือน้อยกว่า (GB)'],
+        'Warn when the event loop is late by more than (s)': ['', 'เตือนเมื่อ event loop ช้ากว่า (วินาที)'], '⚙️ Backup & server settings': ['', '⚙️ ตั้งค่าการสำรองและเซิร์ฟเวอร์'], 'CSMS server': ['', 'เซิร์ฟเวอร์ CSMS'],
+        'Database not connected - running on the JSON files': ['', 'ฐานข้อมูลไม่ได้เชื่อมต่อ - ใช้ไฟล์ JSON แทน'], 'Database not answering: {e}': ['', 'ฐานข้อมูลไม่ตอบ: {e}'],
+        'Server slow: event loop delays up to {s} s': ['', 'เซิร์ฟเวอร์ช้า: event loop หน่วงถึง {s} วินาที'], 'Disk almost full: {f} GB free': ['', 'ดิสก์ใกล้เต็ม: เหลือ {f} GB'], 'Memory {m} MB of {l} MB': ['', 'หน่วยความจำ {m} MB จาก {l} MB'],
+        'Backup failed: {e}': ['', 'สำรองข้อมูลล้มเหลว: {e}']
+    });
+})();
+''')
+
+
+# ---- [OPS] v1.10 session continuity + transaction ids that never repeat (ops/patch_scale.py)
+# Found by the 200-charger power-cut test: (1) the transaction counter started again at 1001 after every restart, so a new
+# session could get the id of an older one (MongoDB history cp:txn overwritten, two running sessions with one id);
+# (2) a session that was running when the charger reconnected or the CSMS restarted lost the energy charged before that
+# moment in the KPI report and the history (the meter start was only kept in the connection's memory).
+OPS_FEATURES.append('continuity')
+ops_open_tx = OpsDocStore('open_tx', 'ops_open_tx')    # 'cp|txn' -> facts of a running session; '_seq' -> last id handed out
+OPS_TXN_EPOCH = 1700000000                              # 14 Nov 2023: ids start from the seconds since then (about 93 million in 2026)
+OPS_OPEN_TX_KEEP_H = 72                                 # a session that was never stopped is forgotten after 3 days
+_OPS_CT = {'saved': 0.0, 'dirty': False}
+
+
+def ops_txn_floor() -> int:
+    return max(1000, int(_ops_time.time()) - OPS_TXN_EPOCH)
+
+
+def _ops_next_transaction_id(self) -> int:
+    """At least the last id handed out (kept on disk / in the database) + 1 and at least the seconds since OPS_TXN_EPOCH:
+    an id is never handed out twice, not after a restart, a crash or a restored backup (sessions start more slowly than
+    one per second on average)."""
+    seq = ops_open_tx.data.get('_seq') or {}
+    try:
+        last = int(seq.get('last') or 0)
+    except (TypeError, ValueError):
+        last = 0
+    n = max(int(getattr(self, 'transaction_counter', 1000) or 1000) + 1, last + 1, ops_txn_floor())
+    self.transaction_counter = n
+    ops_open_tx.data['_seq'] = {'last': n, 't': round(ops_now(), 1)}
+    _OPS_CT['dirty'] = True
+    return n
+
+
+AppState.next_transaction_id = _ops_next_transaction_id
+
+
+def ops_open_tx_save(force: bool = False):
+    ops_open_tx.save()
+    _OPS_CT.update(saved=ops_now(), dirty=False)
+
+
+def ops_open_tx_rec(cp_id: str, txn_id):
+    if txn_id is None:
+        return None
+    return ops_open_tx.data.get(f'{cp_id}|{txn_id}')
+
+
+@ops_on('tx_start')
+def _ops_ct_tx_start(cp_id='', connector=0, txn_id=None, id_tag='', meter_start=0, timestamp='', **kw):
+    if txn_id is None:
+        return
+    now = ops_now()
+    try:
+        ms = float(meter_start or 0)
+    except (TypeError, ValueError):
+        ms = 0.0
+    try:
+        conn = int(connector or 0)
+    except (TypeError, ValueError):
+        conn = 0
+    ops_open_tx.data[f'{cp_id}|{txn_id}'] = {'cp': cp_id, 'c': conn, 'tx': txn_id, 'ms': ms, 'tag': str(id_tag or '')[:40],
+                                             'ts': str(timestamp or '')[:40], 't': round(now, 1)}
+    old = now - OPS_OPEN_TX_KEEP_H * 3600
+    for k in [k for k, v in ops_open_tx.data.items() if k != '_seq' and float(v.get('t') or 0) < old]:
+        ops_open_tx.data.pop(k, None)
+    ops_open_tx_save()
+
+
+@ops_on('tx_stop')
+def _ops_ct_tx_stop(cp_id='', txn_id=None, **kw):
+    if ops_open_tx.data.pop(f'{cp_id}|{txn_id}', None) is not None or _OPS_CT['dirty']:
+        ops_open_tx_save()
+
+
+def _ops_ct_meter_first(cp_id='', connector=0, txn_id=None, energy_wh=None, **kw):
+    """Runs before the health listener: a session that began before this CSMS run gets its real start (time, meter, card)."""
+    if txn_id is None:
+        return
+    key = f'{cp_id}|{txn_id}'
+    if key in OPS_TX:
+        return
+    rec = ops_open_tx_rec(cp_id, txn_id)
+    if not rec:
+        return
+    now = ops_now()
+    ms = float(rec.get('ms') or 0)
+    OPS_TX[key] = {'cp': cp_id, 'c': rec.get('c', connector), 'tx': txn_id, 'tag': rec.get('tag') or '', 'start': float(rec.get('t') or now),
+                   'restored': True, 'ms': ms, 'mv': now, 'e': float(energy_wh) if energy_wh is not None else ms, 'e_t': now,
+                   'p': 0.0, 'maxp': 0.0, 'gaps': 0, 'gap_s': 0.0}
+
+
+OPS_HOOKS.setdefault('meter', []).insert(0, _ops_ct_meter_first)
+
+
+def ops_ct_rehydrate(cs, txn_id, connector=None) -> bool:
+    """Put the facts kept when the session started back on the charger's connection (after a reconnect or a restart the
+    connection starts empty, and a session rebuilt from MeterValues would count only the energy since then)."""
+    try:
+        rec = ops_open_tx_rec(cs.id, txn_id)
+        if not rec:
+            return False
+        cur = cs.data.transactions.get(txn_id)
+        if cur is not None and not cur.get('reconstructed'):
+            return False
+        cs.data.transactions[txn_id] = {'connector_id': int(rec.get('c', connector or 0) or 0), 'id_tag': rec.get('tag') or '',
+                                        'meter_start': rec.get('ms') or 0, 'start_time': rec.get('ts') or '', 'resumed': True}
+        if cur is None:
+            logger.info(f"🔁 {cs.id}: session {txn_id} continues after a reconnect / restart (meter start {rec.get('ms')} Wh kept)")
+        return True
+    except Exception as e:
+        logger.error(f"ops: session continuity for {getattr(cs, 'id', '?')} {txn_id} failed: {e}")
+        return False
+
+
+def _ops_ct_on_connect(cp_id='', **kw):
+    """Sessions of this charger that were running: back on the connection at once (the console and remote stop see them
+    before the first MeterValues)."""
+    cs = app_state.charge_points.get(cp_id)
+    if cs is None:
+        return
+    for k, rec in list(ops_open_tx.data.items()):
+        if k != '_seq' and rec.get('cp') == cp_id and rec.get('tx') not in cs.data.transactions:
+            ops_ct_rehydrate(cs, rec.get('tx'), rec.get('c'))
+
+
+ops_on('connect')(_ops_ct_on_connect)
+
+
+def _ops_ct_status(cp_id='', connector=0, status='', **kw):
+    """A connector that reports Available / Unavailable / Faulted with no session: a session kept for it is over on the
+    charger (its StopTransaction may still come from the charger's queue - the facts stay until then or for 3 days)."""
+    if status not in ('Available', 'Unavailable', 'Faulted'):
+        return
+    cs = app_state.charge_points.get(cp_id)
+    if cs is None:
+        return
+    try:
+        cid = int(connector or 0)
+    except (TypeError, ValueError):
+        return
+    for tid, t in list(cs.data.transactions.items()):
+        if t.get('resumed') and int(t.get('connector_id') or 0) == cid:
+            cs.data.transactions.pop(tid, None)
+
+
+ops_on('status')(_ops_ct_status)
+
+
+# ---- RFID cards: the 'last used' time no longer rewrites the whole card list at every Authorize / StartTransaction ----
+# (400 cards: 3 ms, 10 000 cards: 50 ms of a blocked event loop each time, twice per session; MongoDB mode compared every
+# card). The time is kept in memory and written with the next card change or within 30 s.
+_ops_authorize_rfid_orig = AppState.authorize_rfid
+
+
+def _ops_authorize_rfid(self, id_tag: str) -> dict:
+    had = '_save_rfid_cards' in self.__dict__
+    keep = self.__dict__.get('_save_rfid_cards')
+    self._save_rfid_cards = lambda *a, **k: _OPS_CT.__setitem__('rfid_dirty', True)
+    try:
+        return _ops_authorize_rfid_orig(self, id_tag)
+    finally:
+        if had:
+            self._save_rfid_cards = keep
+        else:
+            self.__dict__.pop('_save_rfid_cards', None)
+
+
+AppState.authorize_rfid = _ops_authorize_rfid
+
+
+def ops_ct_flush():
+    if _OPS_CT['dirty']:
+        try:
+            ops_open_tx_save()
+        except Exception as e:
+            logger.error(f"ops: saving the running sessions failed: {e}")
+    if _OPS_CT.pop('rfid_dirty', False):
+        try:
+            app_state._save_rfid_cards()
+        except Exception as e:
+            logger.error(f"ops: saving the RFID cards failed: {e}")
+
+
+async def ops_ct_loop():
+    while True:
+        await asyncio.sleep(30)
+        ops_ct_flush()
+
+
+OPS_TASKS.append(ops_ct_loop)
+
+
+def _ops_ct_startup():
+    seq = ops_open_tx.data.get('_seq') or {}
+    n = sum(1 for k in ops_open_tx.data if k != '_seq')
+    try:
+        app_state.transaction_counter = max(int(app_state.transaction_counter or 1000), int(seq.get('last') or 0))
+    except (TypeError, ValueError):
+        pass
+    if n:
+        logger.info(f"🔁 {n} charging session(s) were running at the last stop - they continue when their chargers report")
+
+
+OPS_STARTUP.append(_ops_ct_startup)
+
+
+# ---- [OPS] v1.10 scale: what the 200-charger load test with 45 days of history showed (ops/patch_scale.py) -----------
+# - event-log queries scanned every event in memory (up to 300 000) for any time window -> binary search on time;
+# - weeks of status history were read back from the files / MongoDB for every KPI view (the state at the start of the
+#   period needs a 40-day look-back) -> only the last event of each kind per charger / connector is needed: kept from
+#   memory, the older part read once a day and cached;
+# - KPI figures matched sessions to chargers and days with nested loops -> grouped once;
+# - an RFID import saved the whole card list after every card (400 cards blocked the CSMS for 0.8 s) -> one save;
+# - every settings lookup deep-copied all its defaults, even the ones already set (KPIs for 200 chargers: 12 600 lookups,
+#   1.5 of 2.4 s) -> copied only when missing;
+# - several operators with the KPI tab open (it refreshes every minute) recomputed the same report side by side -> one
+#   computation is shared, and a report that took long is kept a little longer (15 x its time, at least 30 s; past
+#   periods 10 min); the 24 h availability likewise computed once for simultaneous Health views;
+# - live console updates were sent while looping over the set of open consoles: a console opened or closed during a
+#   send ('Set changed size during iteration') made BootNotification / StatusNotification / MeterValues fail with
+#   InternalError and dropped charger connections (PC test, CSMS restart with 3 consoles open) -> sent from a copy, all
+#   consoles at once, and a console that cannot keep up for 5 s (phone network) is closed instead of holding up chargers;
+# - a backup made under load caught rfid_cards.json half written (the station / card / config files were rewritten in
+#   place) and restored 0 cards -> those files are written whole (temporary file + rename) and the backup re-reads a
+#   .json file until it is complete.
+OPS_FEATURES.append('scale')
+_OPS_LB_CACHE: Dict[tuple, list] = {}
+
+
+def _ops_ev_t(e) -> float:
+    try:
+        return float(e.get('t') or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _ops_ev_index(rec: list, t: float) -> int:
+    """First index whose event time is >= t (rec sorted by time)."""
+    lo, hi = 0, len(rec)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if _ops_ev_t(rec[mid]) < t:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+
+def ops_evlog_mem_from(log) -> float:
+    """From when the memory copy of an event log is complete (keep days, or later when the count cap dropped older ones)."""
+    start = ops_now() - log.keep + 60
+    rec = log.recent
+    if rec and len(rec) >= log.max_recent:
+        start = max(start, _ops_ev_t(rec[0]) + 1)
+    return start
+
+
+_ops_evlog_add_orig = OpsEventLog.add
+
+
+def _ops_evlog_add(self, ev: dict) -> dict:
+    out = _ops_evlog_add_orig(self, ev)
+    rec = self.recent
+    try:
+        if len(rec) > 1 and _ops_ev_t(rec[-1]) < _ops_ev_t(rec[-2]):
+            self._unsorted = True                     # an event with an older time: sorted again before the next search
+    except IndexError:
+        pass
+    return out
+
+
+def _ops_evlog_sorted(self) -> list:
+    """The memory list, sorted by time (a sorted copy replaces it if an older event was added - never sorted in place,
+    so a reader holding the list is not disturbed)."""
+    if getattr(self, '_unsorted', False):
+        self.recent = sorted(self.recent, key=_ops_ev_t)
+        self._unsorted = False
+    return self.recent
+
+
+def _ops_evlog_query(self, t0: float, t1: float, pred=None, limit: int = None, newest_first: bool = False) -> List[dict]:
+    if self.loaded and t0 >= ops_evlog_mem_from(self):
+        with self._lock:
+            rec = _ops_evlog_sorted(self)
+            src = rec[_ops_ev_index(rec, t0):_ops_ev_index(rec, t1)]
+    else:
+        src = self.read(t0, t1)
+    if pred is not None:
+        src = [e for e in src if pred(e)]
+    if newest_first:
+        src.reverse()
+    return src[:limit] if limit else src
+
+
+OpsEventLog.add = _ops_evlog_add
+OpsEventLog.query = _ops_evlog_query
+
+
+def ops_lb_compress(events, cp: str = None) -> list:
+    """The last CSMS up / down, the last online / offline of every charger and the last status of every connector, in
+    time order: applied in order they leave exactly the state that all the events leave (see ops_timeline.apply).
+    cp: only that charger (+ the CSMS events)."""
+    last = {}
+    for e in events:
+        k = e.get('k')
+        if k == 'conn':
+            c = e.get('cp') or ''
+            if cp is not None and c != cp:
+                continue
+            try:
+                last[(c, 'conn', int(e.get('c') or 0))] = e
+            except (TypeError, ValueError):
+                last[(c, 'conn', 0)] = e
+        elif k == 'online' or k == 'offline':
+            c = e.get('cp') or ''
+            if cp is not None and c != cp:
+                continue
+            last[(c, k)] = e
+        elif k == 'csms':
+            last[('', 'csms', e.get('s'))] = e
+    return sorted(last.values(), key=_ops_ev_t)
+
+
+def ops_status_events_lb(t0: float, t1: float, lookback: float = 40 * 86400, cp: str = None) -> List[dict]:
+    """Status events of [t0, t1) + what ops_timeline needs from the 40 days before t0 (compressed): the same timelines
+    and uptime figures as all the events, without reading weeks of history for every view.  cp: only what that
+    charger's timeline uses (its events + the CSMS events)."""
+    log = OPS_STATUS
+    lb0 = t0 - lookback
+    window = log.query(t0, t1)
+    if cp is not None:
+        window = [e for e in window if e.get('cp') == cp or e.get('k') == 'csms']
+    if not log.loaded:
+        return ops_lb_compress(log.read(lb0, t0), cp) + window
+    mem_from = ops_evlog_mem_from(log)
+    boundary = max(lb0, -(-mem_from // 3600) * 3600.0)                  # whole hours: the cache key changes once an hour
+    older = []
+    if lb0 < boundary and lb0 < t0:
+        end = min(t0, boundary)
+        key = (round(lb0, 1), round(end, 1))
+        older = _OPS_LB_CACHE.get(key)
+        if older is None:
+            older = ops_lb_compress(log.read(lb0, end))
+            if len(_OPS_LB_CACHE) > 16:
+                _OPS_LB_CACHE.clear()
+            _OPS_LB_CACHE[key] = older
+    recent_part = ops_lb_compress(log.query(max(lb0, boundary), t0), cp) if boundary < t0 else []
+    return ops_lb_compress(list(older) + recent_part, cp) + window
+
+
+def _ops_day_bucket(day_starts: list, t: float):
+    """The last day start <= t (day_starts ascending), or None - same as max([x for x in day_starts if x <= t] or [None])."""
+    lo, hi = 0, len(day_starts)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if day_starts[mid] <= t:
+            lo = mid + 1
+        else:
+            hi = mid
+    return day_starts[lo - 1] if lo else None
+
+
+# ---- RFID import: one save for the whole list ------------------------------------------------------------------------
+_ops_rfid_import_orig = handle_api_rfid_import
+
+
+async def handle_api_rfid_import(request):
+    app_state._save_rfid_cards = lambda *a, **k: _OPS_CT.__setitem__('rfid_import_dirty', True)
+    try:
+        return await _ops_rfid_import_orig(request)
+    finally:
+        app_state.__dict__.pop('_save_rfid_cards', None)
+        if _OPS_CT.pop('rfid_import_dirty', False):
+            app_state._save_rfid_cards()
+
+
+# ---- KPI: a state segment is split only over the days it touches (was: every segment x every day of the period) -------
+def _ops_split_days(segs: List[list], day_starts: List[float]) -> Dict[float, List[list]]:
+    out: Dict[float, List[list]] = {}
+    n = len(day_starts)
+    for a, b, st in segs:
+        i = _ops_ev_first_day(day_starts, a - 86400)
+        while i < n and day_starts[i] < b:
+            d = day_starts[i]
+            lo, hi = max(a, d), min(b, d + 86400)
+            if hi > lo:
+                out.setdefault(d, []).append([lo, hi, st])
+            i += 1
+    return out
+
+
+def _ops_ev_first_day(day_starts: list, t: float) -> int:
+    """First index whose day start is > t."""
+    lo, hi = 0, len(day_starts)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if day_starts[mid] <= t:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+
+# ---- data files written whole; backups copy whole files -------------------------------------------------------------
+def _ops_write_json_safe(path: str, data, indent: int = 2) -> None:
+    """Write a data file whole or not at all (temporary file, flushed to the disk, then renamed over the old one): a power
+    cut or a backup reading the file at that moment never sees half a file.  Same content and format as before.  When the
+    rename is refused (Windows: the file is open in another program) it is written in place as before."""
+    tmp = path + '.tmp'
+    try:
+        with open(tmp, 'w') as f:
+            json.dump(data, f, indent=indent)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        return
+    except OSError as e:
+        logger.warning(f"{path}: written in place ({e})")
+    with open(path, 'w') as f:
+        json.dump(data, f, indent=indent)
+
+
+def ops_backup_read_file(path: str) -> bytes:
+    """A complete copy of a data file for a backup: a .json file that is being rewritten at this moment (another program,
+    or an older CSMS writing in place) is read again until it is whole (up to 3 s)."""
+    data = b''
+    for _ in range(60):
+        with open(path, 'rb') as f:
+            data = f.read()
+        if not path.endswith('.json'):
+            return data
+        try:
+            if data.strip():
+                json.loads(data.decode('utf-8'))
+                return data
+        except (ValueError, UnicodeDecodeError):
+            pass
+        _ops_time.sleep(0.05)
+    logger.warning(f"backup: {os.path.basename(path)} was not complete after 3 s - copied as it is")
+    return data
+
+
+# ---- settings lookups: defaults copied only when missing (same result; was json round-trip of every default each call) -
+def ops_cfg(section: str, defaults: dict = None) -> dict:
+    """A settings document; missing keys are filled from defaults (and kept)."""
+    d = ops_settings.data.get(section)
+    if not isinstance(d, dict):
+        d = {}
+        ops_settings.data[section] = d
+    for k, v in (defaults or {}).items():
+        if k not in d:
+            d[k] = json.loads(json.dumps(v))
+    return d
+
+
+# ---- KPI report / 24 h availability: one computation shared by simultaneous requests ------------------------------------
+_OPS_KPI_INFLIGHT: Dict[tuple, 'asyncio.Future'] = {}
+_OPS_AVAIL_LOCK = {'lock': None}
+
+
+async def ops_kpi_cached(q) -> dict:
+    t0, t1, label = ops_period(q)
+    key = (round(t0), round(t1))
+    now = ops_now()
+    hit = _OPS_KPI_CACHE.get(key)
+    if hit and not q.get('fresh'):
+        took = hit[2] if len(hit) > 2 else 0.0
+        ttl = 600.0 if t1 <= now - 3600 else max(30.0, 15.0 * took)
+        if now - hit[0] < ttl:
+            return hit[1]
+    fut = _OPS_KPI_INFLIGHT.get(key)
+    if fut is not None and not fut.done():
+        return await asyncio.shield(fut)
+    fut = asyncio.get_running_loop().create_future()
+    _OPS_KPI_INFLIGHT[key] = fut
+    try:
+        t = _ops_time.perf_counter()
+        res = await asyncio.to_thread(ops_kpi_compute, t0, t1, label)
+        if len(_OPS_KPI_CACHE) > 20:
+            _OPS_KPI_CACHE.clear()
+        _OPS_KPI_CACHE[key] = (ops_now(), res, _ops_time.perf_counter() - t)
+        fut.set_result(res)
+        return res
+    except Exception as e:
+        fut.set_exception(e)
+        fut.exception()                                  # the waiting requests get the error; no 'never retrieved' warning
+        raise
+    finally:
+        if _OPS_KPI_INFLIGHT.get(key) is fut:
+            _OPS_KPI_INFLIGHT.pop(key, None)
+
+
+async def ops_avail_24h_async() -> Dict[str, Optional[float]]:
+    """ops_avail_24h in a thread, one at a time: simultaneous Health views wait for the same fresh result (cached 60 s)."""
+    if _OPS_AVAIL_LOCK['lock'] is None:
+        _OPS_AVAIL_LOCK['lock'] = asyncio.Lock()
+    async with _OPS_AVAIL_LOCK['lock']:
+        return await asyncio.to_thread(ops_avail_24h)
+
+
+# ---- live console updates: from a copy of the list, in parallel, slow consoles dropped -----------------------------------
+OPS_WS_SEND_TIMEOUT = 5.0
+
+
+async def _ops_broadcast(self, msg_type: str, data: dict):
+    """Broadcast to all web clients"""
+    clients = list(self.web_clients)
+    if not clients:
+        return
+    message = json.dumps({'type': msg_type, 'data': data})
+
+    async def _one(ws):
+        try:
+            await asyncio.wait_for(ws.send_str(message), OPS_WS_SEND_TIMEOUT)
+            return None
+        except Exception:
+            return ws
+    dead = [await _one(clients[0])] if len(clients) == 1 else await asyncio.gather(*(_one(ws) for ws in clients))
+    dead = {ws for ws in dead if ws is not None}
+    if dead:
+        self.web_clients -= dead
+        for ws in dead:
+            try:
+                asyncio.get_running_loop().create_task(ws.close())
+            except Exception:
+                pass
+
+
+AppState.broadcast = _ops_broadcast
+
+
+# ---- [OPS] v1.11 firmware updates + diagnostics files from the chargers (T04)
+#  - firmware library: files uploaded by an operator, offered to the chargers at /fw/<token>/<name> (HTTP, resumable);
+#    UpdateFirmware to one or many chargers (now or at a set time; chargers offline get it when they connect, 7 days),
+#    FirmwareStatusNotification + the version reported at the next start-up followed per charger
+#  - diagnostics: GetDiagnostics with an upload address of its own (/api/diagnostics/upload/t/<token>/), PUT or POST
+#    (raw or multipart) streamed to disk up to 200 MB (the old route accepted 1 MB at most - bigger log files failed),
+#    DiagnosticsStatusNotification followed; the old address without a token only while a request is open
+OPS_FEATURES.append('fwdiag')
+import hashlib as _ops_fd_hash
+import socket as _ops_fd_socket
+import urllib.parse as _ops_fd_url
+ops_fw_files = OpsDocStore('fw_files', 'ops_fw_files')      # file id -> {name, size, sha256, token, t, by, note, path, downloads}
+ops_fw_jobs = OpsDocStore('fw_jobs', 'ops_fw_jobs')         # job id -> {cp, file, name, url, status, history, fw_before, fw_after ...}
+ops_diag_jobs = OpsDocStore('diag_jobs', 'ops_diag_jobs')   # job id -> {cp, token, status, file_name, file, size, history ...}
+OPS_FW_DIR = str(APP_DIR / 'firmware')
+OPS_FD_DEFAULTS = {'charger_base_url': '', 'fw_retries': 3, 'fw_retry_interval': 120, 'diag_retries': 2, 'diag_retry_interval': 60,
+                   'diag_keep_days': 90, 'fw_max_mb': 500, 'diag_max_mb': 200, 'job_keep_days': 120}
+OPS_FW_ACTIVE = ('waiting', 'sent', 'Downloading', 'Downloaded', 'Installing')
+OPS_DIAG_ACTIVE = ('requested', 'Uploading', 'Uploaded')
+OPS_FD_WAIT_DAYS = 7                       # an update for a charger that is offline is sent when it connects, for 7 days
+_OPS_FD = {'port': None, 'saved': 0.0}
+OPS_TAB_PERMS['fwdiag'] = 'config'
+ops_perm_rule('GET', '/api/ops/fwdiag', 'config')
+for _p in ('/api/ops/fw/upload', '/api/ops/fw/delete', '/api/ops/fw/update', '/api/ops/fw/cancel', '/api/ops/diag/request',
+           '/api/ops/diag/delete', '/api/ops/fwdiag/config'):
+    ops_perm_rule('POST', _p, 'config')
+PUBLIC_PREFIXES = tuple(PUBLIC_PREFIXES) + ('/fw/',)
+
+
+def ops_fd_cfg() -> dict:
+    return ops_cfg('fwdiag', OPS_FD_DEFAULTS)
+
+
+def _ops_fd_safe(name: str, fallback: str = 'file') -> str:
+    base = os.path.basename(str(name or '').replace('\\', '/')).strip()
+    base = _ops_re.sub(r'[^A-Za-z0-9._()+-]+', '_', base).strip('._') or fallback
+    return base[:120]
+
+
+def ops_fd_lan_ip() -> str:
+    try:
+        s = _ops_fd_socket.socket(_ops_fd_socket.AF_INET, _ops_fd_socket.SOCK_DGRAM)
+        s.connect(('10.255.255.255', 1))                      # no packet is sent: only picks the outgoing interface
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except OSError:
+        return '127.0.0.1'
+
+
+def ops_fd_base(request=None) -> str:
+    """Address the chargers use to reach this CSMS (firmware downloads, log uploads)."""
+    if request is not None and getattr(request, 'url', None) is not None and request.url.port:
+        _OPS_FD['port'] = request.url.port
+    for v in (os.environ.get('CSMS_PUBLIC_URL', ''), ops_fd_cfg().get('charger_base_url', ''),
+              (pay_settings.data.get('public_base_url') if 'pay_settings' in globals() else '') or ''):
+        v = str(v or '').strip().rstrip('/')
+        if v:
+            return v
+    return f"http://{ops_fd_lan_ip()}:{_OPS_FD['port'] or 8080}"
+
+
+def _ops_fd_hist(rec: dict, text: str):
+    rec.setdefault('history', []).append([round(ops_now()), str(text)[:120]])
+    del rec['history'][:-30]
+
+
+def _ops_fd_new_id(prefix: str, store) -> str:
+    while True:
+        i = f"{prefix}-{ops_dt().strftime('%y%m%d')}-{secrets.token_hex(2).upper()}"
+        if i not in store.data:
+            return i
+
+
+def _ops_fd_station(cp: str) -> dict:
+    data = app_state.cp_data.get(cp)
+    return {'id': cp, 'name': ops_cp_name(cp), 'online': cp in app_state.charge_points,
+            'vendor': getattr(data, 'vendor', '') or '', 'model': getattr(data, 'model', '') or '',
+            'fw': getattr(data, 'firmware_version', '') or ''}
+
+
+def _ops_fd_prune():
+    keep = max(7, ops_int(ops_fd_cfg().get('job_keep_days'), 120)) * 86400
+    now = ops_now()
+    for store in (ops_fw_jobs, ops_diag_jobs):
+        old = [k for k, v in store.data.items() if now - float(v.get('t') or 0) > keep]
+        for k in old:
+            store.data.pop(k, None)
+
+
+# ---- firmware library ---------------------------------------------------------------------------------------------
+async def _ops_fd_stream_to(part_or_stream, path: str, limit: int, multipart: bool) -> tuple:
+    """Write a request body / multipart part to path (via .part); returns (size, sha256) or raises ValueError (too big)."""
+    tmp = path + '.part'
+    h, size = _ops_fd_hash.sha256(), 0
+    try:
+        with open(tmp, 'wb') as f:
+            while True:
+                chunk = await (part_or_stream.read_chunk(1 << 20) if multipart else part_or_stream.read(1 << 20))
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > limit:
+                    raise ValueError('too large')
+                h.update(chunk)
+                f.write(chunk)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    return size, h.hexdigest()
+
+
+async def ops_api_fw_upload(request):
+    cfg = ops_fd_cfg()
+    limit = max(1, ops_int(cfg.get('fw_max_mb'), 500)) * 1024 * 1024
+    os.makedirs(OPS_FW_DIR, exist_ok=True)
+    try:
+        reader = await request.multipart()
+    except Exception:
+        return ops_err('Send the file as multipart/form-data (field "file")')
+    note, rec = '', None
+    while True:
+        part = await reader.next()
+        if part is None:
+            break
+        if part.name == 'note':
+            note = (await part.text())[:200]
+            continue
+        if part.name != 'file' or not part.filename:
+            await part.release()
+            continue
+        name = _ops_fd_safe(part.filename, 'firmware.bin')
+        fid = _ops_fd_new_id('FW', ops_fw_files)
+        fname = f'{fid}_{name}'
+        try:
+            size, sha = await _ops_fd_stream_to(part, os.path.join(OPS_FW_DIR, fname), limit, True)
+        except ValueError:
+            return ops_err(f"The file is larger than {cfg.get('fw_max_mb')} MB", 413)
+        if size == 0:
+            try:
+                os.remove(os.path.join(OPS_FW_DIR, fname))
+            except OSError:
+                pass
+            return ops_err('The file is empty')
+        rec = {'id': fid, 'name': name, 'path': fname, 'size': size, 'sha256': sha, 'token': secrets.token_urlsafe(18),
+               't': round(ops_now()), 'by': ops_request_user(request).get('username') or '', 'note': '', 'downloads': 0}
+    if rec is None:
+        return ops_err('No file received')
+    rec['note'] = note
+    ops_fw_files.data[rec['id']] = rec
+    ops_fw_files.save()
+    logger.info(f"🧩 firmware file {rec['name']} ({rec['size']:,} bytes) added as {rec['id']}")
+    return ops_json({'ok': True, 'file': _ops_fd_file_public(rec, ops_fd_base(request))})
+
+
+def _ops_fd_file_url(rec: dict, base: str) -> str:
+    return f"{base}/fw/{rec['token']}/{_ops_fd_url.quote(rec['name'])}"
+
+
+def _ops_fd_file_public(rec: dict, base: str) -> dict:
+    d = {k: rec.get(k) for k in ('id', 'name', 'size', 'sha256', 't', 'by', 'note', 'downloads', 'last_download')}
+    d['url'] = _ops_fd_file_url(rec, base)
+    d['missing'] = not os.path.isfile(os.path.join(OPS_FW_DIR, rec.get('path') or ''))
+    return d
+
+
+async def ops_api_fw_delete(request):
+    b = await ops_body(request)
+    rec = ops_fw_files.data.pop(str(b.get('id') or ''), None)
+    if rec is None:
+        return ops_err('No such file', 404)
+    try:
+        os.remove(os.path.join(OPS_FW_DIR, rec.get('path') or ''))
+    except OSError:
+        pass
+    ops_fw_files.save()
+    return ops_json({'ok': True})
+
+
+async def ops_fw_download(request):
+    """Public: the chargers fetch the firmware file here (token in the address; HTTP range requests supported)."""
+    token = request.match_info.get('token', '')
+    if not token.isascii():
+        return web.Response(status=404, text='not found')
+    rec = next((r for r in ops_fw_files.data.values() if secrets.compare_digest(str(r.get('token') or ''), token)), None)
+    path = os.path.join(OPS_FW_DIR, (rec or {}).get('path') or '')
+    if rec is None or not os.path.isfile(path):
+        return web.Response(status=404, text='not found')
+    if request.method == 'GET' and 'Range' not in request.headers:
+        rec['downloads'] = int(rec.get('downloads') or 0) + 1
+        rec['last_download'] = {'t': round(ops_now()), 'ip': _client_ip(request)}
+        _OPS_FD['dirty'] = True
+        logger.info(f"🧩 firmware {rec['name']} downloaded by {_client_ip(request)}")
+    return web.FileResponse(path, headers={'Content-Disposition': f'attachment; filename="{rec["name"]}"',
+                                           'Cache-Control': 'no-store'})
+
+
+# ---- firmware updates ---------------------------------------------------------------------------------------------
+def _ops_fd_parse_local(s):
+    """'YYYY-MM-DDTHH:MM' in Bhutan Time (from the console) -> epoch; '' -> None."""
+    s = str(s or '').strip()
+    if not s:
+        return None
+    try:
+        d = datetime.fromisoformat(s.replace('Z', '+00:00'))
+    except ValueError:
+        raise ValueError('Give the time as YYYY-MM-DD HH:MM')
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=OPS_TZ)
+    return d.timestamp()
+
+
+async def ops_api_fw_update(request):
+    b = await ops_body(request)
+    cfg = ops_fd_cfg()
+    cps = []
+    for c in b.get('cps') or []:
+        c = str(c).strip()
+        if c and c not in cps:
+            cps.append(c)
+    if not cps:
+        return ops_err('Choose at least one charger')
+    base = ops_fd_base(request)
+    frec, url = None, str(b.get('url') or '').strip()
+    if b.get('file'):
+        frec = ops_fw_files.data.get(str(b.get('file')))
+        if frec is None:
+            return ops_err('No such firmware file', 404)
+        url = _ops_fd_file_url(frec, base)
+    elif not _ops_re.match(r'^(https?|ftps?)://\S+$', url, _ops_re.I):
+        return ops_err('Choose a firmware file or give its address (http://, https://, ftp:// or ftps://)')
+    try:
+        when = _ops_fd_parse_local(b.get('retrieve'))
+    except ValueError as e:
+        return ops_err(str(e))
+    retries = ops_int(b.get('retries'), cfg['fw_retries'], 0, 20)
+    interval = ops_int(b.get('interval'), cfg['fw_retry_interval'], 0, 86400)
+    who = ops_request_user(request).get('username') or ''
+    jobs = []
+    for cp in cps:
+        st = _ops_fd_station(cp)
+        for old in ops_fw_jobs.data.values():          # one update at a time per charger: a newer one replaces the waiting one
+            if old.get('cp') == cp and old.get('status') == 'waiting':
+                old['status'] = 'cancelled'
+                _ops_fd_hist(old, 'replaced by a newer update')
+        jid = _ops_fd_new_id('FWU', ops_fw_jobs)
+        rec = {'id': jid, 'cp': cp, 'file': frec['id'] if frec else '', 'name': frec['name'] if frec else url.rsplit('/', 1)[-1][:120],
+               'url': url, 'retrieve_t': round(when) if when else None, 'retries': retries, 'interval': interval, 't': round(ops_now(), 3),
+               'by': who, 'status': 'waiting', 'fw_before': st['fw'], 'fw_after': '', 'history': []}
+        _ops_fd_hist(rec, f'created by {who}')
+        ops_fw_jobs.data[jid] = rec
+        jobs.append(rec)
+    _ops_fd_prune()
+    ops_fw_jobs.save()
+    for rec in jobs:
+        if rec['cp'] in app_state.charge_points:
+            await _ops_fw_send(rec['id'])
+    return ops_json({'ok': True, 'jobs': [_ops_fd_job_public(ops_fw_jobs.data[r['id']]) for r in jobs]})
+
+
+async def _ops_fw_send(jid: str):
+    rec = ops_fw_jobs.data.get(jid)
+    if rec is None or rec.get('status') != 'waiting':
+        return
+    cs = app_state.charge_points.get(rec['cp'])
+    if cs is None:
+        return
+    when = max(float(rec.get('retrieve_t') or 0), ops_now())
+    retrieve = datetime.fromtimestamp(when, timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    kw = {'location': rec['url'], 'retrieve_date': retrieve}
+    if rec.get('retries') is not None:
+        kw['retries'] = int(rec['retries'])
+    if rec.get('interval') is not None:
+        kw['retry_interval'] = int(rec['interval'])
+    app_state.add_log('➡️ OUT', rec['cp'], 'UpdateFirmware', {'location': rec['url'], 'retrieveDate': retrieve,
+                                                             'retries': kw.get('retries'), 'retryInterval': kw.get('retry_interval')})
+    rec['status'] = 'sending'
+    try:
+        await asyncio.wait_for(cs.call(call.UpdateFirmware(**kw)), 30)
+        rec['status'] = 'sent'
+        rec['sent_t'] = round(ops_now())
+        _ops_fd_hist(rec, f'UpdateFirmware accepted (download from {retrieve.replace("T", " ")[:16]} UTC)')
+    except asyncio.TimeoutError:
+        rec['status'] = 'waiting'
+        _ops_fd_hist(rec, 'no answer from the charger - sent again when it reconnects')
+    except Exception as e:
+        rec['status'] = 'refused'
+        _ops_fd_hist(rec, f'charger refused: {type(e).__name__} {e}'[:120])
+    ops_fw_jobs.save()
+    await app_state.broadcast('fwdiag', {'cp': rec['cp']})
+
+
+def ops_fd_fw_status(cp: str, status: str):
+    status = str(status).split('.')[-1]
+    status = {'downloading': 'Downloading', 'downloaded': 'Downloaded', 'downloadfailed': 'DownloadFailed', 'idle': 'Idle',
+              'installing': 'Installing', 'installed': 'Installed', 'installationfailed': 'InstallationFailed'}.get(status.lower(), status)
+    recs = sorted((r for r in ops_fw_jobs.data.values() if r.get('cp') == cp and r.get('status') not in ('waiting', 'cancelled')),
+                  key=lambda r: r.get('t') or 0)
+    rec = recs[-1] if recs else None
+    if rec is None or ops_now() - float(rec.get('t') or 0) > 30 * 86400:
+        return
+    if status == 'Idle' and rec.get('status') in ('Installed', 'DownloadFailed', 'InstallationFailed'):
+        return
+    rec['status'] = status if status != 'Idle' else rec.get('status')
+    rec['status_t'] = round(ops_now())
+    _ops_fd_hist(rec, f'FirmwareStatusNotification {status}')
+    ops_fw_jobs.save()
+
+
+@ops_on('boot')
+def _ops_fd_boot(cp_id='', firmware='', **kw):
+    """Start-up of a charger: the firmware it now reports; updates that waited for it are sent."""
+    now = ops_now()
+    for rec in sorted((r for r in ops_fw_jobs.data.values() if r.get('cp') == cp_id), key=lambda r: r.get('t') or 0)[-1:]:
+        if rec.get('status') in ('sent', 'Downloading', 'Downloaded', 'Installing', 'Installed') and firmware and firmware != rec.get('fw_after'):
+            if firmware != rec.get('fw_before'):
+                rec['fw_after'] = firmware
+                _ops_fd_hist(rec, f'charger started with firmware {firmware}')
+                if rec.get('status') in ('Downloaded', 'Installing'):
+                    rec['status'] = 'Installed'
+                    _ops_fd_hist(rec, 'installed (new version reported at start-up)')
+                _OPS_FD['dirty'] = True
+    waiting = [r['id'] for r in ops_fw_jobs.data.values() if r.get('cp') == cp_id and r.get('status') == 'waiting'
+               and now - float(r.get('t') or 0) < OPS_FD_WAIT_DAYS * 86400]
+
+    async def _go():
+        await asyncio.sleep(3.0)                       # after the BootNotification answer and the status reports
+        for jid in waiting:
+            await _ops_fw_send(jid)
+    if waiting:
+        try:
+            asyncio.get_running_loop().create_task(_go())
+        except RuntimeError:
+            pass
+
+
+@ops_on('connect')
+def _ops_fd_connect(cp_id='', **kw):
+    """A charger that reconnects without a BootNotification also gets the updates that waited for it (after 15 s)."""
+    now = ops_now()
+    waiting = [r['id'] for r in ops_fw_jobs.data.values() if r.get('cp') == cp_id and r.get('status') == 'waiting'
+               and now - float(r.get('t') or 0) < OPS_FD_WAIT_DAYS * 86400]
+
+    async def _go():
+        await asyncio.sleep(15.0)
+        for jid in waiting:
+            await _ops_fw_send(jid)
+    if waiting:
+        try:
+            asyncio.get_running_loop().create_task(_go())
+        except RuntimeError:
+            pass
+
+
+def _ops_fd_startup():
+    try:
+        os.makedirs(OPS_FW_DIR, exist_ok=True)
+    except OSError as e:
+        logger.error(f"ops: cannot create {OPS_FW_DIR}: {e}")
+    n = 0
+    for r in ops_fw_jobs.data.values():
+        if r.get('status') == 'sending':               # the CSMS stopped while it was sending: send again
+            r['status'] = 'waiting'
+            n += 1
+    if n:
+        ops_fw_jobs.save()
+
+
+OPS_STARTUP.append(_ops_fd_startup)
+
+
+async def ops_api_fw_cancel(request):
+    b = await ops_body(request)
+    rec = ops_fw_jobs.data.get(str(b.get('id') or ''))
+    if rec is None:
+        return ops_err('No such update', 404)
+    if rec.get('status') != 'waiting':
+        return ops_err('Only an update that has not reached the charger yet can be cancelled', 409)
+    rec['status'] = 'cancelled'
+    _ops_fd_hist(rec, 'cancelled by ' + (ops_request_user(request).get('username') or ''))
+    ops_fw_jobs.save()
+    return ops_json({'ok': True})
+
+
+# ---- diagnostics ----------------------------------------------------------------------------------------------------
+def _ops_diag_job(cp: str, token: str, who: str, how: str) -> dict:
+    jid = _ops_fd_new_id('LOG', ops_diag_jobs)
+    rec = {'id': jid, 'cp': cp, 'token': token, 't': round(ops_now(), 3), 'by': who, 'status': 'requested', 'file_name': '',
+           'file': '', 'size': None, 'history': []}
+    _ops_fd_hist(rec, f'requested by {who} ({how})')
+    ops_diag_jobs.data[jid] = rec
+    _ops_fd_prune()
+    return rec
+
+
+def _ops_diag_location(base: str, token: str) -> str:
+    return f'{base}/api/diagnostics/upload/t/{token}/'
+
+
+_ops_fd_getdiag_orig = CentralSystem.cmd_get_diagnostics
+
+
+async def _ops_fd_cmd_get_diagnostics(self, location: str, start_time: str = None, stop_time: str = None, retries: int = None,
+                                      retry_interval: int = None):
+    """[OPS] v1.11: the station drawer's 'Get diagnostics' gets an upload address of its own (token); a localhost address
+    is replaced by one the charger can reach."""
+    loc = str(location or '')
+    m = _ops_re.match(r'^(https?://[^/]+)(/api/diagnostics/upload/?)$', loc)
+    rec = None
+    if m:
+        base = m.group(1)
+        host = _ops_fd_url.urlparse(base).hostname or ''
+        remote = str(getattr(self.data, 'remote_address', '') or '')
+        if host in ('localhost', '127.0.0.1', '::1') and remote and not remote.startswith(('127.', '::1', '[::1]')):
+            base = ops_fd_base()
+        rec = _ops_diag_job(self.id, secrets.token_urlsafe(18), 'console', 'station drawer')
+        loc = _ops_diag_location(base, rec['token'])
+        ops_diag_jobs.save()
+    res = await _ops_fd_getdiag_orig(self, loc, start_time, stop_time, retries, retry_interval)
+    if rec is not None:
+        rec['file_name'] = (res or {}).get('fileName') or ''
+        if not rec['file_name']:
+            rec['status'] = 'no file'
+            _ops_fd_hist(rec, 'the charger has no diagnostics to send')
+        ops_diag_jobs.save()
+        res = dict(res or {}, location=loc)
+    return res
+
+
+CentralSystem.cmd_get_diagnostics = _ops_fd_cmd_get_diagnostics
+
+
+async def ops_api_diag_request(request):
+    b = await ops_body(request)
+    cfg = ops_fd_cfg()
+    cp = str(b.get('cp') or b.get('cp_id') or '').strip()
+    cs = app_state.charge_points.get(cp)
+    if cs is None:
+        return ops_err('The charger is not connected', 409)
+    try:
+        t0, t1 = _ops_fd_parse_local(b.get('from')), _ops_fd_parse_local(b.get('to'))
+    except ValueError as e:
+        return ops_err(str(e))
+    utc = lambda t: datetime.fromtimestamp(t, timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ') if t else None
+    rec = _ops_diag_job(cp, secrets.token_urlsafe(18), ops_request_user(request).get('username') or '', 'Firmware & logs tab')
+    loc = _ops_diag_location(ops_fd_base(request), rec['token'])
+    rec['location'] = loc
+    ops_diag_jobs.save()
+    try:
+        res = await asyncio.wait_for(_ops_fd_getdiag_orig(cs, loc, utc(t0), utc(t1), ops_int(b.get('retries'), cfg['diag_retries'], 0, 10),
+                                                          ops_int(b.get('interval'), cfg['diag_retry_interval'], 0, 3600)), 30)
+    except Exception as e:
+        rec['status'] = 'refused'
+        _ops_fd_hist(rec, f'charger refused: {type(e).__name__} {e}'[:120])
+        ops_diag_jobs.save()
+        return ops_err(f'The charger did not accept GetDiagnostics ({type(e).__name__})', 502, job=_ops_fd_job_public(rec))
+    rec['file_name'] = (res or {}).get('fileName') or ''
+    if not rec['file_name']:
+        rec['status'] = 'no file'
+        _ops_fd_hist(rec, 'the charger has no diagnostics to send')
+    else:
+        _ops_fd_hist(rec, f"the charger will upload {rec['file_name']}")
+    ops_diag_jobs.save()
+    return ops_json({'ok': True, 'job': _ops_fd_job_public(rec)})
+
+
+async def _ops_diag_receive(request, rec: dict):
+    cfg = ops_fd_cfg()
+    limit = max(1, ops_int(cfg.get('diag_max_mb'), 200)) * 1024 * 1024
+    name = request.match_info.get('filename') or rec.get('file_name') or f"{rec['cp']}_diagnostics.zip"
+    os.makedirs(DIAGNOSTICS_DIR, exist_ok=True)
+    try:
+        if (request.content_type or '').lower().startswith('multipart/'):
+            reader = await request.multipart()
+            part = None
+            while True:
+                part = await reader.next()
+                if part is None or part.filename:
+                    break
+                await part.release()
+            if part is None:
+                return web.Response(status=400, text='no file in the upload')
+            name = request.match_info.get('filename') or part.filename or name
+            fname = f"{_ops_fd_safe(rec['cp'], 'cp')}__{ops_dt().strftime('%Y%m%d_%H%M%S')}__{_ops_fd_safe(name, 'diagnostics.zip')}"
+            size, sha = await _ops_fd_stream_to(part, os.path.join(DIAGNOSTICS_DIR, fname), limit, True)
+        else:
+            fname = f"{_ops_fd_safe(rec['cp'], 'cp')}__{ops_dt().strftime('%Y%m%d_%H%M%S')}__{_ops_fd_safe(name, 'diagnostics.zip')}"
+            size, sha = await _ops_fd_stream_to(request.content, os.path.join(DIAGNOSTICS_DIR, fname), limit, False)
+    except ValueError:
+        rec['status'] = 'too large'
+        _ops_fd_hist(rec, f"upload refused: larger than {cfg.get('diag_max_mb')} MB")
+        ops_diag_jobs.save()
+        return web.Response(status=413, text='too large')
+    if size == 0:
+        try:
+            os.remove(os.path.join(DIAGNOSTICS_DIR, fname))
+        except OSError:
+            pass
+        return web.Response(status=400, text='empty body')
+    rec.update(status='received', file=fname, size=size, sha256=sha, received_t=round(ops_now()))
+    _ops_fd_hist(rec, f'file received: {fname} ({size:,} bytes) from {_client_ip(request)}')
+    ops_diag_jobs.save()
+    logger.info(f"📥 diagnostics from {rec['cp']}: {fname} ({size:,} bytes)")
+    app_state.add_log('📥 IN', rec['cp'], 'DiagnosticsFileReceived', {'fileName': fname, 'size': size})
+    await app_state.broadcast('diagnostics_received', {'fileName': fname, 'size': size, 'cp': rec['cp'],
+                                                       'timestamp': datetime.now().isoformat(timespec='seconds')})
+    return web.Response(status=200, text='OK')
+
+
+async def ops_diag_upload(request):
+    """Public: a charger uploads its diagnostics file (PUT or POST, raw body or multipart) to the address it was given."""
+    token = request.match_info.get('token', '')
+    if not token.isascii():
+        return web.Response(status=403, text='unknown or expired upload address')
+    rec = next((r for r in ops_diag_jobs.data.values() if r.get('token') and secrets.compare_digest(str(r['token']), token)), None)
+    if rec is None or ops_now() - float(rec.get('t') or 0) > OPS_FD_WAIT_DAYS * 86400:
+        return web.Response(status=403, text='unknown or expired upload address')
+    return await _ops_diag_receive(request, rec)
+
+
+async def handle_diagnostics_upload(request):
+    """[OPS] v1.11 the old address without a token (PUT /api/diagnostics/upload/<file>): only while a diagnostics request
+    is open (2 h); the file goes to the newest open request."""
+    now = ops_now()
+    open_recs = sorted((r for r in ops_diag_jobs.data.values() if r.get('status') in OPS_DIAG_ACTIVE and now - float(r.get('t') or 0) < 7200),
+                       key=lambda r: r.get('t') or 0)
+    if not open_recs:
+        return web.json_response({'error': 'no diagnostics request is open'}, status=403)
+    return await _ops_diag_receive(request, open_recs[-1])
+
+
+def ops_fd_diag_status(cp: str, status: str):
+    status = str(status).split('.')[-1]
+    status = {'uploading': 'Uploading', 'uploaded': 'Uploaded', 'uploadfailed': 'UploadFailed', 'idle': 'Idle'}.get(status.lower(), status)
+    recs = sorted((r for r in ops_diag_jobs.data.values() if r.get('cp') == cp), key=lambda r: r.get('t') or 0)
+    rec = recs[-1] if recs else None
+    if rec is None or ops_now() - float(rec.get('t') or 0) > 2 * 86400:
+        return
+    _ops_fd_hist(rec, f'DiagnosticsStatusNotification {status}')
+    if rec.get('status') != 'received' and status != 'Idle':
+        rec['status'] = status
+        if status == 'Uploaded':
+            rec['uploaded_t'] = round(ops_now())
+    ops_diag_jobs.save()
+
+
+async def ops_api_diag_delete(request):
+    b = await ops_body(request)
+    name = os.path.basename(str(b.get('file') or ''))
+    path = os.path.join(DIAGNOSTICS_DIR, name)
+    if not name or not os.path.isfile(path):
+        return ops_err('No such file', 404)
+    try:
+        os.remove(path)
+    except OSError as e:
+        return ops_err(f'Could not delete: {e}')
+    for r in ops_diag_jobs.data.values():
+        if r.get('file') == name:
+            r['file_deleted'] = True
+    ops_diag_jobs.save()
+    return ops_json({'ok': True})
+
+
+def _ops_fd_diag_files() -> list:
+    out = []
+    try:
+        names = os.listdir(DIAGNOSTICS_DIR)
+    except OSError:
+        names = []
+    for n in names:
+        p = os.path.join(DIAGNOSTICS_DIR, n)
+        if not os.path.isfile(p) or n.endswith('.part'):
+            continue
+        st = os.stat(p)
+        cp = n.split('__', 1)[0] if '__' in n else ''
+        out.append({'name': n, 'cp': cp, 'size': st.st_size, 't': round(st.st_mtime)})
+    out.sort(key=lambda x: -x['t'])
+    return out[:500]
+
+
+# ---- status of the hooks: FirmwareStatusNotification / DiagnosticsStatusNotification --------------------------------
+_ops_fd_on_fw_orig = CentralSystem.on_firmware_status
+_ops_fd_on_diag_orig = CentralSystem.on_diagnostics_status
+
+
+@on(Action.firmware_status_notification)
+async def _ops_fd_on_firmware_status(self, status: str, **kwargs):
+    res = await _ops_fd_on_fw_orig(self, status, **kwargs)
+    try:
+        ops_fd_fw_status(self.id, status)
+        await app_state.broadcast('fwdiag', {'cp': self.id})
+    except Exception as e:
+        logger.error(f"ops: firmware status of {self.id} not recorded: {e}")
+    return res
+
+
+@on(Action.diagnostics_status_notification)
+async def _ops_fd_on_diagnostics_status(self, status: str, **kwargs):
+    res = await _ops_fd_on_diag_orig(self, status, **kwargs)
+    try:
+        ops_fd_diag_status(self.id, status)
+        await app_state.broadcast('fwdiag', {'cp': self.id})
+    except Exception as e:
+        logger.error(f"ops: diagnostics status of {self.id} not recorded: {e}")
+    return res
+
+
+CentralSystem.on_firmware_status = _ops_fd_on_firmware_status
+CentralSystem.on_diagnostics_status = _ops_fd_on_diagnostics_status
+
+
+# ---- API ------------------------------------------------------------------------------------------------------------
+def _ops_fd_job_public(rec: dict) -> dict:
+    d = {k: v for k, v in rec.items() if k != 'token'}
+    d['name_cp'] = ops_cp_name(rec.get('cp') or '')
+    return d
+
+
+async def ops_api_fwdiag(request):
+    base = ops_fd_base(request)
+    cfg = ops_fd_cfg()
+    stations = [_ops_fd_station(s.get('id')) for s in app_state.station_records() if s.get('id')]
+    fw_jobs = sorted(ops_fw_jobs.data.values(), key=lambda r: -(r.get('t') or 0))[:300]
+    diag_jobs = sorted(ops_diag_jobs.data.values(), key=lambda r: -(r.get('t') or 0))[:300]
+    files = await asyncio.to_thread(_ops_fd_diag_files)
+    cloud = bool(os.environ.get('CSMS_PUBLIC_URL')) and _db() is not None
+    return ops_json({'base': base, 'base_source': 'CSMS_PUBLIC_URL' if os.environ.get('CSMS_PUBLIC_URL') else
+                     ('setting' if cfg.get('charger_base_url') else ('payments' if (pay_settings.data.get('public_base_url') or '') else 'lan')),
+                     'cfg': {k: cfg.get(k) for k in OPS_FD_DEFAULTS}, 'cloud': cloud,
+                     'files': sorted((_ops_fd_file_public(r, base) for r in ops_fw_files.data.values()), key=lambda r: -(r.get('t') or 0)),
+                     'fw_jobs': [_ops_fd_job_public(r) for r in fw_jobs], 'diag_jobs': [_ops_fd_job_public(r) for r in diag_jobs],
+                     'diag_files': files, 'stations': stations})
+
+
+async def ops_api_fwdiag_config(request):
+    b = await ops_body(request)
+    cfg = ops_fd_cfg()
+    if 'charger_base_url' in b:
+        v = str(b.get('charger_base_url') or '').strip().rstrip('/')
+        if v and not _ops_re.match(r'^https?://[^/\s]+$', v, _ops_re.I):
+            return ops_err('Give the address as http://host:port or https://host (no path)')
+        cfg['charger_base_url'] = v
+    for k, lo, hi in (('fw_retries', 0, 20), ('fw_retry_interval', 0, 86400), ('diag_retries', 0, 10), ('diag_retry_interval', 0, 3600),
+                      ('diag_keep_days', 1, 3650), ('fw_max_mb', 1, 2000), ('diag_max_mb', 1, 2000), ('job_keep_days', 7, 3650)):
+        if k in b:
+            cfg[k] = ops_int(b[k], OPS_FD_DEFAULTS[k], lo, hi)
+    ops_settings.save()
+    return ops_json({'ok': True, 'cfg': {k: cfg.get(k) for k in OPS_FD_DEFAULTS}, 'base': ops_fd_base(request)})
+
+
+async def ops_fd_loop():
+    """Saves download counters, forgets old jobs, deletes diagnostics files older than the keep time (daily)."""
+    last_clean = 0.0
+    while True:
+        await asyncio.sleep(30)
+        if _OPS_FD.pop('dirty', False):
+            ops_fw_files.save()
+            ops_fw_jobs.save()
+        now = ops_now()
+        if now - last_clean > 86400:
+            last_clean = now
+            keep = max(1, ops_int(ops_fd_cfg().get('diag_keep_days'), 90)) * 86400
+
+            def _clean():
+                n = 0
+                for f in _ops_fd_diag_files():
+                    if now - f['t'] > keep:
+                        try:
+                            os.remove(os.path.join(DIAGNOSTICS_DIR, f['name']))
+                            n += 1
+                        except OSError:
+                            pass
+                return n
+            n = await asyncio.to_thread(_clean)
+            if n:
+                logger.info(f"📥 {n} diagnostics file(s) older than {ops_fd_cfg().get('diag_keep_days')} days deleted")
+
+
+OPS_TASKS.append(ops_fd_loop)
+OPS_ROUTES += [
+    ('GET', '/api/ops/fwdiag', ops_api_fwdiag), ('POST', '/api/ops/fwdiag/config', ops_api_fwdiag_config),
+    ('POST', '/api/ops/fw/upload', ops_api_fw_upload), ('POST', '/api/ops/fw/delete', ops_api_fw_delete),
+    ('POST', '/api/ops/fw/update', ops_api_fw_update), ('POST', '/api/ops/fw/cancel', ops_api_fw_cancel),
+    ('POST', '/api/ops/diag/request', ops_api_diag_request), ('POST', '/api/ops/diag/delete', ops_api_diag_delete),
+    ('GET', '/fw/{token}/{name}', ops_fw_download), ('HEAD', '/fw/{token}/{name}', ops_fw_download),
+    ('PUT', '/api/diagnostics/upload/t/{token}/{filename}', ops_diag_upload), ('POST', '/api/diagnostics/upload/t/{token}/{filename}', ops_diag_upload),
+    ('PUT', '/api/diagnostics/upload/t/{token}/', ops_diag_upload), ('POST', '/api/diagnostics/upload/t/{token}/', ops_diag_upload),
+    ('PUT', '/api/diagnostics/upload/t/{token}', ops_diag_upload), ('POST', '/api/diagnostics/upload/t/{token}', ops_diag_upload),
+]
+
+OPS_CSS_PARTS.append(r'''/* [OPS] v1.11 firmware & logs tab */
+.ops-fd-base { font-size: 0.82rem; line-height: 1.6; word-break: break-word; }
+.ops-fd-chip { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 999px; font-size: 0.72rem; font-weight: 700; white-space: nowrap;
+    border: 1px solid transparent; }
+.ops-fd-ok { background: rgba(31, 157, 73, 0.12); color: #13803c; border-color: rgba(31, 157, 73, 0.35); }
+.ops-fd-bad { background: rgba(220, 38, 38, 0.10); color: #b91c1c; border-color: rgba(220, 38, 38, 0.35); }
+.ops-fd-run { background: rgba(42, 120, 214, 0.10); color: #1d5fae; border-color: rgba(42, 120, 214, 0.35); }
+.ops-fd-wait { background: rgba(217, 119, 6, 0.10); color: #b45309; border-color: rgba(217, 119, 6, 0.35); }
+.ops-fd-off { background: rgba(100, 116, 139, 0.10); color: #475569; border-color: rgba(100, 116, 139, 0.30); }
+.ops-fd-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 0.6rem; align-items: end; margin-bottom: 0.7rem; }
+.ops-fd-btnl { display: flex; align-items: flex-end; }
+.ops-fd-pick { border: 1px solid var(--border); border-radius: 10px; padding: 0.5rem; margin-bottom: 0.8rem; }
+.ops-fd-pick-head { display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; margin-bottom: 0.4rem; }
+.ops-fd-pick-head .tb-inp { flex: 1 1 220px; min-width: 0; }
+.ops-fd-pick-head #fdSend { margin-left: auto; }
+.ops-fd-list { max-height: 300px; overflow: auto; }
+.ops-fd-list input[type=checkbox] { width: 18px; height: 18px; }
+.ops-fd-prog { position: relative; height: 22px; border-radius: 8px; background: rgba(100, 116, 139, 0.15); overflow: hidden; margin: 0 0 0.6rem; }
+.ops-fd-prog div { position: absolute; left: 0; top: 0; bottom: 0; width: 0; background: linear-gradient(90deg, #1b8a44, #2fb35f); transition: width 0.2s; }
+.ops-fd-prog span { position: relative; display: block; text-align: center; font-size: 0.75rem; line-height: 22px; font-weight: 700; }
+#view-fwdiag details summary { cursor: pointer; font-size: 0.78rem; }
+#view-fwdiag details div { font-size: 0.72rem; }
+#view-fwdiag h4 { margin: 0.8rem 0 0.4rem; }
+@media (max-width: 640px) {
+    .ops-fd-pick-head #fdSend { margin-left: 0; width: 100%; }
+}
+''')
+OPS_JS_PARTS.append(r'''/* [OPS] 🧰 Firmware & logs tab (v1.11): firmware files, UpdateFirmware to chargers, diagnostics files (logs) from chargers */
+(function () {
+    'use strict';
+    const OPS = window.OPS;
+    if (!OPS) return;
+    const F = {data: null, sel: new Set(), q: '', mode: 'file'};
+    const td = (l, h, c) => OPS.td(l, h, c);
+    const size = b => (b == null ? '—' : (b >= 1e9 ? OPS.num(b / 1e9, 2) + ' GB' : (b >= 1e6 ? OPS.num(b / 1e6, 1) + ' MB' : OPS.num(Math.max(1, b / 1e3), 0) + ' kB')));
+    const FW_ST = {waiting: ['wait', 'Waiting for the charger'], sending: ['wait', 'Sending'], sent: ['run', 'Sent'], Downloading: ['run', 'Downloading'],
+        Downloaded: ['run', 'Downloaded'], Installing: ['run', 'Installing'], Installed: ['ok', 'Installed'], DownloadFailed: ['bad', 'Download failed'],
+        InstallationFailed: ['bad', 'Installation failed'], refused: ['bad', 'Refused by the charger'], cancelled: ['off', 'Cancelled'], Idle: ['off', 'Idle']};
+    const DG_ST = {requested: ['wait', 'Requested'], Uploading: ['run', 'Uploading'], Uploaded: ['run', 'Uploaded - file not here yet'], received: ['ok', 'File received'],
+        UploadFailed: ['bad', 'Upload failed'], refused: ['bad', 'Refused by the charger'], 'no file': ['off', 'No file to send'], 'too large': ['bad', 'File too large']};
+    const chip = (map, st) => { const m = map[st] || ['off', st || '—']; return '<span class="ops-fd-chip ops-fd-' + m[0] + '">' + OPS.t(m[1]) + '</span>'; };
+    const dl = s => (s ? String(s).replace(' ', 'T').slice(0, 16) : '');
+
+    function build(v) {
+        v.dataset.built = '1';
+        v.innerHTML = '<section class="kpis ops-kpis">' + OPS.kpi('info', 'Firmware files', 'fdKFiles', '') + OPS.kpi('info', 'Updates running', 'fdKRun', '') +
+            OPS.kpi('good', 'Updated (30 days)', 'fdKOk', '') + OPS.kpi('warn', 'Failed (30 days)', 'fdKBad', '') + OPS.kpi('info', 'Log files received', 'fdKLogs', '') + '</section>' +
+            '<section class="pay-panel ops-panel"><div class="ops-head"><h3>' + OPS.t('🧰 Firmware & charger logs') + '</h3><div class="ops-actions">' +
+            '<button class="tb-btn" id="fdCfg">' + OPS.t('⚙️ Settings') + '</button></div></div><div id="fdBase" class="ops-fd-base"></div></section>' +
+            // firmware files
+            '<section class="pay-panel ops-panel"><div class="ops-head"><h3>' + OPS.t('🧩 Firmware files') + '</h3><div class="ops-actions">' +
+            '<input class="tb-inp" id="fdNote" placeholder="' + OPS.esc(OPS.tx('Note (version, models)')) + '">' +
+            '<label class="tb-btn primary">' + OPS.t('⬆️ Upload a firmware file') + '<input type="file" id="fdUpload" hidden></label></div></div>' +
+            '<div id="fdProg" class="ops-fd-prog" hidden><div></div><span></span></div>' +
+            '<div class="ops-table-wrap"><table class="fleet-table ops-table ops-cards" id="fdFiles"></table></div></section>' +
+            // update firmware
+            '<section class="pay-panel ops-panel"><div class="ops-head"><h3>' + OPS.t('⬆️ Update the firmware of chargers') + '</h3></div>' +
+            '<div class="ops-form ops-fd-form">' +
+            '<label>' + OPS.t('Firmware') + '<select class="tb-inp" id="fdFile"></select></label>' +
+            '<label id="fdUrlL" hidden>' + OPS.t('Address of the firmware (http, https, ftp)') + '<input class="tb-inp" id="fdUrl" placeholder="https://…"></label>' +
+            '<label>' + OPS.t('Start the download (Bhutan Time, empty = now)') + '<input class="tb-inp" type="datetime-local" id="fdWhen"></label>' +
+            '<label>' + OPS.t('Retries') + '<input class="tb-inp" type="number" min="0" max="20" id="fdRetries"></label>' +
+            '<label>' + OPS.t('Seconds between retries') + '<input class="tb-inp" type="number" min="0" id="fdInterval"></label></div>' +
+            '<div class="ops-fd-pick"><div class="ops-fd-pick-head"><input class="tb-inp" id="fdQ" placeholder="' + OPS.esc(OPS.tx('Filter: charger, model, firmware')) + '">' +
+            '<button class="tb-btn" id="fdAllOn">' + OPS.t('Select all online') + '</button><button class="tb-btn" id="fdNone">' + OPS.t('Clear') + '</button>' +
+            '<span id="fdSelN" class="muted"></span><button class="tb-btn primary" id="fdSend">' + OPS.t('⬆️ Send the update') + '</button></div>' +
+            '<div class="ops-table-wrap ops-fd-list"><table class="fleet-table ops-table" id="fdPick"></table></div></div>' +
+            '<h4>' + OPS.t('Updates') + '</h4><div class="ops-table-wrap ops-tall"><table class="fleet-table ops-table ops-cards" id="fdJobs"></table></div>' +
+            '<div class="pay-help">' + OPS.t('The CSMS sends UpdateFirmware with the address of the file; the charger downloads it, installs it and restarts, and reports each step (FirmwareStatusNotification). A charger that is offline gets the update when it connects (for 7 days). The firmware version it reports at its next start is shown as "after".') + '</div></section>' +
+            // diagnostics
+            '<section class="pay-panel ops-panel"><div class="ops-head"><h3>' + OPS.t('📥 Charger logs (diagnostics)') + '</h3></div>' +
+            '<div class="ops-form ops-fd-form"><label>' + OPS.t('Charger (online)') + '<select class="tb-inp" id="fdDgCp"></select></label>' +
+            '<label>' + OPS.t('From (optional)') + '<input class="tb-inp" type="datetime-local" id="fdDgFrom"></label>' +
+            '<label>' + OPS.t('To (optional)') + '<input class="tb-inp" type="datetime-local" id="fdDgTo"></label>' +
+            '<label class="ops-fd-btnl"><button class="tb-btn primary" id="fdDgGo">' + OPS.t('📥 Ask for the log file') + '</button></label></div>' +
+            '<h4>' + OPS.t('Requests') + '</h4><div class="ops-table-wrap"><table class="fleet-table ops-table ops-cards" id="fdDgJobs"></table></div>' +
+            '<h4>' + OPS.t('Files received') + '</h4><div class="ops-table-wrap ops-tall"><table class="fleet-table ops-table ops-cards" id="fdDgFiles"></table></div>' +
+            '<div class="pay-help">' + OPS.t('Each request gets an upload address of its own; the charger uploads its file there over HTTP or HTTPS (PUT or POST, up to the size in the settings). Chargers that can only upload by FTP need an FTP server of their own.') + '</div></section>';
+        OPS.$('fdUpload').onchange = upload;
+        OPS.$('fdCfg').onclick = settings;
+        OPS.$('fdFile').onchange = () => { OPS.$('fdUrlL').hidden = OPS.$('fdFile').value !== '__url'; };
+        OPS.$('fdQ').oninput = () => { F.q = OPS.$('fdQ').value.trim().toLowerCase(); renderPick(); };
+        OPS.$('fdAllOn').onclick = () => { (F.data.stations || []).filter(s => s.online).forEach(s => F.sel.add(s.id)); renderPick(); };
+        OPS.$('fdNone').onclick = () => { F.sel.clear(); renderPick(); };
+        OPS.$('fdSend').onclick = sendUpdate;
+        OPS.$('fdDgGo').onclick = askLogs;
+        v.addEventListener('click', onClick);
+        v.addEventListener('change', e => {
+            const c = e.target.closest('[data-pick]');
+            if (!c) return;
+            if (c.checked) F.sel.add(c.dataset.pick); else F.sel.delete(c.dataset.pick);
+            OPS.$('fdSelN').textContent = OPS.tx('{n} selected', {n: F.sel.size});
+        });
+    }
+
+    async function load() {
+        try { F.data = await OPS.api('/api/ops/fwdiag'); } catch (e) { return OPS.fail(e); }
+        render();
+    }
+
+    function render() {
+        const d = F.data, now = Date.now() / 1000, month = now - 30 * 86400;
+        OPS.$('fdKFiles').textContent = d.files.length;
+        OPS.$('fdKRun').textContent = d.fw_jobs.filter(j => ['waiting', 'sending', 'sent', 'Downloading', 'Downloaded', 'Installing'].includes(j.status)).length;
+        OPS.$('fdKOk').textContent = d.fw_jobs.filter(j => j.status === 'Installed' && j.t > month).length;
+        OPS.$('fdKBad').textContent = d.fw_jobs.filter(j => ['DownloadFailed', 'InstallationFailed', 'refused'].includes(j.status) && j.t > month).length;
+        OPS.$('fdKLogs').textContent = d.diag_files.length;
+        const src = {CSMS_PUBLIC_URL: 'the public address of this server (CSMS_PUBLIC_URL)', setting: 'set in the settings', payments: 'the public address in the payment settings',
+            lan: 'this computer in the local network - check that the chargers can reach it'}[d.base_source] || '';
+        OPS.$('fdBase').innerHTML = OPS.t('Chargers download firmware from and upload logs to') + ' <b>' + OPS.esc(d.base) + '</b>' +
+            ' <span class="muted">(' + OPS.t(src) + ')</span>' +
+            (d.cloud ? '<br><span class="ops-warn">' + OPS.t('Cloud server: files are kept on its disk only until the next restart or deploy. Download log files right away and upload a firmware file shortly before the update.') + '</span>' : '');
+        // files
+        OPS.$('fdFiles').innerHTML = '<thead><tr><th>' + OPS.t('File') + '</th><th>' + OPS.t('Size') + '</th><th>' + OPS.t('Uploaded') + '</th><th>' + OPS.t('Downloads') + '</th><th></th></tr></thead><tbody>' +
+            (d.files.map(f => '<tr>' + td('File', '<b>' + OPS.esc(f.name) + '</b>' + (f.missing ? ' <span class="ops-bad">' + OPS.t('file missing on the disk') + '</span>' : '') +
+                '<br><span class="muted">' + OPS.esc(f.id) + (f.note ? ' · ' + OPS.esc(f.note) : '') + ' · SHA-256 ' + OPS.esc((f.sha256 || '').slice(0, 16)) + '…</span>') +
+                td('Size', size(f.size)) + td('Uploaded', OPS.fmt(f.t) + '<br><span class="muted">' + OPS.esc(f.by || '') + '</span>') +
+                td('Downloads', String(f.downloads || 0) + (f.last_download ? '<br><span class="muted">' + OPS.fmt(f.last_download.t) + ' · ' + OPS.esc(f.last_download.ip) + '</span>' : '')) +
+                td('', '<div class="ops-btns"><button class="tb-btn ops-mini" data-fd="copy" data-u="' + OPS.esc(f.url) + '">' + OPS.t('🔗 Copy address') + '</button>' +
+                    '<button class="tb-btn ops-mini" data-fd="delfile" data-id="' + OPS.esc(f.id) + '">🗑️</button></div>') + '</tr>').join('') ||
+                '<tr><td colspan="5" class="muted">' + OPS.t('No firmware file yet') + '</td></tr>') + '</tbody>';
+        // firmware choice
+        const cur = OPS.$('fdFile').value;
+        OPS.$('fdFile').innerHTML = d.files.map(f => OPS.opt(f.id, f.name + ' (' + size(f.size) + ')', cur === f.id)).join('') + OPS.opt('__url', '— ' + OPS.tx('another address (URL)') + ' —', cur === '__url');
+        OPS.$('fdUrlL').hidden = OPS.$('fdFile').value !== '__url';
+        if (!OPS.$('fdRetries').value) OPS.$('fdRetries').value = d.cfg.fw_retries;
+        if (!OPS.$('fdInterval').value) OPS.$('fdInterval').value = d.cfg.fw_retry_interval;
+        renderPick();
+        // update jobs
+        OPS.$('fdJobs').innerHTML = '<thead><tr><th>' + OPS.t('Charger') + '</th><th>' + OPS.t('Firmware') + '</th><th>' + OPS.t('Status') + '</th><th>' + OPS.t('Version before → after') + '</th><th>' + OPS.t('Steps') + '</th><th></th></tr></thead><tbody>' +
+            (d.fw_jobs.slice(0, 100).map(j => '<tr>' + td('Charger', '<b>' + OPS.esc(j.cp) + '</b>' + (j.name_cp ? '<br><span class="muted">' + OPS.esc(j.name_cp) + '</span>' : '')) +
+                td('Firmware', OPS.esc(j.name) + '<br><span class="muted">' + OPS.fmt(j.t) + ' · ' + OPS.esc(j.by || '') + (j.retrieve_t ? ' · ' + OPS.t('from {t}', {t: OPS.fmt(j.retrieve_t)}) : '') + '</span>') +
+                td('Status', chip(FW_ST, j.status)) + td('Version before → after', OPS.esc(j.fw_before || '—') + ' → ' + (j.fw_after ? '<b>' + OPS.esc(j.fw_after) + '</b>' : '—')) +
+                td('Steps', '<details><summary>' + ((j.history || []).length === 1 ? OPS.t('1 step') : OPS.t('{n} steps', {n: (j.history || []).length})) + '</summary>' + (j.history || []).map(h => '<div class="muted">' + OPS.fmt(h[0], true) + ' · ' + OPS.esc(h[1]) + '</div>').join('') + '</details>') +
+                td('', j.status === 'waiting' ? '<button class="tb-btn ops-mini" data-fd="cancel" data-id="' + OPS.esc(j.id) + '">' + OPS.t('Cancel') + '</button>' : '') + '</tr>').join('') ||
+                '<tr><td colspan="6" class="muted">' + OPS.t('No update sent yet') + '</td></tr>') + '</tbody>';
+        // diagnostics
+        const dcur = OPS.$('fdDgCp').value;
+        const online = (d.stations || []).filter(s => s.online);
+        OPS.$('fdDgCp').innerHTML = online.map(s => OPS.opt(s.id, s.id + (s.name ? ' · ' + s.name : ''), dcur === s.id)).join('') || OPS.opt('', 'No charger online', true);
+        OPS.$('fdDgJobs').innerHTML = '<thead><tr><th>' + OPS.t('Charger') + '</th><th>' + OPS.t('Requested at') + '</th><th>' + OPS.t('Status') + '</th><th>' + OPS.t('File') + '</th><th>' + OPS.t('Steps') + '</th></tr></thead><tbody>' +
+            (d.diag_jobs.slice(0, 50).map(j => '<tr>' + td('Charger', '<b>' + OPS.esc(j.cp) + '</b>' + (j.name_cp ? '<br><span class="muted">' + OPS.esc(j.name_cp) + '</span>' : '')) +
+                td('Requested at', OPS.fmt(j.t) + '<br><span class="muted">' + OPS.esc(j.by || '') + '</span>') + td('Status', chip(DG_ST, j.status)) +
+                td('File', j.file && !j.file_deleted ? '<a href="/api/diagnostics/files/' + encodeURIComponent(j.file) + '" download>' + OPS.esc(j.file) + '</a><br><span class="muted">' + size(j.size) + '</span>'
+                    : OPS.esc(j.file_name || '—')) +
+                td('Steps', '<details><summary>' + ((j.history || []).length === 1 ? OPS.t('1 step') : OPS.t('{n} steps', {n: (j.history || []).length})) + '</summary>' + (j.history || []).map(h => '<div class="muted">' + OPS.fmt(h[0], true) + ' · ' + OPS.esc(h[1]) + '</div>').join('') + '</details>') + '</tr>').join('') ||
+                '<tr><td colspan="5" class="muted">' + OPS.t('No request yet') + '</td></tr>') + '</tbody>';
+        OPS.$('fdDgFiles').innerHTML = '<thead><tr><th>' + OPS.t('File') + '</th><th>' + OPS.t('Charger') + '</th><th>' + OPS.t('Received') + '</th><th>' + OPS.t('Size') + '</th><th></th></tr></thead><tbody>' +
+            (d.diag_files.map(f => '<tr>' + td('File', '<a href="/api/diagnostics/files/' + encodeURIComponent(f.name) + '" download>' + OPS.esc(f.name) + '</a>') + td('Charger', OPS.esc(f.cp || '—')) +
+                td('Received', OPS.fmt(f.t)) + td('Size', size(f.size)) + td('', '<button class="tb-btn ops-mini" data-fd="deldiag" data-f="' + OPS.esc(f.name) + '">🗑️</button>') + '</tr>').join('') ||
+                '<tr><td colspan="5" class="muted">' + OPS.t('No file received yet') + '</td></tr>') + '</tbody>';
+    }
+
+    function renderPick() {
+        const d = F.data;
+        if (!d) return;
+        const last = {};
+        d.fw_jobs.forEach(j => { if (!last[j.cp]) last[j.cp] = j; });
+        const rows = (d.stations || []).filter(s => !F.q || (s.id + ' ' + s.name + ' ' + s.model + ' ' + s.vendor + ' ' + s.fw).toLowerCase().includes(F.q))
+            .sort((a, b) => (b.online - a.online) || a.id.localeCompare(b.id));
+        OPS.$('fdPick').innerHTML = '<thead><tr><th></th><th>' + OPS.t('Charger') + '</th><th>' + OPS.t('Model') + '</th><th>' + OPS.t('Firmware now') + '</th><th>' + OPS.t('Last update') + '</th></tr></thead><tbody>' +
+            (rows.map(s => '<tr><td><input type="checkbox" data-pick="' + OPS.esc(s.id) + '"' + (F.sel.has(s.id) ? ' checked' : '') + '></td>' +
+                '<td><b>' + OPS.esc(s.id) + '</b> ' + (s.online ? '<span class="ops-ok">● ' + OPS.t('online') + '</span>' : '<span class="muted">○ ' + OPS.t('offline') + '</span>') +
+                (s.name ? '<br><span class="muted">' + OPS.esc(s.name) + '</span>' : '') + '</td><td>' + OPS.esc([s.vendor, s.model].filter(Boolean).join(' ') || '—') + '</td>' +
+                '<td>' + OPS.esc(s.fw || '—') + '</td><td>' + (last[s.id] ? chip(FW_ST, last[s.id].status) : '—') + '</td></tr>').join('') ||
+                '<tr><td colspan="5" class="muted">' + OPS.t('No charger') + '</td></tr>') + '</tbody>';
+        OPS.$('fdSelN').textContent = OPS.tx('{n} selected', {n: F.sel.size});
+    }
+
+    function upload() {
+        const f = OPS.$('fdUpload').files[0];
+        if (!f) return;
+        const fd = new FormData();
+        fd.append('note', OPS.$('fdNote').value.trim());
+        fd.append('file', f);
+        const prog = OPS.$('fdProg'), bar = prog.querySelector('div'), lab = prog.querySelector('span');
+        prog.hidden = false;
+        const x = new XMLHttpRequest();
+        x.open('POST', '/api/ops/fw/upload');
+        x.upload.onprogress = e => { if (e.lengthComputable) { const p = Math.round(100 * e.loaded / e.total); bar.style.width = p + '%'; lab.textContent = p + '% · ' + size(e.loaded); } };
+        x.onload = () => {
+            prog.hidden = true;
+            let j = {};
+            try { j = JSON.parse(x.responseText); } catch (e) { j = {}; }
+            if (x.status === 200) { OPS.toast(OPS.tx('Firmware file {n} added', {n: (j.file || {}).name || f.name}), 'success'); OPS.$('fdNote').value = ''; F.lastFile = (j.file || {}).id; }
+            else OPS.toast(j.error || ('HTTP ' + x.status), 'error');
+            OPS.$('fdUpload').value = '';
+            load().then(() => { if (F.lastFile) { OPS.$('fdFile').value = F.lastFile; F.lastFile = null; } });
+        };
+        x.onerror = () => { prog.hidden = true; OPS.toast(OPS.tx('Upload failed'), 'error'); OPS.$('fdUpload').value = ''; };
+        x.send(fd);
+    }
+
+    async function sendUpdate() {
+        const file = OPS.$('fdFile').value, cps = Array.from(F.sel);
+        if (!cps.length) return OPS.toast(OPS.tx('Choose at least one charger'), 'error');
+        const body = {cps: cps, retrieve: OPS.$('fdWhen').value, retries: OPS.$('fdRetries').value, interval: OPS.$('fdInterval').value};
+        if (file === '__url') body.url = OPS.$('fdUrl').value.trim(); else body.file = file;
+        const name = file === '__url' ? body.url : (F.data.files.find(f => f.id === file) || {}).name;
+        if (!name) return OPS.toast(OPS.tx('Choose a firmware file or give its address'), 'error');
+        if (!OPS.confirm('Send firmware {f} to {n} charger(s)? The chargers restart to install it - do not update chargers that are charging.', {f: name, n: cps.length})) return;
+        const btn = OPS.$('fdSend');
+        btn.disabled = true;
+        try {
+            const j = await OPS.post('/api/ops/fw/update', body);
+            const sent = j.jobs.filter(x => x.status === 'sent').length, wait = j.jobs.filter(x => x.status === 'waiting').length;
+            OPS.toast(OPS.tx('Update sent to {s} charger(s), {w} waiting for the charger', {s: sent, w: wait}), 'success');
+            F.sel.clear();
+        } catch (e) { OPS.fail(e); }
+        btn.disabled = false;
+        load();
+    }
+
+    async function askLogs() {
+        const cp = OPS.$('fdDgCp').value;
+        if (!cp) return OPS.toast(OPS.tx('No charger online'), 'error');
+        const btn = OPS.$('fdDgGo');
+        btn.disabled = true;
+        try {
+            const j = await OPS.post('/api/ops/diag/request', {cp: cp, from: OPS.$('fdDgFrom').value, to: OPS.$('fdDgTo').value});
+            OPS.toast(j.job.file_name ? OPS.tx('{cp} will upload {f}', {cp: cp, f: j.job.file_name}) : OPS.tx('{cp} has no log file to send', {cp: cp}), j.job.file_name ? 'success' : 'info');
+        } catch (e) { OPS.fail(e); }
+        btn.disabled = false;
+        load();
+    }
+
+    async function onClick(e) {
+        const b = e.target.closest('[data-fd]');
+        if (!b) return;
+        const a = b.dataset.fd;
+        if (a === 'copy') {
+            try { await navigator.clipboard.writeText(b.dataset.u); OPS.toast(OPS.tx('Address copied'), 'success'); }
+            catch (err) { window.prompt(OPS.tx('Address of the file'), b.dataset.u); }
+            return;
+        }
+        try {
+            if (a === 'delfile') { if (!OPS.confirm('Delete this firmware file?')) return; await OPS.post('/api/ops/fw/delete', {id: b.dataset.id}); }
+            if (a === 'cancel') await OPS.post('/api/ops/fw/cancel', {id: b.dataset.id});
+            if (a === 'deldiag') { if (!OPS.confirm('Delete {f}?', {f: b.dataset.f})) return; await OPS.post('/api/ops/diag/delete', {file: b.dataset.f}); }
+        } catch (err) { OPS.fail(err); }
+        load();
+    }
+
+    function settings() {
+        const c = F.data.cfg;
+        const html = '<div class="ops-form"><label class="wide">' + OPS.t('Address the chargers use to reach this CSMS (http://host:port or https://host; empty = automatic)') +
+            '<input class="tb-inp" id="fdBaseIn" value="' + OPS.esc(c.charger_base_url || '') + '" placeholder="http://192.168.1.10:8081"></label>' +
+            '<label>' + OPS.t('Firmware download retries') + '<input class="tb-inp" type="number" min="0" max="20" id="fdR" value="' + OPS.esc(c.fw_retries) + '"></label>' +
+            '<label>' + OPS.t('Seconds between firmware retries') + '<input class="tb-inp" type="number" min="0" id="fdRI" value="' + OPS.esc(c.fw_retry_interval) + '"></label>' +
+            '<label>' + OPS.t('Largest firmware file (MB)') + '<input class="tb-inp" type="number" min="1" id="fdFM" value="' + OPS.esc(c.fw_max_mb) + '"></label>' +
+            '<label>' + OPS.t('Largest log file (MB)') + '<input class="tb-inp" type="number" min="1" id="fdDM" value="' + OPS.esc(c.diag_max_mb) + '"></label>' +
+            '<label>' + OPS.t('Keep log files (days)') + '<input class="tb-inp" type="number" min="1" id="fdKeep" value="' + OPS.esc(c.diag_keep_days) + '"></label></div>';
+        OPS.modal('⚙️ Firmware & logs settings', html, [{label: 'Cancel'}, {label: '💾 Save', cls: 'primary', run: async box => {
+            await OPS.post('/api/ops/fwdiag/config', {charger_base_url: OPS.val(box, '#fdBaseIn'), fw_retries: OPS.val(box, '#fdR'), fw_retry_interval: OPS.val(box, '#fdRI'),
+                fw_max_mb: OPS.val(box, '#fdFM'), diag_max_mb: OPS.val(box, '#fdDM'), diag_keep_days: OPS.val(box, '#fdKeep')});
+            OPS.toast(OPS.tx('Saved'), 'success');
+            load();
+            return true;
+        }}], {wide: true});
+    }
+
+    OPS.register({tab: 'fwdiag', perm: 'config', every: 5,
+        show: function () { const v = OPS.$('view-fwdiag'); if (!v) return; if (!v.dataset.built) build(v); load(); },
+        refresh: load,
+        relang: function () { const v = OPS.$('view-fwdiag'); if (v) { v.dataset.built = ''; v.innerHTML = ''; OPS.mods.fwdiag.show(); } }
+    });
+
+    OPS.addI18n({
+        '🧰 Firmware & logs': ['', '🧰 เฟิร์มแวร์และ log'], '🧰 Firmware & charger logs': ['', '🧰 เฟิร์มแวร์และ log ของตู้'], 'Firmware files': ['', 'ไฟล์เฟิร์มแวร์'],
+        'Updates running': ['', 'กำลังอัปเดต'], 'Updated (30 days)': ['', 'อัปเดตสำเร็จ (30 วัน)'], 'Failed (30 days)': ['', 'ล้มเหลว (30 วัน)'], 'Log files received': ['', 'ไฟล์ log ที่ได้รับ'],
+        '🧩 Firmware files': ['', '🧩 ไฟล์เฟิร์มแวร์'], 'Note (version, models)': ['', 'หมายเหตุ (เวอร์ชัน รุ่น)'], '⬆️ Upload a firmware file': ['', '⬆️ อัปโหลดไฟล์เฟิร์มแวร์'],
+        '⬆️ Update the firmware of chargers': ['', '⬆️ อัปเดตเฟิร์มแวร์ของตู้'], 'Firmware': ['', 'เฟิร์มแวร์'], 'Address of the firmware (http, https, ftp)': ['', 'ที่อยู่ของไฟล์เฟิร์มแวร์ (http, https, ftp)'],
+        'Start the download (Bhutan Time, empty = now)': ['', 'เริ่มดาวน์โหลด (เวลาภูฏาน ว่าง = ทันที)'], 'Retries': ['', 'ลองใหม่ (ครั้ง)'], 'Seconds between retries': ['', 'วินาทีระหว่างการลองใหม่'],
+        'Filter: charger, model, firmware': ['', 'ค้นหา: ตู้ รุ่น เฟิร์มแวร์'], 'Select all online': ['', 'เลือกทุกตู้ที่ออนไลน์'], 'Clear': ['', 'ล้าง'], '⬆️ Send the update': ['', '⬆️ ส่งการอัปเดต'],
+        'Updates': ['', 'การอัปเดต'], '📥 Charger logs (diagnostics)': ['', '📥 log ของตู้ (diagnostics)'], 'Charger (online)': ['', 'ตู้ (ออนไลน์)'], 'From (optional)': ['', 'ตั้งแต่ (ไม่บังคับ)'],
+        'To (optional)': ['', 'ถึง (ไม่บังคับ)'], '📥 Ask for the log file': ['', '📥 ขอไฟล์ log'], 'Requests': ['', 'คำขอ'], 'Files received': ['', 'ไฟล์ที่ได้รับ'],
+        'Waiting for the charger': ['', 'รอตู้เชื่อมต่อ'], 'Sending': ['', 'กำลังส่ง'], 'Sent': ['', 'ส่งแล้ว'], 'Downloading': ['', 'กำลังดาวน์โหลด'], 'Downloaded': ['', 'ดาวน์โหลดแล้ว'],
+        'Installing': ['', 'กำลังติดตั้ง'], 'Installed': ['', 'ติดตั้งแล้ว'], 'Download failed': ['', 'ดาวน์โหลดไม่สำเร็จ'], 'Installation failed': ['', 'ติดตั้งไม่สำเร็จ'],
+        'Refused by the charger': ['', 'ตู้ปฏิเสธ'], 'Cancelled': ['', 'ยกเลิกแล้ว'], 'Idle': ['', 'ว่าง'], 'Requested': ['', 'ส่งคำขอแล้ว'], 'Uploading': ['', 'กำลังอัปโหลด'],
+        'Uploaded - file not here yet': ['', 'ตู้แจ้งว่าอัปโหลดแล้ว - ยังไม่ได้รับไฟล์'], 'File received': ['', 'ได้รับไฟล์แล้ว'], 'Upload failed': ['', 'อัปโหลดไม่สำเร็จ'],
+        'No file to send': ['', 'ตู้ไม่มีไฟล์ให้ส่ง'], 'File too large': ['', 'ไฟล์ใหญ่เกินไป'], 'Chargers download firmware from and upload logs to': ['', 'ตู้ดาวน์โหลดเฟิร์มแวร์และส่ง log มาที่'], '1 step': ['', '1 ขั้นตอน'],
+        'the public address of this server (CSMS_PUBLIC_URL)': ['', 'ที่อยู่สาธารณะของเซิร์ฟเวอร์นี้ (CSMS_PUBLIC_URL)'], 'set in the settings': ['', 'ตั้งไว้ในการตั้งค่า'],
+        'the public address in the payment settings': ['', 'ที่อยู่สาธารณะในการตั้งค่าการชำระเงิน'], 'this computer in the local network - check that the chargers can reach it': ['', 'เครื่องนี้ในเครือข่ายภายใน - ตรวจว่าตู้เข้าถึงได้'],
+        'Cloud server: files are kept on its disk only until the next restart or deploy. Download log files right away and upload a firmware file shortly before the update.': ['', 'เซิร์ฟเวอร์คลาวด์: ไฟล์อยู่บนดิสก์จนถึงการรีสตาร์ทหรือ deploy ครั้งถัดไปเท่านั้น ดาวน์โหลดไฟล์ log ทันที และอัปโหลดไฟล์เฟิร์มแวร์ก่อนอัปเดตไม่นาน'],
+        'File': ['', 'ไฟล์'], 'Uploaded': ['', 'อัปโหลดเมื่อ'], 'Downloads': ['', 'ดาวน์โหลด'], 'file missing on the disk': ['', 'ไม่พบไฟล์บนดิสก์'], '🔗 Copy address': ['', '🔗 คัดลอกที่อยู่'],
+        'No firmware file yet': ['', 'ยังไม่มีไฟล์เฟิร์มแวร์'], 'another address (URL)': ['', 'ที่อยู่อื่น (URL)'], 'Charger': ['', 'ตู้'], 'Status': ['', 'สถานะ'],
+        'Version before → after': ['', 'เวอร์ชันก่อน → หลัง'], 'Steps': ['', 'ขั้นตอน'], '{n} steps': ['', '{n} ขั้นตอน'], 'from {t}': ['', 'ตั้งแต่ {t}'], 'Cancel': ['', 'ยกเลิก'],
+        'No update sent yet': ['', 'ยังไม่มีการอัปเดต'], 'No charger online': ['', 'ไม่มีตู้ออนไลน์'], 'Requested at': ['', 'ส่งคำขอเมื่อ'], 'No request yet': ['', 'ยังไม่มีคำขอ'],
+        'Received': ['', 'ได้รับเมื่อ'], 'No file received yet': ['', 'ยังไม่ได้รับไฟล์'], 'Model': ['', 'รุ่น'], 'Firmware now': ['', 'เฟิร์มแวร์ปัจจุบัน'], 'Last update': ['', 'อัปเดตล่าสุด'],
+        'online': ['', 'ออนไลน์'], 'offline': ['', 'ออฟไลน์'], 'No charger': ['', 'ไม่มีตู้'], '{n} selected': ['', 'เลือก {n} ตู้'], 'Firmware file {n} added': ['', 'เพิ่มไฟล์เฟิร์มแวร์ {n} แล้ว'],
+        'Upload failed': ['', 'อัปโหลดไม่สำเร็จ'], 'Choose at least one charger': ['', 'เลือกอย่างน้อยหนึ่งตู้'], 'Choose a firmware file or give its address': ['', 'เลือกไฟล์เฟิร์มแวร์หรือใส่ที่อยู่'],
+        'Send firmware {f} to {n} charger(s)? The chargers restart to install it - do not update chargers that are charging.': ['', 'ส่งเฟิร์มแวร์ {f} ไปยัง {n} ตู้? ตู้จะรีสตาร์ทเพื่อติดตั้ง - อย่าอัปเดตตู้ที่กำลังชาร์จ'],
+        'Update sent to {s} charger(s), {w} waiting for the charger': ['', 'ส่งการอัปเดตแล้ว {s} ตู้ รอตู้เชื่อมต่อ {w} ตู้'], '{cp} will upload {f}': ['', '{cp} จะอัปโหลด {f}'],
+        '{cp} has no log file to send': ['', '{cp} ไม่มีไฟล์ log ให้ส่ง'], 'Address copied': ['', 'คัดลอกที่อยู่แล้ว'], 'Address of the file': ['', 'ที่อยู่ของไฟล์'], 'Delete this firmware file?': ['', 'ลบไฟล์เฟิร์มแวร์นี้?'],
+        'Delete {f}?': ['', 'ลบ {f}?'], '⚙️ Firmware & logs settings': ['', '⚙️ ตั้งค่าเฟิร์มแวร์และ log'],
+        'Address the chargers use to reach this CSMS (http://host:port or https://host; empty = automatic)': ['', 'ที่อยู่ที่ตู้ใช้เข้าถึง CSMS นี้ (http://host:port หรือ https://host ว่าง = อัตโนมัติ)'],
+        'Firmware download retries': ['', 'จำนวนครั้งที่ลองดาวน์โหลดใหม่'], 'Seconds between firmware retries': ['', 'วินาทีระหว่างการลองดาวน์โหลดใหม่'], 'Largest firmware file (MB)': ['', 'ไฟล์เฟิร์มแวร์ใหญ่สุด (MB)'],
+        'Largest log file (MB)': ['', 'ไฟล์ log ใหญ่สุด (MB)'], 'Keep log files (days)': ['', 'เก็บไฟล์ log (วัน)'],
+        'The CSMS sends UpdateFirmware with the address of the file; the charger downloads it, installs it and restarts, and reports each step (FirmwareStatusNotification). A charger that is offline gets the update when it connects (for 7 days). The firmware version it reports at its next start is shown as "after".':
+            ['', 'CSMS ส่ง UpdateFirmware พร้อมที่อยู่ของไฟล์ ตู้ดาวน์โหลด ติดตั้ง และรีสตาร์ท แล้วแจ้งทุกขั้นตอน (FirmwareStatusNotification) ตู้ที่ออฟไลน์จะได้รับการอัปเดตเมื่อเชื่อมต่อ (ภายใน 7 วัน) เวอร์ชันที่ตู้แจ้งตอนเริ่มทำงานครั้งถัดไปจะแสดงเป็น "หลัง"'],
+        'Each request gets an upload address of its own; the charger uploads its file there over HTTP or HTTPS (PUT or POST, up to the size in the settings). Chargers that can only upload by FTP need an FTP server of their own.':
+            ['', 'แต่ละคำขอมีที่อยู่สำหรับอัปโหลดของตัวเอง ตู้ส่งไฟล์ผ่าน HTTP หรือ HTTPS (PUT หรือ POST ไม่เกินขนาดที่ตั้งไว้) ตู้ที่ส่งได้แค่ FTP ต้องใช้ FTP server แยก']
+    });
+})();
+''')
+
+
+# [OPS] end of ops modules
+
+
 async def main(ocpp_port: int, web_port: int, tls_cert: str = None, tls_key: str = None):
+    ops_startup()   # [OPS] users, settings, audit log (+ later modules)
     # Start OCPP WebSocket server with ping settings
     # Note: Server-side ping is independent from CP's WebSocketPingInterval
     # การเปิด ping ฝั่งเซิร์ฟเวอร์ทำให้ตรวจจับตู้ที่หลุดแบบไม่ปิด connection อย่างถูกต้องได้
@@ -18441,6 +29504,7 @@ async def main(ocpp_port: int, web_port: int, tls_cert: str = None, tls_key: str
             os.environ.get('CSMS_OCPP_BIND', '').strip() or '0.0.0.0',   # [CLOUD] 127.0.0.1 in the container
             ocpp_port,
             subprotocols=['ocpp1.6'],
+            **ops_ws_serve_kwargs(),   # [OPS] v1.6 charger security (Basic Auth / unknown ids)
             # เปิด server-side ping เพื่อตรวจจับตู้ที่หลุดแบบกะทันหัน (ไฟดับ/เน็ตหลุด/ถอดสาย)
             # ถ้าตู้ไม่ตอบ pong ภายใน ping_timeout เซิร์ฟเวอร์จะปิด connection -> เข้า finally
             # -> ตั้ง connected=False และลบออกจาก charge_points -> CSMS ขึ้น Offline ทันที
@@ -18502,6 +29566,7 @@ async def main(ocpp_port: int, web_port: int, tls_cert: str = None, tls_key: str
     app_register_routes(app)   # [APP] BPC EV customer app (PWA) + Customers tab API
     map_register_routes(app)   # [MAP] operator map tab (Leaflet assets + config)
     db_register_routes(app)   # [DB] database tab API (status / test / settings / export)
+    ops_register_routes(app)   # [OPS] users / audit (+ health, KPIs, alerts, maintenance)
     
     # Start web server (รองรับ HTTPS ถ้ามี cert/key)
     global COOKIE_SECURE
@@ -18526,18 +29591,22 @@ async def main(ocpp_port: int, web_port: int, tls_cert: str = None, tls_key: str
     await site.start()
     asyncio.create_task(pay_watchdog())   # [PAYMENT] expiry / start retries / time-based budget / ledger flush
     asyncio.create_task(app_flush_task())   # [APP] customer store flush
+    ops_start_tasks()   # [OPS] background tasks of the ops modules
     # [CLOUD] graceful stop: Render / Docker send SIGTERM before replacing the instance -> save the ledgers and the
     # database queue first, so a redeploy loses nothing
     try:
         import signal as _cloud_signal
 
         def _cloud_on_sigterm():
+            if (globals().get('_OPS_SRV') or {}).get('restoring'):   # [OPS] v1.9 restore written: save nothing
+                os._exit(OPS_RESTART_EXIT_CODE)
             logger.info('SIGTERM - saving data before exit')
             try:
                 for _name in ('pay_ledger', 'customers'):
                     _store = globals().get(_name)
                     if _store is not None:
                         _store.flush()
+                globals().get('ops_ct_flush', lambda: None)()   # [OPS] v1.10 running sessions, RFID last-used times
                 if DB is not None:
                     DB.flush(8)
             except Exception as _e:
@@ -19432,6 +30501,10 @@ def _launcher_main():
                     proc.kill()
                 return 0
 
+            if code == 76:   # [OPS] v1.9 restart requested from the console (restore / restart button)
+                print('\n🔄 Restarting the CSMS ...', flush=True)
+                time.sleep(1)
+                continue
             if code == CSMS_SWITCH_EXIT_CODE:
                 previous, version = version, _OTHER[version]
                 print(f'\n🔀 Switching OCPP {previous} -> {version}', flush=True)
@@ -19449,6 +30522,8 @@ def _launcher_main():
 
 
 if __name__ == '__main__':
+    if any(a in sys.argv for a in ('--backup', '--restore', '--verify-backup')):   # [OPS] v1.9 backups from the command line
+        sys.exit(ops_cli(sys.argv))
     if len(sys.argv) >= 3 and sys.argv[1] == '--csms-child':
         _child_version = sys.argv[2]
         _child_args = sys.argv[3:]
