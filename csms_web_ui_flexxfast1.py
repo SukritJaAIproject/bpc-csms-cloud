@@ -511,7 +511,7 @@ import sys as _db_sys
 
 DB_SETTINGS_FILE = str((APP_DIR / 'database.json') if 'APP_DIR' in globals() else 'database.json')
 DB_DEFAULTS = {'type': 'json', 'uri': '', 'db_name': 'bpc_csms', 'log_to_db': True, 'log_retention_days': 30, 'keep_json_backup': True}
-DB_COLLECTIONS = ('payments', 'customers', 'tokens', 'settings', 'stations', 'rfid_cards', 'transactions', 'ocpp_logs', 'ops_users', 'ops_settings', 'ops_audit', 'ops_status', 'ops_sessions', 'ops_alerts', 'ops_notify', 'ops_tickets', 'ops_pm', 'ops_charger_access', 'ops_charger_unknown', 'ops_security', 'ops_free_active', 'ops_free_cards', 'ops_free_log', 'ops_lm_sites', 'ops_lm_log', 'ops_open_tx', 'ops_fw_files', 'ops_fw_jobs', 'ops_diag_jobs', 'ops_bookings')
+DB_COLLECTIONS = ('payments', 'customers', 'tokens', 'settings', 'stations', 'rfid_cards', 'transactions', 'ocpp_logs', 'ops_users', 'ops_settings', 'ops_audit', 'ops_status', 'ops_sessions', 'ops_alerts', 'ops_notify', 'ops_tickets', 'ops_pm', 'ops_charger_access', 'ops_charger_unknown', 'ops_security', 'ops_free_active', 'ops_free_cards', 'ops_free_log', 'ops_lm_sites', 'ops_lm_log', 'ops_open_tx', 'ops_fw_files', 'ops_fw_jobs', 'ops_diag_jobs', 'ops_bookings', 'ops_charger_ids', 'ops_charger_identity')
 DB_LOG_BATCH = 500                      # log inserts per bulk write
 DB_QUEUE_MAX = 60000                    # queued operations before the oldest log inserts are dropped
 DB_TXN_METER_INTERVAL = 30.0            # seconds between transaction-document updates from MeterValues
@@ -1913,7 +1913,8 @@ class CentralSystem(cp):
     async def on_boot_notification(self, charge_point_vendor: str, charge_point_model: str, **kwargs):
         self.data.vendor = charge_point_vendor
         self.data.model = charge_point_model
-        self.data.serial_number = kwargs.get('charge_point_serial_number', '')
+        self.data.serial_number = (kwargs.get('charge_point_serial_number') or kwargs.get('charge_box_serial_number')   # [OPS] v1.13
+                                   or '')
         self.data.firmware_version = kwargs.get('firmware_version', '')
         demo_geo_for_simulator(self.id, self.data.firmware_version)   # [DEMO-GEO] Virtual Charger demo fleet on the map
         
@@ -1957,7 +1958,7 @@ class CentralSystem(cp):
         
         ops_emit('boot', cp_id=self.id, vendor=charge_point_vendor, model=charge_point_model,   # [OPS]
                  serial=self.data.serial_number, firmware=self.data.firmware_version, interval=interval,
-                 registration=reg_status)
+                 registration=reg_status, box_serial=kwargs.get('charge_box_serial_number') or '')   # [OPS] v1.13
         return call_result.BootNotification(
             current_time=datetime.now(timezone.utc).isoformat(),
             interval=interval,
@@ -1994,7 +1995,8 @@ class CentralSystem(cp):
     @on(Action.authorize)
     async def on_authorize(self, id_tag: str, **kwargs):
         # Use RFID card database for authorization
-        id_tag_info = ops_free_authorize(self.id, None, id_tag) or app_state.authorize_rfid(id_tag)   # [OPS] v1.7 free charging
+        id_tag_info = (ops_cid_auth_gate(self.id, id_tag, 'Authorize')   # [OPS] v1.13 only an Accepted charger may charge
+                       or ops_free_authorize(self.id, None, id_tag) or app_state.authorize_rfid(id_tag))   # [OPS] v1.7 free charging
         
         app_state.add_log('⬅️ IN', self.id, 'Authorize', {
             'idTag': id_tag,
@@ -2009,7 +2011,8 @@ class CentralSystem(cp):
         # ถ้า transaction นี้เกิดจาก RemoteStart ที่ operator สั่งจาก CSMS -> Accepted (authorized โดย operator)
         # ไม่งั้นตรวจตามรายการบัตรปกติ (บัตรไม่ลงทะเบียน = Invalid ตามเดิม)
         _rs_key = str(id_tag).upper()
-        _bk_gate = ops_bk_start_gate(self.id, connector_id, id_tag, kwargs.get('reservation_id'), timestamp)   # [OPS] v1.12 bookings
+        _bk_gate = (ops_cid_auth_gate(self.id, id_tag, 'StartTransaction')   # [OPS] v1.13 only an Accepted charger may charge
+                    or ops_bk_start_gate(self.id, connector_id, id_tag, kwargs.get('reservation_id'), timestamp))   # [OPS] v1.12 bookings
         if _bk_gate is not None:
             id_tag_info = _bk_gate
         elif app_state.take_remote_start_pending(self.id, connector_id, id_tag):
@@ -12155,12 +12158,13 @@ async function switchCsmsVersion() {
                     'Rejected': '🚫'
                 };
                 
+                const id = esc(cp.cp_id);   // [OPS] v1.13 charger ids / vendor / model come from the chargers: escaped
                 return `
                     <tr>
-                        <td style="font-family: monospace; font-weight: 600;">${cp.cp_id}</td>
+                        <td style="font-family: monospace; font-weight: 600;">${id}</td>
                         <td>
                             <span style="color: ${statusColors[cp.status] || 'var(--text)'};">
-                                ${statusIcons[cp.status] || ''} ${cp.status}
+                                ${statusIcons[cp.status] || ''} ${esc(cp.status)}
                             </span>
                         </td>
                         <td>
@@ -12168,14 +12172,14 @@ async function switchCsmsVersion() {
                                 ? '<span style="color: var(--success);" data-i18n="🟢 Online">🟢 Online</span>' 
                                 : '<span style="color: var(--text-dim);" data-i18n="⚫ Offline">⚫ Offline</span>'}
                         </td>
-                        <td>${cp.vendor || '-'}</td>
-                        <td>${cp.model || '-'}</td>
+                        <td>${esc(cp.vendor || '-')}</td>
+                        <td>${esc(cp.model || '-')}</td>
                         <td>
-                            <button onclick="quickSetCpStatus('${cp.cp_id}', 'Accepted')" class="edit-btn" style="background: var(--success); margin-right: 0.25rem;" title="Accept" data-i18n-title="Accept">✅</button>
-                            <button onclick="quickSetCpStatus('${cp.cp_id}', 'Pending')" class="edit-btn" style="background: var(--warning); margin-right: 0.25rem;" title="Pending" data-i18n-title="Pending">⏳</button>
-                            <button onclick="quickSetCpStatus('${cp.cp_id}', 'Rejected')" class="edit-btn" style="background: var(--error); margin-right: 0.25rem;" title="Reject" data-i18n-title="Reject">🚫</button>
-                            ${cp.connected ? `<button onclick="forceDisconnectCp('${cp.cp_id}')" class="edit-btn" style="background: #d63384; margin-right: 0.25rem;" title="Force Disconnect" data-i18n-title="Force Disconnect">⚡</button>` : ''}
-                            <button onclick="deleteCpRegistration('${cp.cp_id}')" class="edit-btn" style="background: var(--text-dim);" title="Delete" data-i18n-title="Delete">🗑️</button>
+                            <button data-cp="${id}" onclick="quickSetCpStatus(this.dataset.cp, 'Accepted')" class="edit-btn" style="background: var(--success); margin-right: 0.25rem;" title="Accept" data-i18n-title="Accept">✅</button>
+                            <button data-cp="${id}" onclick="quickSetCpStatus(this.dataset.cp, 'Pending')" class="edit-btn" style="background: var(--warning); margin-right: 0.25rem;" title="Pending" data-i18n-title="Pending">⏳</button>
+                            <button data-cp="${id}" onclick="quickSetCpStatus(this.dataset.cp, 'Rejected')" class="edit-btn" style="background: var(--error); margin-right: 0.25rem;" title="Reject" data-i18n-title="Reject">🚫</button>
+                            ${cp.connected ? `<button data-cp="${id}" onclick="forceDisconnectCp(this.dataset.cp)" class="edit-btn" style="background: #d63384; margin-right: 0.25rem;" title="Force Disconnect" data-i18n-title="Force Disconnect">⚡</button>` : ''}
+                            <button data-cp="${id}" onclick="deleteCpRegistration(this.dataset.cp)" class="edit-btn" style="background: var(--text-dim);" title="Delete" data-i18n-title="Delete">🗑️</button>
                         </td>
                     </tr>
                 `;
@@ -12500,9 +12504,9 @@ async function switchCsmsVersion() {
                                 <tbody>
                                     ${result.restored.map(r => `
                                         <tr>
-                                            <td style="font-family: monospace;">${r.key}</td>
-                                            <td>${r.value}</td>
-                                            <td style="color: ${r.status === 'Accepted' ? 'var(--success)' : r.status === 'RebootRequired' ? 'var(--warning)' : 'var(--error)'};">${r.status}</td>
+                                            <td style="font-family: monospace;">${esc(r.key)}</td>
+                                            <td>${esc(r.value)}</td>
+                                            <td style="color: ${r.status === 'Accepted' ? 'var(--success)' : r.status === 'RebootRequired' ? 'var(--warning)' : 'var(--error)'};">${esc(r.status)}</td>
                                         </tr>
                                     `).join('')}
                                 </tbody>
@@ -14969,7 +14973,9 @@ async def handle_pay_page(request):
 async def handle_pay_public_config(request):
     pub = pay_settings.public()
     pub['stations'] = ([{'id': s['id'], 'connected': bool(s.get('connected'))} for s in app_state.station_records()
-                        if s.get('registration_status') == 'Accepted'] if pub.get('public_station_list') else [])
+                        if s.get('registration_status') == 'Accepted'
+                        and not (station_info.data.get(s['id']) or {}).get('hidden')]   # [OPS] v1.13 hidden stations
+                       if pub.get('public_station_list') else [])
     fn = PAY_EXTENSIONS.get('config_extra')
     if fn:
         try:
@@ -18592,7 +18598,7 @@ import re as _ops_re
 import csv as _ops_csv
 import io as _ops_io
 
-OPS_VERSION = '1.12.0'
+OPS_VERSION = '1.13.0'
 OPS_FEATURES: List[str] = ['users']
 OPS_DIR = str(APP_DIR / 'ops_data')
 OPS_TZ = timezone(timedelta(hours=6))           # Bhutan Time (BTT, UTC+06:00): ops views, monthly files, reports
@@ -20026,6 +20032,7 @@ def ops_known_chargers() -> List[str]:
     ignore = {str(x).strip() for x in (ops_health_cfg().get('ignore') or []) if str(x).strip()}
     ids = set(OPS_CP) | set(app_state.cp_data) | set(app_state.charge_points)
     ids |= {k for k, v in app_state.cp_registrations.items() if v != 'Rejected'}
+    ids -= ops_cid_waiting()   # [OPS] v1.13 issued charger IDs waiting for installation
     return sorted(i for i in ids if i and i not in ignore and app_state.cp_registrations.get(i) != 'Rejected')
 
 
@@ -24042,6 +24049,12 @@ def ops_sec_check(cp_id: str, auth_header: str, ip: str, secure: bool, transport
     rec = ops_charger_access.data.get(cp_id)
     creds = ops_sec_basic(auth_header)
     if rec is None:
+        _cid_gate = ops_cid_access_gate(cp_id)   # [OPS] v1.13 an issued charger id always needs its password
+        if _cid_gate is not None:
+            if _cid_gate[0] == 401:
+                return _ops_sec_fail(cp_id, ip, 401, _cid_gate[1], cfg, now)
+            ops_sec_event('blocked_hit', cp_id, ip, 'charger blocked')
+            return _cid_gate
         if mode == 'open':
             OPS_SEC_CONN[cp_id] = {'t': round(now), 'ip': ip, 'tls': bool(secure), 'auth': False, 'how': 'open', 'via': transport}
             return 0, 'open'
@@ -24550,6 +24563,8 @@ async def ops_api_sec_delete(request):
     cp = str(b.get('cp_id') or '').strip()
     if cp not in ops_charger_access.data:
         return ops_err('Not in the list', 404)
+    if cp in ops_charger_ids.data:   # [OPS] v1.13 an issued charger id keeps its password: retire it in Charger IDs
+        return ops_err('This charger ID was issued in 🆔 Charger IDs - retire it there instead', 409)
     ops_charger_access.data.pop(cp, None)
     ops_charger_access.save()
     ops_sec_event('removed', cp, '', 'removed from the charger access list')
@@ -24693,7 +24708,7 @@ OPS_JS_PARTS.append(r'''/* [OPS] 🔑 Charger access (v1.6): OCPP security profi
         strict: ['🔐 Password for every charger', 'Every charger must be on the list and sign in with its own password (security profile 1 or 2).', 'good']
     };
     const PROFILES = {0: 'Profile 0 · no password', 1: 'Profile 1 · password', 2: 'Profile 2 · password + TLS'};
-    const EVENTS = {fail: '🚫 Refused', unknown: '❓ Unknown charger', locked: '🔒 Locked', locked_hit: '🔒 Refused (locked)',
+    const EVENTS = OPS.SEC_EVENTS = {fail: '🚫 Refused', unknown: '❓ Unknown charger', locked: '🔒 Locked', locked_hit: '🔒 Refused (locked)',
         blocked_hit: '⛔ Refused (blocked)', ip_blocked: '🧱 Address blocked', ip_blocked_hit: '🧱 Refused (address blocked)',
         confirmed: '✅ New password in use', fallback: '⚠️ Signed in without password (change-over)', pw_pushed: '🔑 Password stored on the charger',
         pushed: '📤 New password sent', push_failed: '❌ Sending the password failed', profile: '🛡️ Security profile changed',
@@ -28411,9 +28426,15 @@ def ops_backup_read_file(path: str) -> bytes:
     """A complete copy of a data file for a backup: a .json file that is being rewritten at this moment (another program,
     or an older CSMS writing in place) is read again until it is whole (up to 3 s)."""
     data = b''
-    for _ in range(60):
-        with open(path, 'rb') as f:
-            data = f.read()
+    for _try in range(60):
+        try:
+            with open(path, 'rb') as f:
+                data = f.read()
+        except PermissionError:                  # [OPS] v1.13 Windows: the file is being replaced right now - try again
+            if _try == 59:
+                raise
+            _ops_time.sleep(0.05)
+            continue
         if not path.endswith('.json'):
             return data
         try:
@@ -32388,6 +32409,1552 @@ OPS_JS_PARTS.append(r'''/* [OPS] 📅 Bookings tab (v1.12): pre-booked connector
         'At the start of a booking the CSMS sends ReserveNow to the charger (OCPP 1.6 Reservation profile): the connector shows Reserved and only the booking\'s driver can start. A charger that cannot reserve is kept by the CSMS: other cards and app / QR starts are refused on that connector. Booking is free; drivers who miss bookings are paused.': ['སྔོན་བཟུང་འགོ་བཙུགས་པའི་སྐབས་ CSMS གིས་གློག་བླུགས་ཆས་ལུ་ ReserveNow གཏངམ་ཨིན་ (OCPP 1.6 Reservation): མཐུད་ཆས་ Reserved སྟོནམ་ཨིན་ དེ་ལས་སྔོན་བཟུང་གི་དེད་པ་ཁོ་ར་གིས་འགོ་བཙུགས་ཚུགས་. སྔོན་བཟུང་འབད་མི་ཚུགས་པའི་གློག་བླུགས་ཆས་ CSMS གིས་བཞགཔ་ཨིན་: མཐུད་ཆས་དེ་ནང་ཤོག་བྱང་གཞན་དང་ app / QR གི་འགོ་བཙུགས་ཚུ་ངོས་མི་ལེན་. སྔོན་བཟུང་རིན་མེད་ཨིན་; མ་ལྷོད་མི་དེད་པ་ཚུ་བར་བཀག་འབདཝ་ཨིན་', 'เมื่อถึงเวลาการจอง CSMS ส่ง ReserveNow ให้ตู้ (OCPP 1.6 Reservation) หัวชาร์จจะขึ้น Reserved และเฉพาะผู้ขับที่จองเริ่มชาร์จได้ ตู้ที่จองเองไม่ได้ CSMS จะกันหัวให้เอง: บัตรอื่นและการเริ่มชาร์จจากแอป / QR ของคนอื่นจะถูกปฏิเสธที่หัวนั้น การจองไม่มีค่าใช้จ่าย ผู้ขับที่จองแล้วไม่มาจะถูกระงับการจองชั่วคราว'],
         '⚙️ Booking settings': ['⚙️ སྔོན་བཟུང་གི་སྒྲིག་སྟངས་', '⚙️ ตั้งค่าการจอง'], 'Saved': ['བསྲུང་ཡོད་', 'บันทึกแล้ว'], '⬇️ CSV': ['⬇️ CSV', '⬇️ CSV'],
         '⚙️ Settings': ['⚙️ སྒྲིག་སྟངས་', '⚙️ ตั้งค่า'], '7 days': ['ཉིན་ ༧', '7 วัน'], '30 days': ['ཉིན་ ༣༠', '30 วัน'], 'Today': ['ད་རིས་', 'วันนี้']
+    });
+})();
+''')
+
+
+# ---- [OPS] v1.13 charger IDs: the CSMS issues the ChargeBox IDs (BPC-<dzongkhag>-<0000>) - registered (Accepted), put on
+#      the access list with their own password (OCPP security profile 1 or 2) and a station that stays hidden from drivers
+#      until the charger is installed; a setup sheet for the installer. Every known charger's identity (vendor / model /
+#      serial from BootNotification) is remembered: a change is reported (health issue, alert, security log), not refused.
+#      A charger that is not Accepted cannot charge: Authorize / StartTransaction are answered Invalid.
+OPS_FEATURES.append('chargerid')
+ops_charger_ids = OpsDocStore('charger_ids', 'ops_charger_ids')                  # issued id -> record
+ops_charger_identity = OpsDocStore('charger_identity', 'ops_charger_identity')   # charger id -> identity from BootNotification
+OPS_CID_DZ = [('THM', 'Thimphu'), ('PRO', 'Paro'), ('PNK', 'Punakha'), ('WDP', 'Wangdue Phodrang'), ('CHK', 'Chhukha'),
+              ('HAA', 'Haa'), ('SAM', 'Samtse'), ('SRP', 'Sarpang'), ('TSG', 'Tsirang'), ('DGN', 'Dagana'), ('TRG', 'Trongsa'),
+              ('BUM', 'Bumthang'), ('ZHM', 'Zhemgang'), ('MON', 'Mongar'), ('LHU', 'Lhuentse'), ('TGN', 'Trashigang'),
+              ('TYT', 'Trashiyangtse'), ('PMG', 'Pemagatshel'), ('SJK', 'Samdrup Jongkhar'), ('GSA', 'Gasa')]
+OPS_CID_DEFAULTS = {'prefix': 'BPC', 'digits': 4, 'profile': 0, 'ocpp_url': '', 'hide_until_installed': True,
+                    'refuse_not_accepted': True, 'codes': [[c, n] for c, n in OPS_CID_DZ]}
+#   profile 0 = automatic: 2 (password + TLS) when the chargers' address is wss:// behind an HTTPS proxy, else 1 (password)
+#   ocpp_url  = the address given to the chargers (wss://host/ocpp); empty = from the public address of this CSMS
+OPS_CID_STATES = ('issued', 'installed', 'in_service', 'retired')
+OPS_CID_FIELDS = ('vendor', 'model', 'serial')
+OPS_CID_URL_RE = _ops_re.compile(r'^wss?://[^\s/?#]+(/[^\s?#]*)?$')
+OPS_CID_SIGNED_IN = ('password', 'no password', 'fallback')   # let in through the access list (not "open" to anybody)
+_CID_NA_LAST: Dict[tuple, float] = {}                    # (charger, message) -> last 'charging refused' event (one a minute)
+_CID_DIRTY = {'identity': False}
+for _p in ('/api/ops/chargerids/issue', '/api/ops/chargerids/edit', '/api/ops/chargerids/retire',
+           '/api/ops/chargerids/identity/confirm'):
+    ops_perm_rule('POST', _p, 'config')
+ops_perm_rule('POST', '/api/ops/chargerids/config', 'admin')
+ops_perm_rule('GET', '/api/ops/chargerids', 'config', prefix=True)
+try:
+    OPS_ISSUE_TITLES['identity_changed'] = 'Charger identity changed'
+    OPS_ALERT_RULES_DEFAULT['identity_changed'] = {'on': True, 'sev': 'major', 'delay_min': 0, 'notify': True, 'ticket': False}
+except NameError:
+    pass
+
+
+def ops_cid_cfg() -> dict:
+    d = ops_cfg('charger_ids', OPS_CID_DEFAULTS)
+    codes = []
+    for x in d.get('codes') or []:
+        if isinstance(x, (list, tuple)) and len(x) >= 2 and _ops_re.match(r'^[A-Z]{3}$', str(x[0])):
+            codes.append([str(x[0]), str(x[1])[:40]])
+    d['codes'] = codes or [[c, n] for c, n in OPS_CID_DZ]
+    if not _ops_re.match(r'^[A-Z][A-Z0-9]{1,5}$', str(d.get('prefix') or '')):
+        d['prefix'] = OPS_CID_DEFAULTS['prefix']
+    d['digits'] = ops_int(d.get('digits'), 4, 3, 6)
+    d['profile'] = ops_int(d.get('profile'), 0, 0, 2)
+    if not OPS_CID_URL_RE.match(str(d.get('ocpp_url') or '')):
+        d['ocpp_url'] = ''
+    return d
+
+
+def _cid_bool(v) -> bool:
+    if isinstance(v, str):
+        return v.strip().lower() in ('1', 'true', 'yes', 'on')
+    return bool(v)
+
+
+def _cid_codes(cfg: dict) -> dict:
+    return {c: n for c, n in cfg['codes']}
+
+
+def _cid_seq() -> dict:
+    return ops_cfg('charger_id_seq', {})
+
+
+def _cid_up(i) -> str:
+    return str(i or '').strip().upper()
+
+
+def _cid_trusted_ids() -> set:
+    """IDs the operator made or accepted (issued, registered, on the access list, with station details), upper case:
+    only these set the numbering floor - an ID a stranger tried can never use up the numbers of a dzongkhag."""
+    ids = set(list(ops_charger_ids.data)) | set(list(app_state.cp_registrations)) | set(list(ops_charger_access.data))
+    try:
+        ids |= set(list(station_info.data))
+    except Exception:
+        pass
+    return {_cid_up(i) for i in ids if i}
+
+
+def _cid_known_ids() -> set:
+    """Every charger ID the CSMS knows or has seen, strangers included (upper case): an issued ID is never one of them."""
+    ids = set(list(app_state.cp_data)) | set(list(app_state.charge_points)) | set(list(ops_charger_unknown.data))
+    ids |= set(list(ops_charger_identity.data))
+    for name in ('OPS_CP', 'OPS_SEC_CONN'):                # health history (45 days, rebuilt at start-up), last sign-ins
+        ids |= set(list(globals().get(name) or {}))
+    try:
+        ids |= {str(k).split('|', 1)[0] for k in list(ops_open_tx.data) if '|' in str(k)}
+    except NameError:
+        pass
+    try:
+        ids |= {str(b.get('cp') or '') for b in list(ops_bookings.data.values()) if isinstance(b, dict)}
+    except NameError:
+        pass
+    return _cid_trusted_ids() | {_cid_up(i) for i in ids if i}
+
+
+def _cid_top(cfg: dict, code: str, trusted: set) -> int:
+    """Highest number used for a dzongkhag: the stored sequence and trusted IDs of the same form (within the digits)."""
+    pat = _ops_re.compile(r'^' + _ops_re.escape(cfg['prefix']) + '-' + code + r'-(\d+)$', _ops_re.I)
+    lim = 10 ** cfg['digits']
+    top = ops_int(_cid_seq().get(code), 0)
+    for i in trusted:
+        m = pat.match(i)
+        if m and int(m.group(1)) < lim:
+            top = max(top, int(m.group(1)))
+    return top
+
+
+def _cid_make(cfg: dict, code: str, n: int) -> str:
+    return '%s-%s-%0*d' % (cfg['prefix'], code, cfg['digits'], n)
+
+
+def _cid_plan(cfg: dict, code: str, count: int, trusted: set, known: set) -> list:
+    """The next free IDs of a dzongkhag after the highest number used (fewer than `count` when the digits run out);
+    any ID the CSMS has seen is skipped. Numbers are never used twice."""
+    n, out, lim = _cid_top(cfg, code, trusted) + 1, [], 10 ** cfg['digits']
+    while len(out) < count and n < lim:
+        i = _cid_make(cfg, code, n)
+        if i.upper() not in known:
+            out.append((i, n))
+        n += 1
+    return out
+
+
+def ops_cid_base(request=None) -> str:
+    try:
+        return ops_fd_base(request)
+    except Exception:
+        return (os.environ.get('CSMS_PUBLIC_URL', '') or '').strip().rstrip('/')
+
+
+def ops_cid_ocpp_base(request=None) -> str:
+    """The address a charger is given: wss://<host>/ocpp (or ws://...); the charger adds its id as the last part."""
+    own = ops_cid_cfg().get('ocpp_url') or ''
+    if own:
+        return own.rstrip('/')
+    base = ops_cid_base(request)
+    if base.startswith('https://'):
+        return 'wss://' + base[8:] + '/ocpp'
+    if base.startswith('http://'):
+        return 'ws://' + base[7:] + '/ocpp'
+    return base + '/ocpp'
+
+
+def ops_cid_tls_ok(request=None) -> bool:
+    """Profile 2 works only when the chargers use wss:// and the CSMS sees that (HTTPS proxy in front, CSMS_TRUST_PROXY=1)."""
+    return ops_cid_ocpp_base(request).startswith('wss://') and bool(TRUST_PROXY)
+
+
+def ops_cid_default_profile(request=None) -> int:
+    p = ops_cid_cfg()['profile']
+    if p in (1, 2):
+        return p
+    return 2 if ops_cid_tls_ok(request) else 1
+
+
+def ops_cid_waiting() -> set:
+    """Issued ids whose charger has not connected yet: not watched by health / uptime / reports until it is installed."""
+    return {i for i, r in list(ops_charger_ids.data.items()) if r.get('status') == 'issued' and i not in app_state.charge_points}
+
+
+def ops_cid_access_gate(cp_id: str):
+    """Charger access check for an ID without an access record: an issued ID is never let in without its password
+    (also in "open" mode), a retired one never. None = not an issued ID."""
+    r = ops_charger_ids.data.get(cp_id)
+    if r is None:
+        return None
+    if r.get('status') == 'retired':
+        return 403, 'blocked'
+    return 401, 'no password set in the CSMS for this charger'
+
+
+def _cid_signed_in(cp_id: str) -> bool:
+    """The current connection came in through the access list (not as an unknown ID in "open" mode)."""
+    return (OPS_SEC_CONN.get(cp_id) or {}).get('how') in OPS_CID_SIGNED_IN
+
+
+# ---- identity of the chargers (BootNotification) -----------------------------------------------------------------------
+def _cid_txt(v) -> str:
+    return str(v or '').strip()[:64]
+
+
+def _cid_diff(ref: dict, cur: dict, box: str = '') -> list:
+    """Fields known on both sides that differ (case and outer spaces ignored). The serial on record may be either of
+    the two serial numbers a charger can send (chargePointSerialNumber / chargeBoxSerialNumber)."""
+    out = []
+    for k in OPS_CID_FIELDS:
+        a, b = _cid_txt(ref.get(k)), _cid_txt(cur.get(k))
+        if a and b and a.lower() != b.lower() and not (k == 'serial' and box and a.lower() == box.lower()):
+            out.append([k, a, b])
+    return out
+
+
+def _cid_what(diff: list) -> str:
+    return ', '.join(f'{k} {a} → {b}' for k, a, b in diff)
+
+
+def _cid_desc(d: dict) -> str:
+    return ' '.join(_cid_txt(d.get(k)) for k in OPS_CID_FIELDS if _cid_txt(d.get(k))) or '?'
+
+
+def _cid_hist(rec: dict, text: str):
+    rec.setdefault('history', []).append([round(ops_now()), str(text)[:160]])
+    del rec['history'][:-20]
+
+
+def _cid_identity(cp_id: str, create: bool = False):
+    rec = ops_charger_identity.data.get(cp_id)
+    if rec is None and create:
+        rec = {'cp': cp_id, 'ref': {}, 'first_seen': None, 'boots': 0}
+        ops_charger_identity.data[cp_id] = rec
+    return rec
+
+
+def ops_cid_simulated(firmware: str) -> bool:
+    """The Virtual Charger and the built-in demo chargers send firmware 'SIM-...' and a new serial at every start."""
+    return str(firmware or '').strip().upper().startswith('SIM-')
+
+
+def _cid_tracked(cp_id: str) -> bool:
+    """Identities are kept for chargers the operator knows (registered, on the access list or issued), not for every id
+    that happens to connect while charger access is open."""
+    return (cp_id in app_state.cp_registrations or cp_id in ops_charger_access.data or cp_id in ops_charger_ids.data
+            or cp_id in ops_charger_identity.data)
+
+
+def _cid_real_ref(ref: dict) -> bool:
+    return bool(any(_cid_txt(ref.get(k)) for k in OPS_CID_FIELDS) and not ref.get('sim'))
+
+
+def _cid_mismatch(ref: dict, cur: dict, box: str, fw: str, sim: bool):
+    """(what, signature, fields that differ) when the reported identity is not the one on record, else None."""
+    if sim:
+        if _cid_real_ref(ref) and not ref.get('sim_ok'):
+            return f'simulator ({fw}) instead of {_cid_desc(ref)}', ['sim'], []
+        return None
+    if ref.get('sim'):
+        return None
+    diff = _cid_diff(ref, cur, box)
+    if diff:
+        return _cid_what(diff), [cur[k] for k in OPS_CID_FIELDS], [d[0] for d in diff]
+    return None
+
+
+def ops_cid_boot(cp_id: str, vendor='', model='', serial='', firmware='', box_serial=''):
+    """Compare what the charger says it is with the identity on record; warn on a change (the charger is not refused)."""
+    if not cp_id or not _cid_tracked(cp_id):
+        return
+    cur = {'vendor': _cid_txt(vendor), 'model': _cid_txt(model), 'serial': _cid_txt(serial)}
+    box, fw, now = _cid_txt(box_serial), _cid_txt(firmware), round(ops_now())
+    sim = ops_cid_simulated(fw)
+    rec = _cid_identity(cp_id, create=True)
+    rec.update(last=dict(cur, fw=fw, box=box, sim=sim), last_seen=now, boots=ops_int(rec.get('boots'), 0) + 1)
+    if not rec.get('first_seen'):
+        rec['first_seen'] = now
+    ref = rec.setdefault('ref', {})
+    changed = False
+    if not sim and ref.get('sim'):                        # the identity on record came from a simulator: the real one replaces it
+        rec['ref'] = ref = {k: cur[k] for k in OPS_CID_FIELDS if cur[k]}
+        ref.update(set_at=now, set_by='first BootNotification of the real charger')
+        _cid_hist(rec, 'real charger replaces the simulator: ' + _cid_desc(cur))
+        changed = True
+    found = _cid_mismatch(ref, cur, box, fw, sim)
+    mm = rec.get('mismatch') or None
+    if found is not None:
+        what, sig, fields = found
+        if (mm or {}).get('sig') != sig:
+            rec['mismatch'] = dict(cur, fw=fw, sim=sim, sig=sig, fields=fields, at=now, count=1, what=what)
+            _cid_hist(rec, 'identity changed: ' + what)
+            changed = True
+            try:
+                ops_sec_event('identity_changed', cp_id, '', what)
+            except Exception:
+                pass
+            logger.warning(f"🆔 {cp_id}: charger identity changed ({what}) - check the charger, then confirm it in the Registration tab")
+        else:
+            mm['count'] = ops_int(mm.get('count'), 1) + 1
+    elif not sim:
+        if mm:
+            need = mm.get('fields')
+            if need is None:
+                need = [k for k in OPS_CID_FIELDS if _cid_txt(mm.get(k))]
+            if all(cur.get(k) for k in need):              # every field that differed is reported again and matches
+                rec['mismatch'] = mm = None
+                _cid_hist(rec, 'identity matches the confirmed one again')
+                changed = True
+                try:
+                    ops_sec_event('identity_back', cp_id, '', 'identity matches the confirmed one again')
+                except Exception:
+                    pass
+        if not mm:
+            learned = [k for k in OPS_CID_FIELDS if cur[k] and not _cid_txt(ref.get(k))]
+            if learned:
+                for k in learned:
+                    ref[k] = cur[k]
+                ref.setdefault('set_at', now)
+                ref.setdefault('set_by', 'first BootNotification')
+                _cid_hist(rec, 'learned ' + ', '.join(f'{k} {cur[k]}' for k in learned))
+    if changed:
+        ops_charger_identity.save()
+    else:
+        _CID_DIRTY['identity'] = True                     # last seen, boots, learned fields: saved by the loop within 5 s
+
+
+def _cid_ignored() -> set:
+    try:
+        return {str(x).strip() for x in (ops_health_cfg().get('ignore') or []) if str(x).strip()}
+    except Exception:
+        return set()
+
+
+def _cid_warn_open(cp_id: str, rec: dict, ignored: set = None) -> bool:
+    """An identity warning counts while the charger is in use: not Rejected, not on the health ignore list, and
+    registered, on the access list, issued or connected now (it does not close and reopen with every reconnect)."""
+    if not rec.get('mismatch'):
+        return False
+    reg = app_state.cp_registrations.get(cp_id)
+    if reg == 'Rejected' or cp_id in (_cid_ignored() if ignored is None else ignored):
+        return False
+    return (reg is not None or cp_id in ops_charger_access.data or cp_id in ops_charger_ids.data
+            or cp_id in app_state.charge_points)
+
+
+def _ops_cid_issues(add, now):
+    ignored = _cid_ignored()
+    for cp_id, rec in list(ops_charger_identity.data.items()):
+        if _cid_warn_open(cp_id, rec, ignored):
+            mm = rec['mismatch']
+            add('identity_changed', cp_id, 0, 'major', mm.get('at') or now, 'Charger identity changed: {what}', what=mm.get('what') or '')
+
+OPS_ISSUE_PROVIDERS.append(_ops_cid_issues)
+
+
+def _ops_cid_exclusions(cp_id, connector, t0, t1):
+    """Availability: the time an issued ID waits for its charger, and the time it is retired, is not downtime."""
+    r = ops_charger_ids.data.get(cp_id)
+    if not r:
+        return []
+    now, spans = ops_now(), []
+    b = r.get('installed_at') or (now if r.get('status') == 'issued' else None)
+    if b:                                                 # before its first connection the charger did not exist yet
+        spans.append((0.0, b, 'waiting for installation'))
+    for p in r.get('off') or []:
+        if isinstance(p, (list, tuple)) and p and p[0]:
+            spans.append((p[0], (p[1] if len(p) > 1 and p[1] else now), 'retired'))
+    return [(max(a, t0), min(b, t1), why) for a, b, why in spans if b > t0 and a < t1]
+
+OPS_EXCLUSIONS.append(_ops_cid_exclusions)
+
+
+async def ops_cid_loop():
+    """Saves identities after BootNotifications (at most every 5 s) and forgets old 'charging refused' counters."""
+    while True:
+        await asyncio.sleep(5)
+        if _CID_DIRTY['identity']:
+            _CID_DIRTY['identity'] = False
+            ops_charger_identity.save()
+        now = ops_now()
+        for k in [k for k, t in _CID_NA_LAST.items() if t < now - 3600]:
+            _CID_NA_LAST.pop(k, None)
+
+OPS_TASKS.append(ops_cid_loop)
+
+
+# ---- no charging on a charger that is not Accepted ------------------------------------------------------------------
+def ops_cid_auth_gate(cp_id: str, id_tag: str, what: str):
+    """None = go on. A charger that is Pending or Rejected must not charge (OCPP 1.6: it should not even send these
+    requests); the answer is Invalid with a short expiry, so the charger's authorization cache does not keep it."""
+    try:
+        if not ops_cid_cfg().get('refuse_not_accepted', True):
+            return None
+        reg = app_state.get_cp_registration_status(cp_id)
+    except Exception:
+        return None
+    if reg == 'Accepted':
+        return None
+    now = ops_now()
+    k = (cp_id, what)
+    if now - _CID_NA_LAST.get(k, 0) >= 60:
+        _CID_NA_LAST[k] = now
+        try:
+            ops_sec_event('charge_refused', cp_id, '', f'{what} refused: registration {reg}', tag=str(id_tag or '')[:20])
+        except Exception:
+            pass
+        logger.warning(f"🆔 {cp_id}: {what} for {id_tag} refused - the charger is not accepted ({reg})")
+    until = datetime.now(timezone.utc) + timedelta(seconds=60)
+    return {'status': AuthorizationStatus.invalid, 'expiryDate': until.strftime('%Y-%m-%dT%H:%M:%SZ')}
+
+
+# ---- lifecycle of issued ids -----------------------------------------------------------------------------------------
+def _cid_station_set(cp_id: str, info: dict):
+    """station_info.set() without the save (the caller saves once)."""
+    cur = dict(station_info.data.get(cp_id) or {})
+    if 'name' in info:
+        cur['name'] = str(info.get('name') or '')[:120]
+    for k in ('lat', 'lon'):
+        if k in info:
+            cur[k] = float(info[k]) if info[k] not in ('', None) else None
+    if 'hidden' in info:
+        cur['hidden'] = bool(info['hidden'])
+    station_info.data[cp_id] = cur
+
+
+def _cid_installed(cp_id: str, how: str):
+    r = ops_charger_ids.data.get(cp_id)
+    if r is None or r.get('status') != 'issued' or not _cid_signed_in(cp_id):
+        return
+    r['status'], r['installed_at'] = 'installed', round(ops_now(), 3)   # exact: the waiting time before it is no downtime
+    _cid_hist(r, 'installed: ' + how)
+    if r.get('hidden_by_issue'):
+        try:
+            station_info.set(cp_id, {'hidden': False})
+        except Exception as e:
+            logger.error(f"🆔 {cp_id}: showing the station failed: {e}")
+        r['hidden_by_issue'] = False
+    ops_charger_ids.save()
+    try:
+        ops_sec_event('installed', cp_id, '', how)
+    except Exception:
+        pass
+    logger.info(f"🆔 {cp_id}: the issued charger id is in use now ({how})")
+
+
+@ops_on('connect')
+def _ops_cid_connect(cp_id=None, **kw):
+    _cid_installed(cp_id, 'first connection')
+
+
+@ops_on('boot')
+def _ops_cid_boot(cp_id=None, vendor='', model='', serial='', firmware='', box_serial='', **kw):
+    try:
+        ops_cid_boot(cp_id, vendor, model, serial, firmware, box_serial)
+    except Exception as e:
+        logger.error(f"🆔 {cp_id}: identity check failed: {e}")
+    _cid_installed(cp_id, 'first BootNotification')
+
+
+@ops_on('tx_start')
+def _ops_cid_tx_start(cp_id=None, accepted=True, **kw):
+    r = ops_charger_ids.data.get(cp_id)
+    if not accepted or r is None or r.get('status') not in ('issued', 'installed') or not _cid_signed_in(cp_id):
+        return
+    if r.get('status') == 'issued':
+        _cid_installed(cp_id, 'first transaction')
+    r['status'], r['in_service_at'] = 'in_service', round(ops_now())
+    _cid_hist(r, 'in service: first charging session')
+    ops_charger_ids.save()
+    try:
+        ops_sec_event('in_service', cp_id, '', 'first charging session')
+    except Exception:
+        pass
+
+
+def _cid_open_tx(cp_id: str) -> list:
+    """Transactions the CSMS still has open on a charger (live data and the running-session store)."""
+    out = set()
+    data = app_state.cp_data.get(cp_id)
+    for t in list((getattr(data, 'transactions', None) or {}).keys()):
+        out.add(str(t))
+    try:
+        for k in list(ops_open_tx.data):
+            if str(k).startswith(cp_id + '|'):
+                out.add(str(k).split('|', 1)[1])
+    except NameError:
+        pass
+    return sorted(out)
+
+
+# ---- views -------------------------------------------------------------------------------------------------------------
+def _cid_identity_public(cp_id: str) -> dict:
+    rec = ops_charger_identity.data.get(cp_id) or {}
+    ref, last = rec.get('ref') or {}, rec.get('last') or {}
+    mm = rec.get('mismatch') or None
+    return {'ref': {k: ref.get(k) or '' for k in OPS_CID_FIELDS}, 'ref_sim': bool(ref.get('sim')), 'sim_ok': bool(ref.get('sim_ok')),
+            'last': {k: last.get(k) or '' for k in OPS_CID_FIELDS + ('fw', 'box')}, 'last_sim': bool(last.get('sim')),
+            'mismatch': ({k: mm.get(k) for k in OPS_CID_FIELDS + ('fw', 'sim', 'at', 'count', 'what')} if mm else None),
+            'first_seen': rec.get('first_seen'), 'last_seen': rec.get('last_seen'), 'boots': rec.get('boots') or 0,
+            'confirmed_at': ref.get('set_at'), 'confirmed_by': ref.get('set_by') or '', 'history': (rec.get('history') or [])[-8:]}
+
+
+def _cid_row(cp_id: str, r: dict) -> dict:
+    acc = ops_charger_access.data.get(cp_id) or {}
+    info = station_info.data.get(cp_id) or {}
+    return {'id': cp_id, 'dz': r.get('dz'), 'seq': r.get('seq'), 'status': r.get('status'), 'name': info.get('name') or r.get('name') or '',
+            'connectors': r.get('connectors') or 1, 'note': r.get('note') or '', 'created_at': r.get('created_at'),
+            'created_by': r.get('created_by') or '', 'installed_at': r.get('installed_at'), 'in_service_at': r.get('in_service_at'),
+            'retired_at': r.get('retired_at'), 'retired_by': r.get('retired_by') or '', 'hidden': bool(info.get('hidden')),
+            'lat': info.get('lat'), 'lon': info.get('lon'), 'listed': bool(acc), 'profile': ops_int(acc.get('profile'), 0, 0, 2),
+            'pw_set': bool((acc.get('pw') or {}).get('hash')), 'pw_in_use': bool(acc.get('confirmed_at')),
+            'allowed': bool(acc) and acc.get('allowed') is not False, 'registration': app_state.cp_registrations.get(cp_id) or 'Pending',
+            'connected': cp_id in app_state.charge_points, 'last_ok': acc.get('last_ok'), 'open_tx': _cid_open_tx(cp_id),
+            'identity': _cid_identity_public(cp_id), 'history': (r.get('history') or [])[-8:]}
+
+
+def ops_cid_overview(request=None) -> dict:
+    cfg = ops_cid_cfg()
+    codes = _cid_codes(cfg)
+    rows = [_cid_row(i, r) for i, r in sorted(list(ops_charger_ids.data.items()))]
+    trusted, known = _cid_trusted_ids(), _cid_known_ids()
+    ignored = _cid_ignored()
+    warn = []
+    for cp_id, rec in sorted(list(ops_charger_identity.data.items())):
+        if _cid_warn_open(cp_id, rec, ignored):
+            warn.append({'cp': cp_id, 'name': ops_cp_name(cp_id), 'issued': cp_id in ops_charger_ids.data,
+                         'connected': cp_id in app_state.charge_points, 'identity': _cid_identity_public(cp_id)})
+    counts = {s: sum(1 for r in rows if r['status'] == s) for s in OPS_CID_STATES}
+    counts['warnings'] = len(warn)
+    counts['identities'] = sum(1 for r in list(ops_charger_identity.data.values()) if _cid_real_ref(r.get('ref') or {}))
+    nxt = {}
+    for c in codes:
+        p = _cid_plan(cfg, c, 1, trusted, known)
+        nxt[c] = p[0][0] if p else ''
+    return {'cfg': {k: cfg.get(k) for k in OPS_CID_DEFAULTS}, 'codes': cfg['codes'], 'rows': rows, 'warnings': warn,
+            'counts': counts, 'next': nxt, 'ocpp_base': ops_cid_ocpp_base(request), 'profile_default': ops_cid_default_profile(request),
+            'tls_ok': ops_cid_tls_ok(request), 'sec_mode': ops_sec_cfg().get('mode'), 'now': ops_now()}
+
+
+# ---- API -----------------------------------------------------------------------------------------------------------------
+def _cid_actor(request) -> str:
+    try:
+        return _ops_sec_actor(request)
+    except Exception:
+        return ops_request_user(request).get('username') or '?'
+
+
+def _cid_float(v):
+    if v in (None, ''):
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        raise ValueError('bad number')
+    if f != f or f in (float('inf'), float('-inf')):
+        raise ValueError('bad number')
+    return f
+
+
+def _cid_latlon(b: dict):
+    """(lat, lon) or (None, None); ValueError with the message for the operator."""
+    try:
+        lat, lon = _cid_float(b.get('lat')), _cid_float(b.get('lon'))
+    except ValueError:
+        raise ValueError('Latitude / longitude must be numbers')
+    if (lat is None) != (lon is None) or (lat is not None and not (-90 <= lat <= 90 and -180 <= lon <= 180)):
+        raise ValueError('Give both latitude and longitude (or neither)')
+    return lat, lon
+
+
+async def ops_api_cid(request):
+    return ops_json(ops_cid_overview(request))
+
+
+async def ops_api_cid_preview(request):
+    """The IDs an issue would create now (numbers already used anywhere are skipped)."""
+    cfg = ops_cid_cfg()
+    code = str(request.query.get('dz') or '').strip().upper()
+    if code not in _cid_codes(cfg):
+        return ops_err('Choose a dzongkhag from the list')
+    count = ops_int(request.query.get('count'), 1, 1, 50)
+    plan = _cid_plan(cfg, code, count, _cid_trusted_ids(), _cid_known_ids())
+    return ops_json({'ids': [i for i, _n in plan], 'count': count, 'short': len(plan) < count})
+
+
+async def ops_api_cid_issue(request):
+    """Issue 1 - 50 new ids for a dzongkhag: registered (Accepted), on the access list with a new password each (shown once),
+    a station (hidden from drivers until the charger is installed)."""
+    who = _cid_actor(request)
+    b = await ops_body(request)
+    cfg = ops_cid_cfg()
+    codes = _cid_codes(cfg)
+    code = str(b.get('dz') or '').strip().upper()
+    if code not in codes:
+        return ops_err('Choose a dzongkhag from the list')
+    count = ops_int(b.get('count'), 1)
+    if count < 1 or count > 50:
+        return ops_err('Between 1 and 50 ids at a time')
+    conns = ops_int(b.get('connectors'), 2)
+    if conns < 1 or conns > 8:
+        return ops_err('Connectors: 1 to 8')
+    profile = ops_int(b.get('profile'), 0)
+    if profile not in (1, 2):
+        profile = ops_cid_default_profile(request)
+    if profile == 2 and not ops_cid_tls_ok(request):
+        return ops_err('Security profile 2 needs TLS: the chargers\' address must be wss:// and the CSMS must run behind an HTTPS proxy (CSMS_TRUST_PROXY=1). Use profile 1.')
+    try:
+        lat, lon = _cid_latlon(b)
+    except ValueError as e:
+        return ops_err(str(e))
+    expected = {k: _cid_txt(b.get(k)) for k in OPS_CID_FIELDS}
+    if count > 1 and expected['serial']:
+        return ops_err('A serial number belongs to one charger - issue one id at a time for it')
+    base_name = str(b.get('name') or '').strip()[:100] or f'BPC {codes[code]}'
+    note = str(b.get('note') or '').strip()[:200]
+    plan = _cid_plan(cfg, code, count, _cid_trusted_ids(), _cid_known_ids())
+    if len(plan) < count:
+        return ops_err(f"Only {len(plan)} free numbers are left for this dzongkhag with {cfg['digits']} digits" if plan
+                       else 'No numbers left for this dzongkhag with the current number of digits')
+    hide = bool(cfg.get('hide_until_installed', True))
+    now = round(ops_now())
+    issued = []
+    for i, (cp_id, n) in enumerate(plan):
+        name = base_name if count == 1 else f'{base_name} #{i + 1}'
+        key = ops_sec_new_key()
+        ops_charger_access.data[cp_id] = {'cp': cp_id, 'profile': profile, 'allowed': True, 'added_at': now, 'added_by': who,
+                                          'pw': ops_sec_make_pw(key, who), 'confirmed_at': None,
+                                          'note': (f'issued {ops_iso(now)[:10]}' + (f' - {note}' if note else ''))[:200]}
+        app_state.cp_registrations[cp_id] = 'Accepted'
+        info = {'name': name, 'hidden': hide}
+        if lat is not None:
+            info.update(lat=lat, lon=lon)
+        _cid_station_set(cp_id, info)
+        rec = {'id': cp_id, 'dz': code, 'seq': n, 'status': 'issued', 'name': name, 'connectors': conns, 'note': note,
+               'created_at': now, 'created_by': who, 'hidden_by_issue': hide, 'history': []}
+        _cid_hist(rec, f'issued by {who} (security profile {profile})')
+        ops_charger_ids.data[cp_id] = rec
+        if any(expected.values()):
+            idr = _cid_identity(cp_id, create=True)
+            idr['ref'] = dict({k: v for k, v in expected.items() if v}, set_at=now, set_by=f'issued by {who}')
+            _cid_hist(idr, 'expected ' + ', '.join(f'{k} {v}' for k, v in expected.items() if v))
+        seq = _cid_seq()
+        seq[code] = max(ops_int(seq.get(code), 0), n)
+        issued.append({'id': cp_id, 'key': key, 'name': name, 'connectors': conns, 'profile': profile, 'dz': code,
+                       'dz_name': codes[code], 'lat': lat, 'lon': lon, 'created_at': now, 'created_by': who,
+                       'expected': {k: v for k, v in expected.items() if v}})
+    ops_charger_access.save()
+    ops_charger_ids.save()
+    ops_charger_identity.save()
+    ops_settings.save()
+    station_info.save()
+    app_state._save_cp_registrations()
+    for x in issued:
+        try:
+            ops_sec_event('issued', x['id'], '', f"issued with security profile {x['profile']}", by=who)
+        except Exception:
+            pass
+        try:
+            await app_state.broadcast('station_update', app_state.station_record(x['id']))
+        except Exception:
+            pass
+    logger.info(f"🆔 {len(issued)} charger id(s) issued by {who}: {', '.join(x['id'] for x in issued)}")
+    return ops_json({'ok': True, 'issued': issued, 'ocpp_base': ops_cid_ocpp_base(request)})
+
+
+def _cid_arg(b: dict):
+    cp_id = str(b.get('id') or b.get('cp') or '').strip()
+    return cp_id, ops_charger_ids.data.get(cp_id)
+
+
+async def ops_api_cid_edit(request):
+    who = _cid_actor(request)
+    b = await ops_body(request)
+    cp_id, r = _cid_arg(b)
+    if r is None:
+        return ops_err('Not an issued charger id', 404)
+    if 'connectors' in b and not 1 <= ops_int(b.get('connectors'), 0) <= 8:
+        return ops_err('Connectors: 1 to 8')
+    try:
+        latlon = _cid_latlon(b) if ('lat' in b or 'lon' in b) else None
+    except ValueError as e:
+        return ops_err(str(e))
+    changes, info = [], {}
+    if 'name' in b and str(b.get('name') or '').strip():
+        info['name'] = r['name'] = str(b.get('name') or '').strip()[:100]
+        changes.append('name')
+    if 'connectors' in b:
+        r['connectors'] = ops_int(b.get('connectors'), 1, 1, 8)
+        changes.append('connectors')
+    if 'note' in b:
+        r['note'] = str(b.get('note') or '').strip()[:200]
+        changes.append('note')
+    if latlon is not None:
+        info.update(lat=latlon[0], lon=latlon[1])
+        changes.append('location')
+    if info:
+        _cid_station_set(cp_id, info)
+        station_info.save()
+    if any(k in b for k in OPS_CID_FIELDS):
+        idr = _cid_identity(cp_id, create=True)
+        ref = idr.setdefault('ref', {})
+        for k in OPS_CID_FIELDS:
+            if k in b:
+                v = _cid_txt(b.get(k))
+                if v:
+                    ref[k] = v
+                else:
+                    ref.pop(k, None)
+        ref.pop('sim', None)                              # typed by the operator: a real identity
+        ref.update(set_at=round(ops_now()), set_by=who)
+        last, old = idr.get('last') or {}, idr.get('mismatch') or None
+        if last:
+            found = _cid_mismatch(ref, last, last.get('box') or '', last.get('fw') or '', bool(last.get('sim')))
+            if found is not None:
+                what, sig, fields = found
+                idr['mismatch'] = dict({k: last.get(k) or '' for k in OPS_CID_FIELDS}, fw=last.get('fw') or '', sim=bool(last.get('sim')),
+                                       sig=sig, fields=fields, at=(old or {}).get('at') if (old or {}).get('what') == what else round(ops_now()),
+                                       count=(old or {}).get('count', 1) if (old or {}).get('what') == what else 1, what=what)
+            else:
+                idr['mismatch'] = None
+            new = idr['mismatch']
+            if new and (not old or old.get('what') != new['what']):
+                ops_sec_event('identity_changed', cp_id, '', new['what'] + ' (expected identity changed)', by=who)
+            elif old and not new:
+                ops_sec_event('identity_back', cp_id, '', 'matches the expected identity set by ' + who, by=who)
+        _cid_hist(idr, f'expected identity set by {who}: {_cid_desc(ref)}')
+        ops_charger_identity.save()
+        changes.append('expected identity')
+    _cid_hist(r, f"edited by {who}: {', '.join(changes) or 'nothing'}")
+    ops_charger_ids.save()
+    try:
+        await app_state.broadcast('station_update', app_state.station_record(cp_id))
+    except Exception:
+        pass
+    return ops_json({'ok': True, 'row': _cid_row(cp_id, r)})
+
+
+async def ops_api_cid_retire(request):
+    """Retire an id (the charger is refused from now on; the number is never issued again) - or bring it back."""
+    who = _cid_actor(request)
+    b = await ops_body(request)
+    cp_id, r = _cid_arg(b)
+    if r is None:
+        return ops_err('Not an issued charger id', 404)
+    dropped, key, now = False, None, round(ops_now())
+    if _cid_bool(b.get('reactivate')):
+        if r.get('status') != 'retired':
+            return ops_err('This id is not retired')
+        r['status'] = 'in_service' if r.get('in_service_at') else ('installed' if r.get('installed_at') else 'issued')
+        r.pop('retired_at', None)
+        r.pop('retired_by', None)
+        off = r.get('off') or []
+        if off and isinstance(off[-1], list) and len(off[-1]) > 1 and not off[-1][1]:
+            off[-1][1] = now
+        acc = ops_charger_access.data.get(cp_id)
+        if acc is None or not (acc.get('pw') or {}).get('hash'):     # never back without a password: a new one, shown once
+            key = ops_sec_new_key()
+            acc = ops_sec_rec(cp_id, create=True)
+            acc['profile'] = max(ops_int(acc.get('profile'), 0, 0, 2), ops_cid_default_profile(request))
+            acc['pw'] = ops_sec_make_pw(key, who)
+            acc['confirmed_at'] = None
+            for k in ('pw_old', 'pw_old_until', 'fallback_until'):
+                acc.pop(k, None)
+        acc['allowed'] = True
+        app_state.set_cp_registration_status(cp_id, 'Accepted')
+        hide = r['status'] == 'issued' and bool(ops_cid_cfg().get('hide_until_installed', True))
+        r['hidden_by_issue'] = hide
+        station_info.set(cp_id, {'hidden': hide})
+        _cid_hist(r, f'reactivated by {who}' + (' (new password)' if key else ''))
+        ops_sec_event('reactivated', cp_id, '', 'charger id reactivated' + (' with a new password' if key else ''), by=who)
+    else:
+        if r.get('status') == 'retired':
+            return ops_err('Already retired')
+        busy = _cid_open_tx(cp_id)
+        if busy and not _cid_bool(b.get('force')):
+            return ops_err(f"The charger has a charging session running ({', '.join(busy)}) - stop it first", 409, busy=busy)
+        r.update(status='retired', retired_at=now, retired_by=who, hidden_by_issue=False)
+        r.setdefault('off', []).append([now, None])
+        acc = ops_sec_rec(cp_id, create=True)
+        acc['allowed'] = False
+        app_state.set_cp_registration_status(cp_id, 'Rejected')
+        station_info.set(cp_id, {'hidden': True})
+        cancelled = 0
+        try:
+            for bk in list(_bk_active_for(cp_id)):
+                cancelled += 1 if ops_bk_cancel(bk, who, 'charger retired') else 0
+        except NameError:
+            pass
+        _cid_hist(r, f'retired by {who}' + (f' ({cancelled} booking(s) cancelled)' if cancelled else '') + (' while charging' if busy else ''))
+        ops_sec_event('retired', cp_id, '', 'charger id retired - refused from now on', by=who)
+        try:
+            dropped = await _ops_sec_disconnect(cp_id, 'charger id retired')
+        except Exception as e:
+            logger.error(f"🆔 {cp_id}: disconnect failed: {e}")
+    ops_charger_access.save()
+    ops_charger_ids.save()
+    try:
+        await app_state.broadcast('station_update', app_state.station_record(cp_id))
+    except Exception:
+        pass
+    out = {'ok': True, 'row': _cid_row(cp_id, r), 'disconnected': dropped}
+    if key:
+        acc = ops_charger_access.data.get(cp_id) or {}
+        out['issued'] = [{'id': cp_id, 'key': key, 'name': r.get('name') or cp_id, 'connectors': r.get('connectors') or 1,
+                          'profile': ops_int(acc.get('profile'), 1, 0, 2), 'dz': r.get('dz'),
+                          'dz_name': _cid_codes(ops_cid_cfg()).get(r.get('dz'), r.get('dz') or ''), 'expected': {}}]
+        out['ocpp_base'] = ops_cid_ocpp_base(request)
+    return ops_json(out)
+
+
+async def ops_api_cid_confirm(request):
+    """The identity a charger reports now is the right one (new controller, repaired charger): it becomes the reference.
+    A simulator on the ID of a real charger is only allowed: the real identity stays on record."""
+    who = _cid_actor(request)
+    b = await ops_body(request)
+    cp_id = str(b.get('cp') or b.get('id') or '').strip()
+    idr = ops_charger_identity.data.get(cp_id)
+    if idr is None:
+        return ops_err('No identity known for this charger yet', 404)
+    mm, last = idr.get('mismatch') or {}, idr.get('last') or {}
+    ref = idr.setdefault('ref', {})
+    now = round(ops_now())
+    if mm.get('sim') and _cid_real_ref(ref):
+        ref.update(sim_ok=True, sim_ok_at=now, sim_ok_by=who)
+        idr['mismatch'] = None
+        _cid_hist(idr, f'simulators allowed on this ID by {who} (identity on record kept: {_cid_desc(ref)})')
+        ops_charger_identity.save()
+        ops_sec_event('identity_confirmed', cp_id, '', 'simulator allowed on this ID - the identity on record stays', by=who)
+        return ops_json({'ok': True, 'identity': _cid_identity_public(cp_id)})
+    src = mm if mm else last
+    if not any(_cid_txt(src.get(k)) for k in OPS_CID_FIELDS):
+        return ops_err('The charger has not reported its identity yet', 409)
+    keep = {k: ref[k] for k in ('sim_ok', 'sim_ok_at', 'sim_ok_by') if k in ref}
+    idr['ref'] = ref = dict({k: _cid_txt(src.get(k)) for k in OPS_CID_FIELDS if _cid_txt(src.get(k))}, **keep)
+    if src.get('sim'):
+        ref['sim'] = True                                 # a simulator: the real charger replaces it at its first BootNotification
+    ref.update(set_at=now, set_by=who)
+    what = mm.get('what') or ''
+    idr['mismatch'] = None
+    _cid_hist(idr, f'confirmed by {who}: {_cid_desc(ref)}')
+    ops_charger_identity.save()
+    ops_sec_event('identity_confirmed', cp_id, '', ('new identity confirmed: ' + what) if what else 'identity confirmed', by=who)
+    return ops_json({'ok': True, 'identity': _cid_identity_public(cp_id)})
+
+
+async def ops_api_cid_config(request):
+    who = _cid_actor(request)
+    b = await ops_body(request)
+    cfg = ops_cid_cfg()
+    new = {}
+    if 'prefix' in b:
+        p = str(b.get('prefix') or '').strip().upper()
+        if not _ops_re.match(r'^[A-Z][A-Z0-9]{1,5}$', p):
+            return ops_err('Prefix: 2 - 6 letters or digits, starting with a letter')
+        new['prefix'] = p
+    if 'digits' in b:
+        new['digits'] = ops_int(b.get('digits'), 4, 3, 6)
+    if 'profile' in b:
+        new['profile'] = ops_int(b.get('profile'), 0, 0, 2)
+    if 'ocpp_url' in b:
+        u = str(b.get('ocpp_url') or '').strip().rstrip('/')
+        if u and not OPS_CID_URL_RE.match(u):
+            return ops_err('Charger address: ws://… or wss://… (for example wss://csms.example.bt/ocpp), or empty')
+        new['ocpp_url'] = u
+    for k in ('hide_until_installed', 'refuse_not_accepted'):
+        if k in b:
+            new[k] = _cid_bool(b.get(k))
+    if 'codes' in b:
+        raw = b.get('codes')
+        lines = raw.splitlines() if isinstance(raw, str) else [f'{x[0]}={x[1]}' for x in (raw or []) if isinstance(x, (list, tuple)) and len(x) >= 2]
+        codes, seen = [], set()
+        for ln in lines:
+            ln = ln.strip()
+            if not ln:
+                continue
+            m = _ops_re.match(r'^([A-Za-z]{3})\s*[=:,]\s*(.+)$', ln)
+            if not m:
+                return ops_err('Each line: CODE = Dzongkhag name (3 letters), e.g. THM = Thimphu')
+            c = m.group(1).upper()
+            if c in seen:
+                return ops_err(f'The code {c} is given twice')
+            seen.add(c)
+            codes.append([c, m.group(2).strip()[:40]])
+        if not codes or len(codes) > 60:
+            return ops_err('Give 1 - 60 dzongkhag codes')
+        new['codes'] = codes
+    cfg.update(new)
+    ops_settings.save()
+    ops_sec_event('id_settings', '', '', f"charger id settings: {cfg['prefix']}-XXX-{'0' * cfg['digits']}", by=who)
+    return ops_json({'ok': True, 'cfg': {k: cfg.get(k) for k in OPS_CID_DEFAULTS}})
+
+
+async def ops_api_cid_csv(request):
+    buf = _ops_io.StringIO()
+    w = _ops_csv.writer(buf)
+    w.writerow(['charger id', 'dzongkhag', 'station', 'status', 'issued (BTT)', 'issued by', 'installed (BTT)', 'in service (BTT)',
+                'retired (BTT)', 'connectors', 'security profile', 'password in use', 'registration', 'vendor', 'model', 'serial',
+                'identity warning', 'note'])
+    codes = _cid_codes(ops_cid_cfg())
+    t = lambda v: ops_iso(v) if v else ''
+    for cp_id, r in sorted(list(ops_charger_ids.data.items())):
+        row = _cid_row(cp_id, r)
+        idn = row['identity']
+        mm = idn.get('mismatch') or {}
+        w.writerow([ops_csv_safe(x) for x in (cp_id, codes.get(r.get('dz'), r.get('dz') or ''), row['name'], row['status'],
+                                              t(row['created_at']), row['created_by'], t(row['installed_at']), t(row['in_service_at']),
+                                              t(row['retired_at']), row['connectors'], row['profile'], 'yes' if row['pw_in_use'] else 'no',
+                                              row['registration'], idn['ref'].get('vendor') or '', idn['ref'].get('model') or '',
+                                              idn['ref'].get('serial') or '', mm.get('what') or '', row['note'])])
+    name = 'csms_charger_ids_%s.csv' % ops_dt().strftime('%Y%m%d_%H%M')
+    return web.Response(body=('﻿' + buf.getvalue()).encode('utf-8'), content_type='text/csv',
+                        headers={'Content-Disposition': f'attachment; filename="{name}"'})
+
+
+OPS_ROUTES += [
+    ('GET', '/api/ops/chargerids', ops_api_cid), ('GET', '/api/ops/chargerids.csv', ops_api_cid_csv),
+    ('GET', '/api/ops/chargerids/preview', ops_api_cid_preview),
+    ('POST', '/api/ops/chargerids/issue', ops_api_cid_issue), ('POST', '/api/ops/chargerids/edit', ops_api_cid_edit),
+    ('POST', '/api/ops/chargerids/retire', ops_api_cid_retire), ('POST', '/api/ops/chargerids/identity/confirm', ops_api_cid_confirm),
+    ('POST', '/api/ops/chargerids/config', ops_api_cid_config),
+]
+
+OPS_CSS_PARTS.append(r'''/* [OPS] v1.13 🆔 charger IDs (Registration tab) */
+#cidPanel { margin-top: 1rem; }
+.ops-cid-fmt { border-radius: 10px; padding: 0.6rem 0.8rem; margin: 0.3rem 0 0.8rem; font-size: 0.8rem; line-height: 1.6; border: 1px solid rgba(59, 130, 246, 0.35);
+    background: rgba(59, 130, 246, 0.07); }
+.ops-cid-fmt code, .ops-cid-id { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.ops-cid-id { font-weight: 700; white-space: nowrap; }
+.ops-cid-st { display: inline-block; padding: 0.1rem 0.55rem; border-radius: 50px; font-size: 0.72rem; font-weight: 700; white-space: nowrap; }
+.ops-cid-st.issued { background: #fef3c7; color: #92400e; }
+.ops-cid-st.installed { background: #dbeafe; color: #1d4ed8; }
+.ops-cid-st.in_service { background: #d1fae5; color: #047857; }
+.ops-cid-st.retired { background: #e2e8f0; color: #475569; }
+.ops-cid-warn { border-radius: 10px; padding: 0.6rem 0.8rem; margin: 0 0 0.9rem; border: 1px solid rgba(249, 115, 22, 0.5); background: rgba(249, 115, 22, 0.08); }
+.ops-cid-warn h4 { margin: 0 0 0.4rem; }
+.ops-cid-filters { display: flex; gap: 0.4rem; flex-wrap: wrap; align-items: center; margin: 0.2rem 0 0.5rem; }
+.ops-cid-filters input[type=search] { width: 220px; max-width: 100%; }
+.ops-cid-preview { grid-column: 1 / -1; font-size: 0.8rem; border-radius: 8px; padding: 0.5rem 0.7rem; background: var(--bg-hover); line-height: 1.6; }
+.ops-cid-keys { width: 100%; border-collapse: collapse; font-size: 0.78rem; margin-top: 0.4rem; }
+.ops-cid-keys td, .ops-cid-keys th { border-bottom: 1px solid var(--border); padding: 0.3rem 0.4rem; text-align: left; vertical-align: top; }
+.ops-cid-keys .ops-key { word-break: break-all; }
+.ops-cid-hist { font-size: 0.72rem; color: var(--text-dim); margin: 0.2rem 0 0; padding-left: 1rem; }
+.ops-cid-retired td { opacity: 0.7; }
+@media (max-width: 700px) {
+    #cidPanel table.ops-cards .ops-btns { white-space: normal; display: flex; flex-wrap: wrap; gap: 0.25rem; }
+    #cidPanel table.ops-cards .ops-btns .tb-btn.ops-mini { margin: 0; }
+    .ops-cid-filters input[type=search] { width: 100%; }
+}
+''')
+OPS_JS_PARTS.append(r'''/* [OPS] 🆔 Charger IDs (v1.13): the CSMS issues the ChargeBox IDs, setup sheets for the installers, identity warnings - inside the 🔐 Registration tab */
+(function () {
+    'use strict';
+    const OPS = window.OPS;
+    if (!OPS) return;
+    const S = {data: null, busy: false, q: '', st: '', last: null};
+    OPS.ISSUE_KINDS = OPS.ISSUE_KINDS || {};
+    OPS.ISSUE_KINDS.identity_changed = 'Charger identity changed';
+    if (OPS.SEC_EVENTS) Object.assign(OPS.SEC_EVENTS, {issued: '🆔 Charger ID issued', installed: '🔌 Issued ID connected', in_service: '⚡ First charging session',
+        identity_changed: '⚠️ Charger identity changed', identity_back: '✅ Identity as confirmed again', identity_confirmed: '✅ New identity confirmed',
+        retired: '⛔ Charger ID retired', reactivated: '↩️ Charger ID reactivated', charge_refused: '🚫 Charging refused (charger not accepted)',
+        id_settings: '⚙️ Charger ID settings'});
+    Object.assign(OPS.actionLabels, {'/api/ops/chargerids/issue': 'Charger IDs issued', '/api/ops/chargerids/edit': 'Charger ID changed',
+        '/api/ops/chargerids/retire': 'Charger ID retired / reactivated', '/api/ops/chargerids/identity/confirm': 'Charger identity confirmed',
+        '/api/ops/chargerids/config': 'Charger ID settings changed'});
+    const STATES = {issued: '🕓 Waiting for installation', installed: '🔌 Installed', in_service: '⚡ In service', retired: '⛔ Retired'};
+    const PROFILES = {0: 'Profile 0 · no password', 1: 'Profile 1 · password', 2: 'Profile 2 · password + TLS'};
+    const FIELDS = ['vendor', 'model', 'serial'];
+    const td = (l, h, c) => OPS.td(l, h, c);
+    const esc = OPS.esc;
+    const ago = t => (t ? OPS.t('{d} ago', {d: OPS.dur(Date.now() / 1000 - t)}) : '—');
+
+    function build(view) {
+        const box = document.createElement('section');
+        box.className = 'pay-panel ops-panel';
+        box.id = 'cidPanel';
+        box.innerHTML = '<div class="ops-head"><h3>' + OPS.t('🆔 Charger IDs') + '</h3>' +
+            '<div class="ops-actions"><button class="tb-btn primary" id="cidIssue">' + OPS.t('➕ Issue charger IDs') + '</button>' +
+            '<button class="tb-btn" id="cidLast" style="display:none">' + OPS.t('🔑 Passwords just issued') + '</button>' +
+            '<a class="tb-btn" id="cidCsv" href="/api/ops/chargerids.csv">' + OPS.t('⬇️ CSV') + '</a>' +
+            '<button class="tb-btn" id="cidCfg">' + OPS.t('⚙️ ID settings') + '</button></div></div>' +
+            '<div id="cidFmt" class="ops-cid-fmt"></div>' +
+            '<section class="kpis ops-kpis">' + OPS.kpi('warn', 'Waiting for installation', 'cidKIssued', 'issued, not connected yet') +
+            OPS.kpi('info', 'Installed', 'cidKInst', 'connected with its password') + OPS.kpi('good', 'In service', 'cidKSvc', 'first charging session done') +
+            OPS.kpi('info', 'Retired', 'cidKRet', 'refused, number not used again') + OPS.kpi('warn', 'Identity warnings', 'cidKWarn', 'vendor / model / serial changed') + '</section>' +
+            '<div id="cidWarnBox"></div>' +
+            '<div class="ops-cid-filters"><input type="search" class="tb-inp" id="cidQ" placeholder="' + esc(OPS.tx('Charger ID, station, serial…')) + '">' +
+            '<select class="tb-sel" id="cidSt">' + OPS.opt('', 'All') + Object.keys(STATES).map(k => OPS.opt(k, STATES[k])).join('') + '</select>' +
+            '<span class="muted" id="cidCnt"></span></div>' +
+            '<div class="ops-table-wrap"><table class="fleet-table ops-table ops-cards" id="cidTable"></table></div>' +
+            '<div class="pay-help">' + OPS.t('The CSMS gives every new charger its ID (ChargeBox identity) and its own password. The ID is registered (Accepted) at once, but the charger can only connect with its password; its station stays hidden in the driver app until it connects. Every charger\'s vendor, model and serial number are remembered from its BootNotification - a change is reported (Alerts, security log), the charger is not refused. Chargers that are not Accepted cannot start charging.') + '</div>';
+        const sec = OPS.$('secPanel');
+        if (sec && sec.parentNode === view) view.insertBefore(box, sec);
+        else view.appendChild(box);
+        OPS.$('cidIssue').onclick = issueDialog;
+        OPS.$('cidLast').onclick = () => { if (S.last) keysDialog(S.last); };
+        OPS.$('cidCfg').onclick = settingsDialog;
+        OPS.$('cidQ').value = S.q;
+        OPS.$('cidSt').value = S.st;
+        OPS.$('cidQ').oninput = e => { S.q = e.target.value; renderTable(); };
+        OPS.$('cidSt').onchange = e => { S.st = e.target.value; renderTable(); };
+        box.addEventListener('click', onClick);
+    }
+
+    async function load() {
+        if (S.busy || !OPS.$('cidPanel')) return;
+        S.busy = true;
+        try { S.data = await OPS.api('/api/ops/chargerids'); } catch (e) { S.busy = false; return OPS.fail(e); }
+        S.busy = false;
+        render();
+    }
+
+    const dzName = code => { const c = ((S.data && S.data.codes) || []).find(x => x[0] === code); return c ? c[1] : (code || ''); };
+    const example = d => d.cfg.prefix + '-' + ((d.codes[0] || ['THM'])[0]) + '-' + '1'.padStart(d.cfg.digits, '0');
+
+    function render() {
+        const d = S.data;
+        if (!d || !OPS.$('cidPanel')) return;
+        const c = d.counts;
+        let fmt = '<b>' + OPS.t('ID format') + ':</b> <code>' + esc(d.cfg.prefix) + '-&lt;' + esc(OPS.tx('dzongkhag')) + '&gt;-' + '0'.repeat(d.cfg.digits) + '</code> · ' +
+            OPS.t('for example') + ' <code>' + esc(example(d)) + '</code><br><b>' + OPS.t('Chargers connect to') + ':</b> <code>' + esc(d.ocpp_base) + '/&lt;' + esc(OPS.tx('charger ID')) + '&gt;</code> · ' +
+            OPS.t(PROFILES[d.profile_default] || '') + (d.cfg.profile ? '' : ' <span class="muted">(' + OPS.t('automatic') + ')</span>');
+        if (d.sec_mode === 'open') fmt += '<br><span class="ops-warn">⚠️ ' + OPS.t('Charger access is "Open": a charger with an ID that is not on the list can still connect. Once your chargers have their IDs, switch to "Known chargers only" in 🔑 Charger access below.') + '</span>';
+        if (!d.cfg.refuse_not_accepted) fmt += '<br><span class="ops-warn">⚠️ ' + OPS.t('Chargers that are not Accepted may start charging (ID settings).') + '</span>';
+        if (d.cfg.profile === 2 && !d.tls_ok) fmt += '<br><span class="ops-bad">⚠️ ' + OPS.t('Security profile 2 needs TLS: the chargers\' address must be wss:// and the CSMS must run behind an HTTPS proxy (CSMS_TRUST_PROXY=1). Use profile 1.') + '</span>';
+        OPS.$('cidFmt').innerHTML = fmt;
+        OPS.$('cidKIssued').textContent = c.issued;
+        OPS.$('cidKInst').textContent = c.installed;
+        OPS.$('cidKSvc').textContent = c.in_service;
+        OPS.$('cidKRet').textContent = c.retired;
+        OPS.$('cidKWarn').textContent = c.warnings;
+        OPS.$('cidKWarnSub').innerHTML = OPS.t('{n} chargers with a known identity', {n: c.identities});
+        const cfgBtn = OPS.$('cidCfg');
+        if (cfgBtn) cfgBtn.style.display = OPS.can('admin') ? '' : 'none';
+        OPS.$('cidLast').style.display = S.last ? '' : 'none';
+        renderWarnings(d);
+        renderTable();
+    }
+
+    function idText(x) {
+        const parts = FIELDS.map(k => x && x[k] ? esc(x[k]) : '').filter(Boolean);
+        return parts.length ? parts.join(' · ') : '<span class="muted">—</span>';
+    }
+
+    function renderWarnings(d) {
+        const el = OPS.$('cidWarnBox');
+        if (!d.warnings.length) { el.innerHTML = ''; return; }
+        el.innerHTML = '<div class="ops-cid-warn"><h4>' + OPS.t('⚠️ Charger identity changed') + '</h4>' +
+            '<div class="ops-table-wrap"><table class="fleet-table ops-table ops-cards"><thead><tr><th>' + OPS.t('Charger') + '</th><th>' + OPS.t('On record') + '</th><th>' +
+            OPS.t('Reported now') + '</th><th>' + OPS.t('Since') + '</th><th></th></tr></thead><tbody>' +
+            d.warnings.map(w => {
+                const i = w.identity, m = i.mismatch || {};
+                return '<tr>' + td('Charger', '<b class="ops-cid-id">' + esc(w.cp) + '</b>' + (w.name ? '<br><span class="muted">' + esc(w.name) + '</span>' : '') +
+                        '<br><span class="' + (w.connected ? 'ops-ok' : 'muted') + '">' + OPS.t(w.connected ? 'connected' : 'offline') + '</span>') +
+                    td('On record', idText(i.ref) + (i.confirmed_by ? '<br><span class="muted">' + esc(OPS.tx(i.confirmed_by)) + '</span>' : '')) +
+                    td('Reported now', '<span class="ops-warn">' + (m.sim ? OPS.t('Simulator') + ' (' + esc(m.fw || '') + ')' : idText(m)) + '</span>' +
+                        (m.fw && !m.sim ? '<br><span class="muted">' + OPS.t('Firmware') + ' ' + esc(m.fw) + '</span>' : '')) +
+                    td('Since', OPS.fmt(m.at) + (m.count > 1 ? '<br><span class="muted">' + OPS.t('{n} BootNotifications', {n: m.count}) + '</span>' : '')) +
+                    td('', '<div class="ops-btns">' + confirmBtn(w.cp, m.sim, true) + '</div>') + '</tr>';
+            }).join('') + '</tbody></table></div><div class="pay-help">' +
+            OPS.t('A charger reported another vendor, model or serial number than the one on record: the controller was replaced or repaired - or another device uses this charger ID. Check on site; when the change is right, confirm it.') + '</div></div>';
+    }
+
+    function match(r) {
+        if (S.st && r.status !== S.st) return false;
+        const q = S.q.trim().toLowerCase();
+        if (!q) return true;
+        const i = r.identity || {};
+        return [r.id, r.name, dzName(r.dz), r.note, (i.ref || {}).serial, (i.ref || {}).vendor, (i.ref || {}).model, (i.last || {}).serial]
+            .some(v => String(v || '').toLowerCase().includes(q));
+    }
+
+    function renderTable() {
+        const d = S.data;
+        if (!d || !OPS.$('cidTable')) return;
+        const rows = d.rows.filter(match);
+        OPS.$('cidCnt').textContent = rows.length === d.rows.length ? '' : OPS.tx('{n} of {m}', {n: rows.length, m: d.rows.length});
+        OPS.$('cidTable').innerHTML = '<thead><tr><th>' + OPS.t('Charger ID') + '</th><th>' + OPS.t('Status') + '</th><th>' + OPS.t('Access') + '</th><th>' +
+            OPS.t('Identity') + '</th><th></th></tr></thead><tbody>' +
+            (rows.map(row).join('') || '<tr><td colspan="5" class="muted">' + OPS.t(d.rows.length ? 'Nothing found' : 'No charger IDs issued yet - "➕ Issue charger IDs" creates the first ones.') + '</td></tr>') + '</tbody>';
+    }
+
+    function row(r) {
+        const id = esc(r.id);
+        const name = '<b class="ops-cid-id">' + id + '</b><br><span class="muted">' + esc(r.name) + ' · ' + esc(dzName(r.dz)) + ' · ' +
+            OPS.t('{n} connector(s)', {n: r.connectors}) + '</span>' + (r.note ? '<br><span class="muted">' + esc(r.note) + '</span>' : '');
+        let st = '<span class="ops-cid-st ' + esc(r.status) + '">' + OPS.t(STATES[r.status] || r.status) + '</span><br><span class="muted">' +
+            OPS.t('issued {t}', {t: OPS.fmt(r.created_at)}) + (r.created_by ? ' · ' + esc(r.created_by) : '') + '</span>';
+        if (r.installed_at) st += '<br><span class="muted">' + OPS.t('connected {t}', {t: OPS.fmt(r.installed_at)}) + '</span>';
+        if (r.in_service_at) st += '<br><span class="muted">' + OPS.t('first charge {t}', {t: OPS.fmt(r.in_service_at)}) + '</span>';
+        if (r.retired_at) st += '<br><span class="muted">' + OPS.t('retired {t}', {t: OPS.fmt(r.retired_at)}) + (r.retired_by ? ' · ' + esc(r.retired_by) : '') + '</span>';
+        if (r.hidden && r.status === 'issued') st += '<br><span class="muted">🙈 ' + OPS.t('hidden in the driver app until it connects') + '</span>';
+        if (r.open_tx && r.open_tx.length) st += '<br><span class="ops-ok">⚡ ' + OPS.t('charging now') + '</span>';
+        let acc;
+        if (!r.listed) acc = '<span class="ops-bad">' + OPS.t('Not on the access list') + '</span>';
+        else if (!r.allowed) acc = '<span class="ops-bad">' + OPS.t('⛔ Blocked') + '</span>';
+        else acc = '<span class="ops-prof ops-prof-' + r.profile + '">' + OPS.t(PROFILES[r.profile]) + '</span>';
+        if (r.listed) {
+            acc += '<br>' + (r.pw_in_use ? '<span class="ops-ok">✅ ' + OPS.t('password in use') + '</span>'
+                : (r.pw_set ? '<span class="muted">⏳ ' + OPS.t('password not used yet') + '</span>' : '<span class="ops-bad">' + OPS.t('no password') + '</span>'));
+        }
+        if (r.registration !== 'Accepted') acc += '<br><span class="ops-warn">' + OPS.t('Registration {r}', {r: OPS.tx(r.registration)}) + '</span>';
+        acc += '<br><span class="' + (r.connected ? 'ops-ok' : 'muted') + '">' + (r.connected ? OPS.t('connected') : OPS.t('offline') +
+            (r.last_ok ? ' · ' + OPS.t('last sign-in {a}', {a: OPS.dur(Date.now() / 1000 - r.last_ok)}) : '')) + '</span>';
+        const i = r.identity || {};
+        let idn = idText(i.ref);
+        if (i.ref_sim) idn += '<br><span class="muted">' + OPS.t('(from a simulator - replaced by the real charger)') + '</span>';
+        if (i.sim_ok) idn += '<br><span class="muted">' + OPS.t('simulators allowed on this ID') + '</span>';
+        if (i.mismatch) idn += '<br><span class="ops-warn">⚠️ ' + OPS.t('now') + ': ' + (i.mismatch.sim ? OPS.t('Simulator') + ' (' + esc(i.mismatch.fw || '') + ')' : idText(i.mismatch)) + '</span>';
+        if (i.last && i.last.fw) idn += '<br><span class="muted">' + OPS.t('Firmware') + ' ' + esc(i.last.fw) + '</span>';
+        if (i.boots) idn += '<br><span class="muted">' + OPS.t('{n} BootNotifications · last {a}', {n: i.boots, a: OPS.dur(Date.now() / 1000 - (i.last_seen || 0))}) + '</span>';
+        let btns = '<button class="tb-btn ops-mini primary" data-cid="sheet" data-id="' + id + '">' + OPS.t('🖨️ Setup sheet') + '</button>' +
+            '<button class="tb-btn ops-mini" data-cid="edit" data-id="' + id + '">' + OPS.t('✏️ Edit') + '</button>';
+        if (i.mismatch) btns += confirmBtn(r.id, i.mismatch.sim, false);
+        btns += r.status === 'retired' ? '<button class="tb-btn ops-mini" data-cid="reactivate" data-id="' + id + '">' + OPS.t('↩️ Reactivate') + '</button>'
+            : '<button class="tb-btn ops-mini" data-cid="retire" data-id="' + id + '">' + OPS.t('⛔ Retire') + '</button>';
+        return '<tr class="' + (r.status === 'retired' ? 'ops-cid-retired' : '') + '">' + td('Charger ID', name) + td('Status', st) + td('Access', acc) +
+            td('Identity', idn) + td('', '<div class="ops-btns">' + btns + '</div>') + '</tr>';
+    }
+
+    function confirmBtn(cp, sim, primary) {
+        return '<button class="tb-btn ops-mini' + (primary ? ' primary' : '') + '" data-cid="confirm" data-id="' + esc(cp) + '"' + (sim ? ' data-sim="1"' : '') + '>' +
+            OPS.t(sim ? '✅ Allow the simulator' : '✅ Confirm new identity') + '</button>';
+    }
+
+    function find(id) { return (S.data && S.data.rows || []).find(r => r.id === id) || null; }
+
+    async function onClick(e) {
+        const b = e.target.closest('[data-cid]');
+        if (!b) return;
+        const id = b.dataset.id || '', act = b.dataset.cid;
+        try {
+            if (act === 'sheet') {
+                const r = find(id);
+                if (r) sheets([{id: r.id, name: r.name, dz: r.dz, dz_name: dzName(r.dz), connectors: r.connectors, profile: r.listed ? r.profile : S.data.profile_default,
+                    lat: r.lat, lon: r.lon, expected: r.identity && r.identity.ref || {}}], S.data.ocpp_base, false);
+                return;
+            }
+            if (act === 'edit') return editDialog(find(id));
+            if (act === 'confirm') {
+                if (!OPS.confirm(b.dataset.sim ? 'Allow simulators on {cp}? The identity on record stays - a real charger is still checked against it.'
+                    : 'Confirm the identity that {cp} reports now? It becomes the identity on record and the warning closes.', {cp: id})) return;
+                await OPS.post('/api/ops/chargerids/identity/confirm', {cp: id});
+                OPS.toast(OPS.tx('Saved'), 'success');
+            } else if (act === 'retire') {
+                if (!OPS.confirm('Retire {cp}? The charger is disconnected and refused from now on, its station is hidden, its bookings are cancelled, and the number is never issued again.', {cp: id})) return;
+                let j;
+                try {
+                    j = await OPS.post('/api/ops/chargerids/retire', {id: id});
+                } catch (err) {
+                    if (!(err.status === 409 && err.data && err.data.busy)) throw err;
+                    if (!OPS.confirm('{cp} is charging now (session {tx}). Stop the session first (Stations tab → Remote stop): a retired charger cannot send its StopTransaction, so the session stays open. Retire anyway?',
+                        {cp: id, tx: err.data.busy.join(', ')})) return;
+                    j = await OPS.post('/api/ops/chargerids/retire', {id: id, force: true});
+                }
+                OPS.toast(OPS.tx(j.disconnected ? '{cp} retired and disconnected' : '{cp} retired', {cp: id}), 'success');
+            } else if (act === 'reactivate') {
+                if (!OPS.confirm('Reactivate {cp}? It is accepted again and can connect with its password.', {cp: id})) return;
+                const j = await OPS.post('/api/ops/chargerids/retire', {id: id, reactivate: true});
+                if (j.issued) {
+                    S.last = j;
+                    keysDialog(j, OPS.t('{cp} had no password in the CSMS any more: it got a new one. Set it on the charger.', {cp: id}));
+                } else OPS.toast(OPS.tx('Saved'), 'success');
+            }
+        } catch (err) { return OPS.fail(err); }
+        load();
+    }
+
+    // ---- issue new IDs
+    function issueDialog() {
+        const d = S.data;
+        if (!d) return;
+        const prof = OPS.tx('Automatic: {p}', {p: OPS.tx(PROFILES[d.profile_default])});
+        const html = '<div class="ops-form">' +
+            '<label>' + OPS.t('Dzongkhag') + '<select class="tb-sel" id="cidDz">' + d.codes.map((c, i) => OPS.opt(c[0], c[0] + ' · ' + c[1], i === 0)).join('') + '</select></label>' +
+            '<label>' + OPS.t('How many IDs (1 - 50)') + '<input class="tb-inp" type="number" id="cidN" min="1" max="50" value="1"></label>' +
+            '<label>' + OPS.t('Connectors per charger') + '<input class="tb-inp" type="number" id="cidConn" min="1" max="8" value="2"></label>' +
+            '<label>' + OPS.t('Security profile') + '<select class="tb-sel" id="cidProf">' + OPS.opt(0, prof, true) + OPS.opt(1, PROFILES[1]) + OPS.opt(2, PROFILES[2]) + '</select></label>' +
+            '<label class="wide">' + OPS.t('Station name (shown to drivers)') + '<input class="tb-inp" id="cidName" maxlength="100"></label>' +
+            '<label>' + OPS.t('Latitude') + '<input class="tb-inp" id="cidLat" inputmode="decimal" placeholder="27.4728"></label>' +
+            '<label>' + OPS.t('Longitude') + '<input class="tb-inp" id="cidLon" inputmode="decimal" placeholder="89.6390"></label>' +
+            '<label>' + OPS.t('Vendor (expected)') + '<input class="tb-inp" id="cidVen" maxlength="64"></label>' +
+            '<label>' + OPS.t('Model (expected)') + '<input class="tb-inp" id="cidMod" maxlength="64"></label>' +
+            '<label>' + OPS.t('Serial number (expected)') + '<input class="tb-inp" id="cidSer" maxlength="64"></label>' +
+            '<label class="wide">' + OPS.t('Note') + '<input class="tb-inp" id="cidNote" maxlength="200"></label>' +
+            '<div class="ops-cid-preview" id="cidPrev"></div></div>' +
+            '<div class="pay-help">' + OPS.t('Each ID is registered (Accepted) and put on the access list with its own new password, shown once on the next page. Vendor, model and serial are optional: when given, the charger that connects with this ID is checked against them (a difference is reported, not refused). A serial number is for one charger only.') + '</div>';
+        const w = OPS.modal('➕ Issue charger IDs', html, [{label: 'Cancel'}, {label: '🆔 Issue', cls: 'primary', run: async box => {
+            const n = parseInt(OPS.val(box, '#cidN'), 10) || 1;
+            const body = {dz: OPS.val(box, '#cidDz'), count: n, connectors: parseInt(OPS.val(box, '#cidConn'), 10) || 2,
+                profile: parseInt(OPS.val(box, '#cidProf'), 10) || 0, name: OPS.val(box, '#cidName'), lat: OPS.val(box, '#cidLat'), lon: OPS.val(box, '#cidLon'),
+                vendor: OPS.val(box, '#cidVen'), model: OPS.val(box, '#cidMod'), serial: n > 1 ? '' : OPS.val(box, '#cidSer'), note: OPS.val(box, '#cidNote')};
+            const j = await OPS.post('/api/ops/chargerids/issue', body);
+            S.last = j;
+            load();
+            keysDialog(j);
+            return true;
+        }}], {wide: true});
+        let seq = 0;
+        const upd = async () => {
+            const dz = OPS.val(w, '#cidDz'), n = Math.max(1, Math.min(50, parseInt(OPS.val(w, '#cidN'), 10) || 1));
+            const ser = w.querySelector('#cidSer');
+            ser.disabled = n > 1;
+            if (n > 1) ser.value = '';
+            w.querySelector('#cidName').placeholder = 'BPC ' + dzName(dz);
+            const my = ++seq;
+            let p;
+            try { p = await OPS.api('/api/ops/chargerids/preview?dz=' + encodeURIComponent(dz) + '&count=' + n); } catch (e) { return; }
+            if (my !== seq || !w.isConnected) return;                // an older answer, or the dialog is closed
+            const ids = p.ids || [];
+            let txt;
+            if (!ids.length) txt = '<span class="ops-bad">' + OPS.t('No numbers left for this dzongkhag with the current number of digits') + '</span>';
+            else if (ids.length === 1) txt = OPS.t('New ID') + ': <b class="ops-cid-id">' + esc(ids[0]) + '</b>';
+            else txt = OPS.t('New IDs') + ': <b class="ops-cid-id">' + esc(ids[0]) + '</b> … <b class="ops-cid-id">' + esc(ids[ids.length - 1]) + '</b> (' + ids.length + ')' +
+                '<br><span class="muted">' + OPS.t('Station names get #1, #2, … at the end. Numbers that are already used anywhere are skipped.') + '</span>';
+            if (p.short && ids.length) txt += '<br><span class="ops-bad">' + OPS.t('Only {n} free numbers are left for this dzongkhag', {n: ids.length}) + '</span>';
+            w.querySelector('#cidPrev').innerHTML = txt;
+        };
+        ['#cidDz', '#cidN'].forEach(s => { const el = w.querySelector(s); el.oninput = upd; el.onchange = upd; });
+        upd();
+    }
+
+    function keysText(j) {
+        return OPS.tx('Charger address (OCPP 1.6-J)') + ': ' + j.ocpp_base + '/<' + OPS.tx('charger ID') + '>\n' +
+            j.issued.map(x => x.id + '\t' + x.key + '\t' + x.name).join('\n') + '\n';
+    }
+
+    function keysDialog(j, noteHtml) {
+        const rows = j.issued.map(x => '<tr><td><b class="ops-cid-id">' + esc(x.id) + '</b><br><span class="muted">' + esc(x.name) + '</span></td>' +
+            '<td><span class="ops-key">' + esc(x.key) + '</span></td><td class="muted">' + esc(OPS.tx(PROFILES[x.profile])) + '</td></tr>').join('');
+        const html = (noteHtml ? '<div class="ops-sec-line ops-warn">' + noteHtml + '</div>' : '') +
+            '<div class="ops-sec-line"><b>' + OPS.t('Charger address (OCPP 1.6-J)') + ':</b> <code>' + esc(j.ocpp_base) + '/</code> ' +
+            OPS.t('+ the charger ID') + '</div>' +
+            '<div class="ops-table-wrap"><table class="ops-cid-keys"><thead><tr><th>' + OPS.t('Charger ID = user name') + '</th><th>' + OPS.t('Password (charger key)') + '</th><th>' +
+            OPS.t('Security profile') + '</th></tr></thead><tbody>' + rows + '</tbody></table></div>' +
+            '<div class="pay-help">' + OPS.t('The passwords are shown only now - the CSMS keeps only a fingerprint. Print the setup sheets or copy the list before you close this window (until this page is reloaded, "🔑 Passwords just issued" opens it again). If a password is lost, give the charger a new one in 🔑 Charger access.') + '</div>';
+        OPS.modal('🔑 New charger IDs and passwords', html, [
+            {label: '🖨️ Setup sheets', run: () => { sheets(j.issued, j.ocpp_base, true); return false; }},
+            {label: '📋 Copy all', run: async () => {
+                const t = keysText(j);
+                try { await navigator.clipboard.writeText(t); }
+                catch (e) { const a = document.createElement('textarea'); a.value = t; document.body.appendChild(a); a.select(); document.execCommand('copy'); a.remove(); }
+                OPS.toast(OPS.tx('Copied'), 'success');
+                return false;
+            }},
+            {label: '⬇️ CSV with passwords', run: () => { csvKeys(j); return false; }},
+            {label: 'Done', cls: 'primary'}], {wide: true});
+    }
+
+    function csvKeys(j) {
+        const q = v => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
+        const lines = [['charger id', 'password', 'station', 'dzongkhag', 'connectors', 'security profile', 'ocpp address'].map(q).join(',')]
+            .concat(j.issued.map(x => [x.id, x.key, x.name, x.dz_name, x.connectors, x.profile, j.ocpp_base + '/' + x.id].map(q).join(',')));
+        const blob = new Blob(['﻿' + lines.join('\r\n') + '\r\n'], {type: 'text/csv;charset=utf-8'});
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'charger_ids_' + OPS.day().replace(/-/g, '') + '_KEEP_SECRET.csv';
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+    }
+
+    // ---- printable setup sheet(s): one page per charger (made in this browser, nothing is stored)
+    function sheets(list, ocppBase, withKey) {
+        const w = window.open('', '_blank');
+        if (!w) { OPS.toast(OPS.tx('The browser blocked the new window - allow pop-ups for this page'), 'error'); return; }
+        const o = location.origin, T = (k, v) => esc(OPS.tx(k, v));
+        const line = (k, v, cls) => '<tr><th>' + T(k) + '</th><td' + (cls ? ' class="' + cls + '"' : '') + '>' + v + '</td></tr>';
+        const pages = list.map(x => {
+            const prof = x.profile == null ? 1 : x.profile;
+            const exp = FIELDS.filter(k => x.expected && x.expected[k]).map(k => esc(x.expected[k])).join(' · ');
+            const qrs = Array.from({length: Math.max(1, Math.min(8, x.connectors || 1))}, (_, i) => '<div class="qr"><img src="' + o + '/api/pay/qr.svg?cp=' +
+                encodeURIComponent(x.id) + '&c=' + (i + 1) + '&scale=4" alt=""><div>' + T('Connector {n}', {n: i + 1}) + '</div></div>').join('');
+            return '<section class="sheet"><header><img src="' + o + '/static/bpc_logo.png" alt="" onerror="this.style.display=\'none\'"><div><h1>' + T('Charger setup sheet') + '</h1>' +
+                '<div class="sub">' + esc(x.name || '') + ' · ' + esc(x.dz_name || '') + '</div></div><div class="date">' + esc(OPS.day()) + '</div></header>' +
+                '<div class="big">' + esc(x.id) + '</div>' +
+                '<h2>' + T('OCPP connection') + '</h2><table>' +
+                line('OCPP version', 'OCPP 1.6-J (JSON / WebSocket)') +
+                line('Central system address', '<code>' + esc(ocppBase) + '/</code> <span class="muted">' + T('(the charger adds its ID)') + '</span>') +
+                line('Full address', '<code>' + esc(ocppBase + '/' + x.id) + '</code>') +
+                line('Charger ID (ChargeBox identity)', '<code>' + esc(x.id) + '</code>') +
+                line('Security profile', esc(OPS.tx(PROFILES[prof] || ''))) +
+                line('HTTP Basic user name', '<code>' + esc(x.id) + '</code>') +
+                line('Password (AuthorizationKey)', prof === 0 ? '<span class="muted">' + T('not needed (security profile 0)') + '</span>' :
+                    (withKey && x.key ? '<code class="key">' + esc(x.key) + '</code>' :
+                    '<span class="muted">' + T('given when the ID was issued (the CSMS keeps only a fingerprint) - if it is lost, create a new one in 🔑 Charger access') + '</span>')) +
+                (exp ? line('Expected charger', exp) : '') +
+                line('Station', esc(x.name || '') + ' · ' + esc(x.dz_name || '') + ' · ' + T('{n} connector(s)', {n: x.connectors || 1}) +
+                    (x.lat != null && x.lon != null ? ' · ' + esc(Number(x.lat).toFixed(5) + ', ' + Number(x.lon).toFixed(5)) : '')) + '</table>' +
+                '<p class="note">' + T('The password is 40 hexadecimal digits: it works as text and where the charger asks whether the OCPP 1.6 key is hexadecimal (Vector vSECC).') +
+                (prof === 2 ? ' ' + T('Profile 2: the address must start with wss:// (TLS); plain ws:// is refused.') : '') + '</p>' +
+                '<h2>' + T('Steps') + '</h2><ol>' +
+                '<li>' + T('Enter the charger ID, the address and the password in the charger\'s OCPP settings (web page or service tool of the charger).') + '</li>' +
+                '<li>' + T('Restart the charger. It connects and registers by itself - the ID is accepted already.') + '</li>' +
+                '<li>' + T('In the CSMS (🔐 Registration → 🆔 Charger IDs) the ID shows "Installed" and "password in use"; the station appears in the driver app.') + '</li>' +
+                '<li>' + T('Make a test charge: the ID shows "In service".') + '</li>' +
+                '<li>' + T('Stick the payment QR codes on the connectors.') + '</li></ol>' +
+                '<h2>' + T('Payment QR codes') + '</h2><div class="qrs">' + qrs + '</div>' +
+                (withKey ? '<p class="secret">🔒 ' + T('This sheet contains the charger\'s password - keep it safe and destroy it after the charger is set up.') + '</p>' : '') +
+                '</section>';
+        }).join('');
+        const css = 'body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:#0f172a;margin:0;background:#f1f5f9}' +
+            '.bar{position:sticky;top:0;background:#0f172a;color:#fff;padding:8px 16px;display:flex;gap:12px;align-items:center}' +
+            '.bar button{font:inherit;padding:6px 14px;border-radius:8px;border:0;background:#22c55e;color:#fff;font-weight:700;cursor:pointer}' +
+            '.sheet{background:#fff;max-width:190mm;margin:12px auto;padding:12mm;box-sizing:border-box;page-break-after:always}' +
+            'header{display:flex;gap:12px;align-items:center;border-bottom:2px solid #0f172a;padding-bottom:6px}header img{height:42px}' +
+            'h1{font-size:20px;margin:0}.sub{color:#475569;font-size:13px}.date{margin-left:auto;color:#475569;font-size:12px}' +
+            '.big{font:700 30px ui-monospace,Menlo,Consolas,monospace;text-align:center;margin:14px 0;letter-spacing:1px}' +
+            'h2{font-size:14px;margin:14px 0 6px;text-transform:uppercase;letter-spacing:.5px;color:#334155}' +
+            'table{width:100%;border-collapse:collapse;font-size:13px}th{text-align:left;width:38%;color:#475569;font-weight:600;padding:4px 6px;vertical-align:top}' +
+            'td{padding:4px 6px;border-bottom:1px solid #e2e8f0;word-break:break-all}code{font-family:ui-monospace,Menlo,Consolas,monospace}' +
+            '.key{font-size:14px;font-weight:700}.muted{color:#64748b}.note{font-size:12px;color:#334155}ol{font-size:13px;line-height:1.6;padding-left:18px}' +
+            '.qrs{display:flex;flex-wrap:wrap;gap:10px}.qr{text-align:center;font-size:12px;font-weight:600}.qr img{width:34mm;height:34mm}' +
+            '.secret{margin-top:12px;font-size:12px;font-weight:700;color:#b91c1c}' +
+            '@media print{body{background:#fff}.bar{display:none}.sheet{margin:0;padding:8mm;max-width:none}}';
+        w.document.open();
+        w.document.write('<!doctype html><html><head><meta charset="utf-8"><title>' + T('Charger setup sheet') + ' - ' + esc(list.map(x => x.id).join(', ')).slice(0, 120) +
+            '</title><style>' + css + '</style></head><body><div class="bar"><button type="button" id="prt">🖨️ ' + T('Print') + '</button><span>' +
+            T('{n} setup sheet(s)', {n: list.length}) + '</span></div>' + pages + '</body></html>');
+        w.document.close();
+        const p = w.document.getElementById('prt');
+        if (p) p.onclick = () => w.print();
+    }
+
+    // ---- edit an issued ID
+    function editDialog(r) {
+        if (!r) return;
+        const ref = (r.identity && r.identity.ref) || {};
+        const v = x => (x == null ? '' : esc(x));
+        const html = '<div class="ops-form">' +
+            '<label class="wide">' + OPS.t('Station name (shown to drivers)') + '<input class="tb-inp" id="cidEdName" maxlength="100" value="' + v(r.name) + '"></label>' +
+            '<label>' + OPS.t('Connectors per charger') + '<input class="tb-inp" type="number" id="cidEdConn" min="1" max="8" value="' + v(r.connectors) + '"></label>' +
+            '<label>' + OPS.t('Latitude') + '<input class="tb-inp" id="cidEdLat" inputmode="decimal" value="' + v(r.lat) + '"></label>' +
+            '<label>' + OPS.t('Longitude') + '<input class="tb-inp" id="cidEdLon" inputmode="decimal" value="' + v(r.lon) + '"></label>' +
+            '<label>' + OPS.t('Vendor (expected)') + '<input class="tb-inp" id="cidEdVen" maxlength="64" value="' + v(ref.vendor) + '"></label>' +
+            '<label>' + OPS.t('Model (expected)') + '<input class="tb-inp" id="cidEdMod" maxlength="64" value="' + v(ref.model) + '"></label>' +
+            '<label>' + OPS.t('Serial number (expected)') + '<input class="tb-inp" id="cidEdSer" maxlength="64" value="' + v(ref.serial) + '"></label>' +
+            '<label class="wide">' + OPS.t('Note') + '<input class="tb-inp" id="cidEdNote" maxlength="200" value="' + v(r.note) + '"></label></div>' +
+            ((r.history || []).length ? '<details><summary>' + OPS.t('History') + '</summary><ul class="ops-cid-hist">' +
+                r.history.slice().reverse().map(h => '<li>' + OPS.fmt(h[0]) + ' · ' + esc(OPS.tx(h[1])) + '</li>').join('') + '</ul></details>' : '') +
+            '<div class="pay-help">' + OPS.t('Password and security profile: 🔑 Charger access below.') + '</div>';
+        OPS.modal('Charger ID {cp}', html, [{label: 'Cancel'}, {label: '💾 Save', cls: 'primary', run: async box => {
+            const body = {id: r.id};
+            const nm = OPS.val(box, '#cidEdName'), cn = parseInt(OPS.val(box, '#cidEdConn'), 10), nt = OPS.val(box, '#cidEdNote');
+            if (nm && nm !== (r.name || '')) body.name = nm;
+            if (cn !== r.connectors) body.connectors = cn || 0;
+            if (nt !== (r.note || '')) body.note = nt;
+            const lat = OPS.val(box, '#cidEdLat'), lon = OPS.val(box, '#cidEdLon');
+            if (lat !== (r.lat == null ? '' : String(r.lat)) || lon !== (r.lon == null ? '' : String(r.lon))) { body.lat = lat; body.lon = lon; }
+            const idn = {vendor: OPS.val(box, '#cidEdVen'), model: OPS.val(box, '#cidEdMod'), serial: OPS.val(box, '#cidEdSer')};
+            if (FIELDS.some(k => idn[k] !== (ref[k] || ''))) Object.assign(body, idn);
+            if (Object.keys(body).length === 1) return true;
+            await OPS.post('/api/ops/chargerids/edit', body);
+            OPS.toast(OPS.tx('Saved'), 'success');
+            load();
+            return true;
+        }}], {vars: {cp: r.id}, wide: true});
+    }
+
+    // ---- settings (administrator)
+    function settingsDialog() {
+        const d = S.data;
+        if (!d) return;
+        const c = d.cfg;
+        const html = '<div class="ops-form">' +
+            '<label>' + OPS.t('Prefix') + '<input class="tb-inp" id="cidCfPre" maxlength="6" value="' + esc(c.prefix) + '"></label>' +
+            '<label>' + OPS.t('Digits of the number') + '<select class="tb-sel" id="cidCfDig">' + [3, 4, 5, 6].map(n => OPS.opt(n, String(n), n === c.digits)).join('') + '</select></label>' +
+            '<label>' + OPS.t('Security profile of new IDs') + '<select class="tb-sel" id="cidCfProf">' + OPS.opt(0, 'Automatic (2 on wss://, else 1)', !c.profile) +
+            OPS.opt(1, PROFILES[1], c.profile === 1) + OPS.opt(2, PROFILES[2], c.profile === 2) + '</select></label>' +
+            '<label class="wide">' + OPS.t('Address given to the chargers (empty = automatic)') + '<input class="tb-inp" id="cidCfUrl" maxlength="200" value="' + esc(c.ocpp_url || '') +
+            '" placeholder="' + esc(c.ocpp_url ? '' : d.ocpp_base) + '"></label>' +
+            '<label class="wide ops-check"><input type="checkbox" id="cidCfHide"' + (c.hide_until_installed ? ' checked' : '') + '> ' +
+            OPS.t('Hide the station of a new ID in the driver app until the charger connects') + '</label>' +
+            '<label class="wide ops-check"><input type="checkbox" id="cidCfRefuse"' + (c.refuse_not_accepted ? ' checked' : '') + '> ' +
+            OPS.t('Chargers that are not Accepted cannot start charging (Authorize / StartTransaction answered Invalid)') + '</label>' +
+            '<label class="wide">' + OPS.t('Dzongkhag codes (one per line: CODE = name)') + '<textarea class="tb-inp" id="cidCfCodes" rows="8">' +
+            esc(d.codes.map(x => x[0] + ' = ' + x[1]).join('\n')) + '</textarea></label></div>' +
+            '<div class="pay-help">' + OPS.t('IDs already issued keep their name; a new prefix or number of digits applies to new IDs only. Numbers are never used twice.') + '</div>';
+        OPS.modal('⚙️ Charger ID settings', html, [{label: 'Cancel'}, {label: '💾 Save', cls: 'primary', run: async box => {
+            await OPS.post('/api/ops/chargerids/config', {prefix: OPS.val(box, '#cidCfPre'), digits: parseInt(OPS.val(box, '#cidCfDig'), 10),
+                profile: parseInt(OPS.val(box, '#cidCfProf'), 10) || 0, ocpp_url: OPS.val(box, '#cidCfUrl'),
+                hide_until_installed: box.querySelector('#cidCfHide').checked, refuse_not_accepted: box.querySelector('#cidCfRefuse').checked,
+                codes: box.querySelector('#cidCfCodes').value});
+            OPS.toast(OPS.tx('Saved'), 'success');
+            load();
+            return true;
+        }}], {wide: true});
+    }
+
+    // ---- inside the 🔐 Registration tab, above 🔑 Charger access (same module slot: the previous one is kept and called)
+    const prev = OPS.mods.registration;
+    OPS.register({tab: 'registration', every: 15,
+        show: function () {
+            if (prev) { try { prev.show(); } catch (e) { console.error(e); } }
+            const v = OPS.$('view-registration');
+            if (!v || !OPS.can('config')) return;
+            if (!OPS.$('cidPanel')) build(v);
+            load();
+        },
+        refresh: function () {
+            if (prev) { try { (prev.refresh || prev.show)(); } catch (e) { console.error(e); } }
+            load();
+        },
+        relang: function () {
+            const p = OPS.$('cidPanel');
+            if (p) p.remove();
+            if (prev && prev.relang) prev.relang();
+            else OPS.mods.registration.show();
+            if (!OPS.$('cidPanel')) OPS.mods.registration.show();
+        }
+    });
+
+    OPS.addI18n({
+        '🆔 Charger IDs': ['🆔 གློག་བླུགས་འཕྲུལ་ཆས་ ID ཚུ་', '🆔 ID ตู้ชาร์จ'],
+        '➕ Issue charger IDs': ['➕ གློག་བླུགས་འཕྲུལ་ཆས་ ID སྤྲོད་', '➕ ออก ID ตู้ชาร์จ'],
+        '🔑 Passwords just issued': ['🔑 ད་ལྟོ་སྤྲོད་མི་ཆོག་ཡིག་ཚུ་', '🔑 รหัสผ่านที่เพิ่งออก'],
+        '⬇️ CSV': ['⬇️ CSV', '⬇️ CSV'], '⚙️ ID settings': ['⚙️ ID སྒྲིག་སྟངས་', '⚙️ ตั้งค่า ID'],
+        'Waiting for installation': ['བཙུགས་ནི་ལུ་བསྒུག་དོ་', 'รอติดตั้ง'], 'issued, not connected yet': ['སྤྲོད་ཡོད་ ད་ཚུན་མ་མཐུད་', 'ออกแล้ว ยังไม่เชื่อมต่อ'],
+        'Installed': ['བཙུགས་ཡོད་', 'ติดตั้งแล้ว'], 'connected with its password': ['རང་གི་ཆོག་ཡིག་གིས་མཐུད་ཡོད་', 'เชื่อมต่อด้วยรหัสผ่านของตัวเองแล้ว'],
+        'In service': ['ལཱ་འབད་དོ་', 'ใช้งานจริง'], 'first charging session done': ['གློག་བླུགས་ཐེངས་དང་པ་ཚར་ཡོད་', 'ชาร์จครั้งแรกแล้ว'],
+        'Retired': ['ལག་ལེན་མཚམས་བཞག་ཡོད་', 'เลิกใช้'], 'refused, number not used again': ['ངོས་ལེན་མེད་ ཨང་འདི་ལོག་ལག་ལེན་མི་འབད་', 'ถูกปฏิเสธ ไม่นำเลขกลับมาใช้อีก'],
+        'Identity warnings': ['ངོ་རྟགས་ཉེན་བརྡ་', 'คำเตือนตัวตนตู้'], 'vendor / model / serial changed': ['བཟོ་མི་ / མོ་ཌེལ་ / ཨང་རིམ་ བསྒྱུར་ཡོད་', 'ผู้ผลิต / รุ่น / ซีเรียล เปลี่ยน'],
+        '{n} chargers with a known identity': ['ངོ་རྟགས་ཤེས་ཡོད་པའི་གློག་བླུགས་འཕྲུལ་ཆས་ {n}', 'ตู้ที่รู้ตัวตนแล้ว {n} ตู้'],
+        'Charger ID, station, serial…': ['གློག་བླུགས་འཕྲུལ་ཆས་ ID ས་ཚིགས་ ཨང་རིམ་…', 'ID ตู้ สถานี ซีเรียล…'],
+        'The CSMS gives every new charger its ID (ChargeBox identity) and its own password. The ID is registered (Accepted) at once, but the charger can only connect with its password; its station stays hidden in the driver app until it connects. Every charger\'s vendor, model and serial number are remembered from its BootNotification - a change is reported (Alerts, security log), the charger is not refused. Chargers that are not Accepted cannot start charging.': [
+            'CSMS གིས་ གློག་བླུགས་འཕྲུལ་ཆས་གསརཔ་རེ་རེ་ལུ་ ID (ChargeBox identity) དང་ རང་སོའི་ཆོག་ཡིག་ སྤྲོདཔ་ཨིན། ID འདི་ ཕྱིར་འཐེན་མེད་པར་ ཐོ་བཀོད་ (Accepted) འབདཝ་ཨིན་ དེ་འབདཝ་ད་ གློག་བླུགས་འཕྲུལ་ཆས་འདི་ རང་གི་ཆོག་ཡིག་གིས་རྐྱངམ་ཅིག་ མཐུད་ཚུགས། ས་ཚིགས་འདི་ མཐུད་ཚུན་ཚོད་ དེད་པའི་ app ནང་ སྦ་བཞགཔ་ཨིན། གློག་བླུགས་འཕྲུལ་ཆས་རེ་རེ་གི་ བཟོ་མི་ མོ་ཌེལ་ ཨང་རིམ་ཚུ་ BootNotification ལས་ དྲན་ཐོ་བཞགཔ་ཨིན་ - བསྒྱུར་བཅོས་ཡོད་པ་ཅིན་ ཉེན་བརྡ་ (Alerts, ཉེན་སྲུང་དྲན་ཐོ་) བཏངམ་ཨིན་ གློག་བླུགས་འཕྲུལ་ཆས་ ངོས་ལེན་མེད་པར་མི་བཟོ། Accepted མེན་པའི་གློག་བླུགས་འཕྲུལ་ཆས་ཚུ་གིས་ གློག་བླུགས་འགོ་བཙུགས་མི་ཚུགས།',
+            'CSMS ออก ID (ChargeBox identity) และรหัสผ่านเฉพาะให้ตู้ใหม่แต่ละตู้ ID ถูกลงทะเบียน (Accepted) ทันที แต่ตู้จะเชื่อมต่อได้ด้วยรหัสผ่านของตัวเองเท่านั้น และสถานีจะถูกซ่อนในแอปผู้ขับจนกว่าตู้จะเชื่อมต่อ ระบบจำผู้ผลิต รุ่น และซีเรียลของทุกตู้จาก BootNotification ถ้าเปลี่ยนจะแจ้งเตือน (Alerts, บันทึกความปลอดภัย) แต่ไม่ปฏิเสธตู้ ตู้ที่ไม่ได้ Accepted จะเริ่มชาร์จไม่ได้'],
+        'ID format': ['ID གི་རྣམ་པ་', 'รูปแบบ ID'], 'dzongkhag': ['རྫོང་ཁག་', 'ซองคาก'], 'for example': ['དཔེར་ན་', 'ตัวอย่าง'],
+        'Chargers connect to': ['གློག་བླུགས་འཕྲུལ་ཆས་ཚུ་ མཐུད་སའི་ཁ་བྱང་', 'ตู้เชื่อมต่อที่'], 'charger ID': ['གློག་བླུགས་འཕྲུལ་ཆས་ ID', 'ID ตู้'],
+        'automatic': ['རང་བཞིན་', 'อัตโนมัติ'],
+        'Charger access is "Open": a charger with an ID that is not on the list can still connect. Once your chargers have their IDs, switch to "Known chargers only" in 🔑 Charger access below.': [
+            'གློག་བླུགས་འཕྲུལ་ཆས་ཀྱི་འཛུལ་སྤྱོད་ "ཁ་ཕྱེ་" ཨིན་: ཐོ་ཡིག་ནང་མེད་པའི་ ID གིས་ཡང་ མཐུད་ཚུགས། གློག་བླུགས་འཕྲུལ་ཆས་ཚུ་ལུ་ ID ཐོབ་ཚར་བའི་ཤུལ་ལས་ འོག་གི་ 🔑 གློག་བླུགས་འཕྲུལ་ཆས་ཀྱི་འཛུལ་སྤྱོད་ནང་ "ཤེས་ཡོད་པའི་གློག་བླུགས་འཕྲུལ་ཆས་རྐྱངམ་ཅིག་" ལུ་ སོར་',
+            'การเข้าถึงของตู้เป็นโหมด "เปิด": ตู้ที่มี ID ไม่อยู่ในรายการยังเชื่อมต่อได้ เมื่อตู้ทุกตู้ได้ ID แล้ว ให้เปลี่ยนเป็น "เฉพาะตู้ที่รู้จัก" ในส่วน 🔑 การเข้าถึงของตู้ชาร์จ ด้านล่าง'],
+        'Chargers that are not Accepted may start charging (ID settings).': ['Accepted མེན་པའི་གློག་བླུགས་འཕྲུལ་ཆས་ཚུ་གིས་ གློག་བླུགས་འགོ་བཙུགས་ཆོག (ID སྒྲིག་སྟངས་)', 'ตู้ที่ไม่ได้ Accepted เริ่มชาร์จได้ (ตั้งค่า ID)'],
+        '⚠️ Charger identity changed': ['⚠️ གློག་བླུགས་འཕྲུལ་ཆས་ཀྱི་ངོ་རྟགས་བསྒྱུར་ཡོད་', '⚠️ ตัวตนของตู้เปลี่ยน'],
+        'On record': ['དྲན་ཐོ་ནང་ཡོད་མི་', 'ที่บันทึกไว้'], 'Reported now': ['ད་ལྟོ་སྙན་ཞུ་འབད་མི་', 'ที่ตู้แจ้งตอนนี้'], 'Since': ['ལས་ཚུར་', 'ตั้งแต่'],
+        'Simulator': ['ཚོད་ལྟའི་གློག་བླུགས་འཕྲུལ་ཆས་', 'เครื่องจำลอง'], '{n} BootNotifications': ['BootNotification {n}', 'BootNotification {n} ครั้ง'],
+        '✅ Confirm new identity': ['✅ ངོ་རྟགས་གསརཔ་ ངེས་བདེན་བཟོ་', '✅ ยืนยันตัวตนใหม่'],
+        'A charger reported another vendor, model or serial number than the one on record: the controller was replaced or repaired - or another device uses this charger ID. Check on site; when the change is right, confirm it.': [
+            'གློག་བླུགས་འཕྲུལ་ཆས་ཅིག་གིས་ དྲན་ཐོ་ནང་ཡོད་མི་དང་མ་འདྲ་བའི་ བཟོ་མི་ མོ་ཌེལ་ ཡང་ན་ ཨང་རིམ་ སྙན་ཞུ་འབད་ཡི་: ཚད་འཛིན་ཆས་ སོར་ཡོདཔ་ ཡང་ན་ བཟོ་བཅོས་འབད་ཡོདཔ་ - ཡང་ན་ ཅ་ཆས་གཞན་ཅིག་གིས་ ID འདི་ ལག་ལེན་འཐབ་དོ། ས་གནས་ཁར་ བལྟ་སྟེ་ བསྒྱུར་བཅོས་འདི་ བདེན་པ་ཅིན་ ངེས་བདེན་བཟོ།',
+            'ตู้แจ้งผู้ผลิต รุ่น หรือซีเรียลไม่ตรงกับที่บันทึกไว้: อาจเปลี่ยนหรือซ่อมคอนโทรลเลอร์ หรือมีอุปกรณ์อื่นใช้ ID นี้อยู่ ให้ตรวจที่หน้างาน ถ้าการเปลี่ยนถูกต้องให้กดยืนยัน'],
+        '{n} of {m}': ['{m} ལས་ {n}', '{n} จาก {m}'], 'Charger ID': ['གློག་བླུགས་འཕྲུལ་ཆས་ ID', 'ID ตู้'], 'Identity': ['ངོ་རྟགས་', 'ตัวตน (ผู้ผลิต · รุ่น · ซีเรียล)'],
+        'Nothing found': ['ག་ནི་ཡང་མ་ཐོབ་', 'ไม่พบ'],
+        'No charger IDs issued yet - "➕ Issue charger IDs" creates the first ones.': ['ད་ཚུན་ ID མ་སྤྲོད་པས་ - "➕ གློག་བླུགས་འཕྲུལ་ཆས་ ID སྤྲོད་" གིས་ དང་པ་ཚུ་ བཟོཝ་ཨིན།', 'ยังไม่มี ID ที่ออก - กด "➕ ออก ID ตู้ชาร์จ" เพื่อสร้าง'],
+        '{n} connector(s)': ['མཐུད་ཆས་ {n}', '{n} หัวชาร์จ'],
+        '🕓 Waiting for installation': ['🕓 བཙུགས་ནི་ལུ་བསྒུག་དོ་', '🕓 รอติดตั้ง'], '🔌 Installed': ['🔌 བཙུགས་ཡོད་', '🔌 ติดตั้งแล้ว'],
+        '⚡ In service': ['⚡ ལཱ་འབད་དོ་', '⚡ ใช้งานจริง'], '⛔ Retired': ['⛔ ལག་ལེན་མཚམས་བཞག་ཡོད་', '⛔ เลิกใช้'],
+        'issued {t}': ['སྤྲོད་ཡོད་ {t}', 'ออกเมื่อ {t}'], 'connected {t}': ['མཐུད་ཡོད་ {t}', 'เชื่อมต่อเมื่อ {t}'], 'first charge {t}': ['གློག་བླུགས་དང་པ་ {t}', 'ชาร์จครั้งแรก {t}'],
+        'retired {t}': ['ལག་ལེན་མཚམས་བཞག་ {t}', 'เลิกใช้เมื่อ {t}'],
+        'hidden in the driver app until it connects': ['མཐུད་ཚུན་ཚོད་ དེད་པའི་ app ནང་ སྦ་ཡོད་', 'ซ่อนในแอปผู้ขับจนกว่าตู้จะเชื่อมต่อ'],
+        'Not on the access list': ['འཛུལ་སྤྱོད་ཐོ་ཡིག་ནང་མེད་', 'ไม่อยู่ในรายการเข้าถึง'], 'password in use': ['ཆོག་ཡིག་ལག་ལེན་འཐབ་དོ་', 'ตู้ใช้รหัสผ่านแล้ว'],
+        'password not used yet': ['ཆོག་ཡིག་ད་ཚུན་ལག་ལེན་མ་འཐབ་', 'ตู้ยังไม่ได้ใช้รหัสผ่าน'],
+        '(from a simulator - replaced by the real charger)': ['(ཚོད་ལྟའི་གློག་བླུགས་འཕྲུལ་ཆས་ལས་ - ངོ་མའི་གློག་བླུགས་འཕྲུལ་ཆས་ཀྱིས་ ཚབ་བཙུགས་འོང་)', '(จากเครื่องจำลอง - ตู้จริงจะมาแทน)'],
+        'now': ['ད་ལྟོ་', 'ตอนนี้'], '{n} BootNotifications · last {a}': ['BootNotification {n} · མཇུག་མ་ {a}', 'BootNotification {n} ครั้ง · ล่าสุด {a} ที่แล้ว'],
+        '🖨️ Setup sheet': ['🖨️ གཞི་སྒྲིག་ཤོག་ཁྲམ་', '🖨️ ใบตั้งค่าตู้'], '↩️ Reactivate': ['↩️ ལོག་ཤུགས་ལྡན་བཟོ་', '↩️ ใช้งานอีกครั้ง'], '⛔ Retire': ['⛔ ལག་ལེན་མཚམས་བཞག་', '⛔ เลิกใช้'],
+        'Confirm the identity that {cp} reports now? It becomes the identity on record and the warning closes.': [
+            '{cp} གིས་ ད་ལྟོ་སྙན་ཞུ་འབད་མི་ངོ་རྟགས་ ངེས་བདེན་བཟོ་ནི་ཨིན་ན? དེ་ དྲན་ཐོ་ནང་གི་ངོ་རྟགས་ལུ་འགྱུར་ཏེ་ ཉེན་བརྡ་ ཁ་བསྡམས་འོང་།', 'ยืนยันตัวตนที่ {cp} แจ้งตอนนี้? จะใช้เป็นตัวตนที่บันทึกไว้ และปิดคำเตือน'],
+        'Retire {cp}? The charger is disconnected and refused from now on, its station is hidden, its bookings are cancelled, and the number is never issued again.': [
+            '{cp} ལག་ལེན་མཚམས་བཞག་ནི་ཨིན་ན? གློག་བླུགས་འཕྲུལ་ཆས་ མཐུད་ལམ་བཏོག་སྟེ་ ད་ལས་ཕར་ ངོས་ལེན་མི་འབད་ ས་ཚིགས་ སྦ་བཞག་འོང་ དེ་གི་སྔོན་བཟུང་ཚུ་ ཆ་མེད་གཏང་འོང་ ཨང་འདི་ ལོག་སྟེ་ནམ་ཡང་མི་སྤྲོད།',
+            'เลิกใช้ {cp}? ตู้จะถูกตัดการเชื่อมต่อและถูกปฏิเสธตั้งแต่นี้ สถานีจะถูกซ่อน การจองของตู้นี้จะถูกยกเลิก และจะไม่นำเลขนี้มาออกอีก'],
+        '{cp} is charging now (session {tx}). Stop the session first (Stations tab → Remote stop): a retired charger cannot send its StopTransaction, so the session stays open. Retire anyway?': [
+            '{cp} ད་ལྟོ་ གློག་བླུགས་དོ་ (ལཱ་ཡུན་ {tx})། ཧེ་མ་ ལཱ་ཡུན་ བཀག་ (ས་ཚིགས་ཚུ་ → Remote stop): ལག་ལེན་མཚམས་བཞག་ཡོད་པའི་གློག་བླུགས་འཕྲུལ་ཆས་ཀྱིས་ StopTransaction གཏང་མི་ཚུགས་ དེ་འབདཝ་ལས་ ལཱ་ཡུན་ ཁ་ཕྱེ་སྟེ་ལུསཔ་ཨིན། ག་དེ་སྦེ་རུང་ ལག་ལེན་མཚམས་བཞག་ནི་ཨིན་ན?',
+            '{cp} กำลังชาร์จอยู่ (เซสชัน {tx}) ควรหยุดเซสชันก่อน (แท็บสถานี → Remote stop): ตู้ที่เลิกใช้แล้วส่ง StopTransaction ไม่ได้ เซสชันจะค้างอยู่ จะเลิกใช้ต่อหรือไม่?'],
+        '{cp} had no password in the CSMS any more: it got a new one. Set it on the charger.': [
+            '{cp} ལུ་ CSMS ནང་ ཆོག་ཡིག་ མེད་པས་: ཆོག་ཡིག་གསརཔ་ཅིག་ ཐོབ་ཡི། འདི་ གློག་བླུགས་འཕྲུལ་ཆས་ནང་ བཙུགས།', '{cp} ไม่มีรหัสผ่านใน CSMS แล้ว จึงได้รหัสผ่านใหม่ ให้นำไปตั้งที่ตู้'],
+        'Only {n} free numbers are left for this dzongkhag': ['རྫོང་ཁག་འདི་གི་དོན་ལུ་ ཨང་ {n} རྐྱངམ་ཅིག་ ལྷག་ཡོད།', 'ซองคากนี้เหลือเลขว่างเพียง {n} เลข'],
+        'not needed (security profile 0)': ['མི་དགོ (ཉེན་སྲུང་ profile 0)', 'ไม่ต้องใช้ (security profile 0)'],
+        'charging now': ['ད་ལྟོ་ གློག་བླུགས་དོ་', 'กำลังชาร์จ'], 'simulators allowed on this ID': ['ID འདི་ལུ་ ཚོད་ལྟའི་གློག་བླུགས་འཕྲུལ་ཆས་ ཆོག', 'อนุญาตเครื่องจำลองบน ID นี้'],
+        '✅ Allow the simulator': ['✅ ཚོད་ལྟའི་གློག་བླུགས་འཕྲུལ་ཆས་ ཆོག་མཆན་གནང་', '✅ อนุญาตเครื่องจำลอง'],
+        'Allow simulators on {cp}? The identity on record stays - a real charger is still checked against it.': [
+            '{cp} ལུ་ ཚོད་ལྟའི་གློག་བླུགས་འཕྲུལ་ཆས་ ཆོག་མཆན་གནང་ནི་ཨིན་ན? དྲན་ཐོ་ནང་གི་ངོ་རྟགས་ མི་འགྱུར་ - ངོ་མའི་གློག་བླུགས་འཕྲུལ་ཆས་ ད་རུང་ ཞིབ་དཔྱད་འབདཝ་ཨིན།',
+            'อนุญาตเครื่องจำลองบน {cp}? ตัวตนที่บันทึกไว้ยังคงเดิม ตู้จริงยังถูกตรวจเทียบเหมือนเดิม'],
+        'Security profile 2 needs TLS: the chargers\' address must be wss:// and the CSMS must run behind an HTTPS proxy (CSMS_TRUST_PROXY=1). Use profile 1.': [
+            'ཉེན་སྲུང་ profile 2 ལུ་ TLS དགོ: གློག་བླུགས་འཕྲུལ་ཆས་ཀྱི་ཁ་བྱང་ wss:// ཨིན་དགོ་ CSMS འདི་ HTTPS proxy གི་རྒྱབ་ལུ་ ལཱ་འབད་དགོ (CSMS_TRUST_PROXY=1)། profile 1 ལག་ལེན་འཐབ།',
+            'Security profile 2 ต้องใช้ TLS: ที่อยู่สำหรับตู้ต้องเป็น wss:// และ CSMS ต้องอยู่หลัง HTTPS proxy (CSMS_TRUST_PROXY=1) ให้ใช้ profile 1'],
+        'This charger ID was issued in 🆔 Charger IDs - retire it there instead': ['གློག་བླུགས་འཕྲུལ་ཆས་ ID འདི་ 🆔 གློག་བླུགས་འཕྲུལ་ཆས་ ID ཚུ་ནང་ སྤྲོད་ཡོདཔ་ཨིན་ - དེ་ནང་ ལག་ལེན་མཚམས་བཞག',
+            'ID ตู้นี้ออกจาก 🆔 ID ตู้ชาร์จ - ให้ไปกดเลิกใช้ที่นั่นแทน'],
+        'simulator allowed on this ID - the identity on record stays': ['ID འདི་ལུ་ ཚོད་ལྟའི་གློག་བླུགས་འཕྲུལ་ཆས་ ཆོག་ཡོད་ - དྲན་ཐོ་ནང་གི་ངོ་རྟགས་ མི་འགྱུར།', 'อนุญาตเครื่องจำลองบน ID นี้ - ตัวตนที่บันทึกไว้คงเดิม'],
+        'charger id reactivated with a new password': ['གློག་བླུགས་འཕྲུལ་ཆས་ ID ཆོག་ཡིག་གསརཔ་དང་གཅིག་ཁར་ ལོག་ཤུགས་ལྡན་བཟོ་ཡོད་', 'ใช้งาน ID ตู้อีกครั้งพร้อมรหัสผ่านใหม่'],
+        '{cp} retired and disconnected': ['{cp} ལག་ལེན་མཚམས་བཞག་སྟེ་ མཐུད་ལམ་བཏོག་ཡོད་', 'เลิกใช้ {cp} และตัดการเชื่อมต่อแล้ว'], '{cp} retired': ['{cp} ལག་ལེན་མཚམས་བཞག་ཡོད་', 'เลิกใช้ {cp} แล้ว'],
+        'Reactivate {cp}? It is accepted again and can connect with its password.': ['{cp} ལོག་ཤུགས་ལྡན་བཟོ་ནི་ཨིན་ན? ལོག་ངོས་ལེན་འབད་དེ་ རང་གི་ཆོག་ཡིག་གིས་ མཐུད་ཚུགས།', 'ใช้งาน {cp} อีกครั้ง? ตู้จะถูกยอมรับอีกครั้งและเชื่อมต่อด้วยรหัสผ่านของตัวเองได้'],
+        'Automatic: {p}': ['རང་བཞིན་: {p}', 'อัตโนมัติ: {p}'], 'Dzongkhag': ['རྫོང་ཁག་', 'ซองคาก'], 'How many IDs (1 - 50)': ['ID ག་དེམ་ཅིག (1 - 50)', 'จำนวน ID (1 - 50)'],
+        'Connectors per charger': ['གློག་བླུགས་འཕྲུལ་ཆས་རེ་ལུ་ མཐུད་ཆས་', 'หัวชาร์จต่อตู้'],
+        'Station name (shown to drivers)': ['ས་ཚིགས་ཀྱི་མིང་ (དེད་པ་ཚུ་ལུ་སྟོནམ་ཨིན་)', 'ชื่อสถานี (แสดงให้ผู้ขับเห็น)'],
+        'Vendor (expected)': ['བཟོ་མི་ (རེ་བ་བསྐྱེད་མི་)', 'ผู้ผลิต (ที่ควรเป็น)'], 'Model (expected)': ['མོ་ཌེལ་ (རེ་བ་བསྐྱེད་མི་)', 'รุ่น (ที่ควรเป็น)'],
+        'Serial number (expected)': ['ཨང་རིམ་ (རེ་བ་བསྐྱེད་མི་)', 'ซีเรียล (ที่ควรเป็น)'],
+        'Each ID is registered (Accepted) and put on the access list with its own new password, shown once on the next page. Vendor, model and serial are optional: when given, the charger that connects with this ID is checked against them (a difference is reported, not refused). A serial number is for one charger only.': [
+            'ID རེ་རེ་ ཐོ་བཀོད་ (Accepted) འབད་དེ་ རང་སོའི་ཆོག་ཡིག་གསརཔ་དང་གཅིག་ཁར་ འཛུལ་སྤྱོད་ཐོ་ཡིག་ནང་ བཙུགསཔ་ཨིན། ཆོག་ཡིག་འདི་ ཤོག་ལེབ་ཤུལ་མམ་ནང་ ཚར་གཅིག་རྐྱངམ་ཅིག་ སྟོནམ་ཨིན། བཟོ་མི་ མོ་ཌེལ་ ཨང་རིམ་ཚུ་ གདམ་ཁ་ཨིན་: བཀོད་ཡོད་པ་ཅིན་ ID འདི་གིས་མཐུད་མི་གློག་བླུགས་འཕྲུལ་ཆས་ ཞིབ་དཔྱད་འབདཝ་ཨིན་ (མ་མཐུན་པ་ཅིན་ སྙན་ཞུ་འབདཝ་ཨིན་ ངོས་ལེན་མེད་པར་མི་བཟོ)། ཨང་རིམ་འདི་ གློག་བླུགས་འཕྲུལ་ཆས་གཅིག་གི་དོན་ལུ་རྐྱངམ་ཅིག་ཨིན།',
+            'แต่ละ ID จะถูกลงทะเบียน (Accepted) และใส่ในรายการเข้าถึงพร้อมรหัสผ่านใหม่ของตัวเอง ซึ่งแสดงครั้งเดียวในหน้าถัดไป ผู้ผลิต รุ่น และซีเรียลไม่บังคับ ถ้าใส่ไว้ ระบบจะตรวจตู้ที่เชื่อมต่อด้วย ID นี้ (ถ้าไม่ตรงจะแจ้งเตือน ไม่ปฏิเสธ) ซีเรียลใช้ได้กับตู้เดียวเท่านั้น'],
+        '🆔 Issue': ['🆔 སྤྲོད་', '🆔 ออก ID'], 'New ID': ['ID གསརཔ་', 'ID ใหม่'], 'New IDs': ['ID གསརཔ་ཚུ་', 'ID ใหม่'],
+        'Station names get #1, #2, … at the end. Numbers that are already used anywhere are skipped.': ['ས་ཚིགས་ཀྱི་མིང་གི་མཇུག་ལུ་ #1, #2, … བཙུགསཔ་ཨིན། ག་ཏེ་ཁར་རུང་ ལག་ལེན་འཐབ་ཡོད་པའི་ཨང་ཚུ་ བཤོལ་བཞགཔ་ཨིན།', 'ชื่อสถานีจะมี #1, #2, … ต่อท้าย เลขที่เคยใช้แล้วจะถูกข้าม'],
+        'Charger address (OCPP 1.6-J)': ['གློག་བླུགས་འཕྲུལ་ཆས་ཀྱི་ཁ་བྱང་ (OCPP 1.6-J)', 'ที่อยู่สำหรับตู้ (OCPP 1.6-J)'], '+ the charger ID': ['+ གློག་བླུགས་འཕྲུལ་ཆས་ ID', '+ ID ตู้'],
+        'Charger ID = user name': ['གློག་བླུགས་འཕྲུལ་ཆས་ ID = ལག་ལེན་པའི་མིང་', 'ID ตู้ = user name'],
+        'The passwords are shown only now - the CSMS keeps only a fingerprint. Print the setup sheets or copy the list before you close this window (until this page is reloaded, "🔑 Passwords just issued" opens it again). If a password is lost, give the charger a new one in 🔑 Charger access.': [
+            'ཆོག་ཡིག་ཚུ་ ད་ལྟོ་རྐྱངམ་ཅིག་ སྟོནམ་ཨིན་ - CSMS གིས་ མཛུབ་རིས་ (hash) རྐྱངམ་ཅིག་ བཞགཔ་ཨིན། སྒོ་སྒྲིག་འདི་ ཁ་མ་བསྡམས་པའི་ཧེ་མ་ གཞི་སྒྲིག་ཤོག་ཁྲམ་ དཔར་བསྐྲུན་འབད་ ཡང་ན་ ཐོ་ཡིག་ འདྲ་བཤུས་རྐྱབ། (ཤོག་ལེབ་འདི་ ལོག་མ་ཕབ་ཚུན་ "🔑 ད་ལྟོ་སྤྲོད་མི་ཆོག་ཡིག་ཚུ་" གིས་ ལོག་ཁ་ཕྱེཝ་ཨིན།) ཆོག་ཡིག་བརླག་སོང་པ་ཅིན་ 🔑 གློག་བླུགས་འཕྲུལ་ཆས་ཀྱི་འཛུལ་སྤྱོད་ནང་ གསརཔ་ཅིག་ སྤྲོད།',
+            'รหัสผ่านแสดงเฉพาะตอนนี้เท่านั้น - CSMS เก็บแค่ลายนิ้วมือ (hash) ให้พิมพ์ใบตั้งค่าหรือคัดลอกรายการก่อนปิดหน้าต่างนี้ (จนกว่าจะโหลดหน้าใหม่ ปุ่ม "🔑 รหัสผ่านที่เพิ่งออก" จะเปิดหน้านี้ได้อีก) ถ้ารหัสหาย ให้ออกรหัสใหม่ในส่วน 🔑 การเข้าถึงของตู้ชาร์จ'],
+        '🔑 New charger IDs and passwords': ['🔑 གློག་བླུགས་འཕྲུལ་ཆས་ ID དང་ ཆོག་ཡིག་གསརཔ་ཚུ་', '🔑 ID ตู้และรหัสผ่านใหม่'], '🖨️ Setup sheets': ['🖨️ གཞི་སྒྲིག་ཤོག་ཁྲམ་ཚུ་', '🖨️ ใบตั้งค่าตู้'],
+        '📋 Copy all': ['📋 ཆ་མཉམ་འདྲ་བཤུས་', '📋 คัดลอกทั้งหมด'], '⬇️ CSV with passwords': ['⬇️ ཆོག་ཡིག་དང་བཅས་པའི་ CSV', '⬇️ CSV พร้อมรหัสผ่าน'],
+        'The browser blocked the new window - allow pop-ups for this page': ['བརྡ་འཚོལ་ཆས་ཀྱིས་ སྒོ་སྒྲིག་གསརཔ་ བཀག་ཡི་ - ཤོག་ལེབ་འདི་གི་དོན་ལུ་ pop-up ཆོག་མཆན་གནང་', 'เบราว์เซอร์บล็อกหน้าต่างใหม่ - อนุญาตป๊อปอัปสำหรับหน้านี้'],
+        'Connector {n}': ['མཐུད་ཆས་ {n}', 'หัวชาร์จ {n}'], 'Charger setup sheet': ['གློག་བླུགས་འཕྲུལ་ཆས་ གཞི་སྒྲིག་ཤོག་ཁྲམ་', 'ใบตั้งค่าตู้ชาร์จ'],
+        'OCPP connection': ['OCPP མཐུད་ལམ་', 'การเชื่อมต่อ OCPP'], 'OCPP version': ['OCPP ཐོན་རིམ་', 'เวอร์ชัน OCPP'],
+        'Central system address': ['ལྟེ་བའི་རིམ་ལུགས་ཀྱི་ཁ་བྱང་', 'ที่อยู่ระบบกลาง (Central System)'], '(the charger adds its ID)': ['(གློག་བླུགས་འཕྲུལ་ཆས་ཀྱིས་ རང་གི་ ID ཁ་སྐོང་འབདཝ་ཨིན་)', '(ตู้จะต่อท้ายด้วย ID ของตัวเอง)'],
+        'Full address': ['ཁ་བྱང་ཆ་ཚང་', 'ที่อยู่เต็ม'], 'Charger ID (ChargeBox identity)': ['གློག་བླུགས་འཕྲུལ་ཆས་ ID (ChargeBox identity)', 'ID ตู้ (ChargeBox identity)'],
+        'HTTP Basic user name': ['HTTP Basic ལག་ལེན་པའི་མིང་', 'HTTP Basic user name'], 'Password (AuthorizationKey)': ['ཆོག་ཡིག་ (AuthorizationKey)', 'รหัสผ่าน (AuthorizationKey)'],
+        'given when the ID was issued (the CSMS keeps only a fingerprint) - if it is lost, create a new one in 🔑 Charger access': [
+            'ID སྤྲོད་པའི་སྐབས་ སྤྲོད་ཡོད་ (CSMS གིས་ མཛུབ་རིས་རྐྱངམ་ཅིག་ བཞགཔ་ཨིན་) - བརླག་སོང་པ་ཅིན་ 🔑 གློག་བླུགས་འཕྲུལ་ཆས་ཀྱི་འཛུལ་སྤྱོད་ནང་ གསརཔ་ཅིག་ བཟོ།',
+            'ให้ไว้ตอนออก ID (CSMS เก็บแค่ลายนิ้วมือ) - ถ้าหาย ให้สร้างใหม่ในส่วน 🔑 การเข้าถึงของตู้ชาร์จ'],
+        'Expected charger': ['རེ་བ་བསྐྱེད་མི་གློག་བླུགས་འཕྲུལ་ཆས་', 'ตู้ที่ควรเป็น'],
+        'The password is 40 hexadecimal digits: it works as text and where the charger asks whether the OCPP 1.6 key is hexadecimal (Vector vSECC).': [
+            'ཆོག་ཡིག་འདི་ hexadecimal ཨང་ 40 ཨིན་: ཡིག་འབྲུ་སྦེ་ཡང་ OCPP 1.6 ལྡེ་མིག་ hexadecimal ཨིན་ན་མེན་ན་ དྲི་མི་གློག་བླུགས་འཕྲུལ་ཆས་ (Vector vSECC) ནང་ཡང་ ལཱ་འབདཝ་ཨིན།',
+            'รหัสผ่านเป็นเลขฐานสิบหก 40 หลัก ใช้ได้ทั้งแบบข้อความ และเมื่อตู้ถามว่าคีย์ OCPP 1.6 เป็น hexadecimal หรือไม่ (Vector vSECC)'],
+        'Profile 2: the address must start with wss:// (TLS); plain ws:// is refused.': ['Profile 2: ཁ་བྱང་འདི་ wss:// (TLS) གིས་ འགོ་བཙུགས་དགོ ws:// རྐྱངམ་ ངོས་ལེན་མི་འབད།', 'Profile 2: ที่อยู่ต้องขึ้นต้นด้วย wss:// (TLS) ถ้าใช้ ws:// ธรรมดาจะถูกปฏิเสธ'],
+        'Steps': ['རིམ་པ་', 'ขั้นตอน'],
+        'Enter the charger ID, the address and the password in the charger\'s OCPP settings (web page or service tool of the charger).': [
+            'གློག་བླུགས་འཕྲུལ་ཆས་ཀྱི་ OCPP སྒྲིག་སྟངས་ (གློག་བླུགས་འཕྲུལ་ཆས་ཀྱི་ ཝེབ་ཤོག་ལེབ་ ཡང་ན་ ཞབས་ཏོག་ལག་ཆས་) ནང་ ID ཁ་བྱང་ ཆོག་ཡིག་ཚུ་ བཙུགས།',
+            'ใส่ ID ตู้ ที่อยู่ และรหัสผ่านในการตั้งค่า OCPP ของตู้ (หน้าเว็บหรือเครื่องมือช่างของตู้)'],
+        'Restart the charger. It connects and registers by itself - the ID is accepted already.': ['གློག་བླུགས་འཕྲུལ་ཆས་ ལོག་འགོ་བཙུགས། རང་བཞིན་གྱིས་ མཐུད་དེ་ ཐོ་བཀོད་འབདཝ་ཨིན་ - ID འདི་ ཧེ་མ་ལས་ ངོས་ལེན་འབད་ཡོད།', 'รีสตาร์ตตู้ ตู้จะเชื่อมต่อและลงทะเบียนเอง - ID ได้รับการยอมรับไว้แล้ว'],
+        'In the CSMS (🔐 Registration → 🆔 Charger IDs) the ID shows "Installed" and "password in use"; the station appears in the driver app.': [
+            'CSMS (🔐 ཐོ་བཀོད་ → 🆔 གློག་བླུགས་འཕྲུལ་ཆས་ ID ཚུ་) ནང་ ID འདི་ "བཙུགས་ཡོད་" དང་ "ཆོག་ཡིག་ལག་ལེན་འཐབ་དོ་" སྟོནམ་ཨིན་ ས་ཚིགས་འདི་ དེད་པའི་ app ནང་ ཐོནམ་ཨིན།',
+            'ใน CSMS (🔐 การลงทะเบียน → 🆔 ID ตู้ชาร์จ) ID จะแสดง "ติดตั้งแล้ว" และ "ตู้ใช้รหัสผ่านแล้ว" และสถานีจะขึ้นในแอปผู้ขับ'],
+        'Make a test charge: the ID shows "In service".': ['ཚོད་ལྟའི་གློག་བླུགས་ཅིག་ འབད་: ID འདི་ "ལཱ་འབད་དོ་" སྟོནམ་ཨིན།', 'ทดลองชาร์จ: ID จะแสดง "ใช้งานจริง"'],
+        'Stick the payment QR codes on the connectors.': ['དངུལ་སྤྲོད་ཀྱི་ QR ཨང་རྟགས་ཚུ་ མཐུད་ཆས་གུ་ སྦྱར།', 'ติดสติกเกอร์ QR ชำระเงินที่หัวชาร์จ'],
+        'Payment QR codes': ['དངུལ་སྤྲོད་ཀྱི་ QR ཨང་རྟགས་ཚུ་', 'QR ชำระเงิน'],
+        'This sheet contains the charger\'s password - keep it safe and destroy it after the charger is set up.': ['ཤོག་ཁྲམ་འདི་ནང་ གློག་བླུགས་འཕྲུལ་ཆས་ཀྱི་ཆོག་ཡིག་ཡོད་ - ཉེན་སྲུང་གི་ཐོག་ལས་བཞག་སྟེ་ གཞི་སྒྲིག་ཚར་ཞིནམ་ལས་ མེདཔ་བཟོ།', 'ใบนี้มีรหัสผ่านของตู้ - เก็บให้ปลอดภัยและทำลายทิ้งหลังตั้งค่าตู้เสร็จ'],
+        'Print': ['དཔར་བསྐྲུན་', 'พิมพ์'], '{n} setup sheet(s)': ['གཞི་སྒྲིག་ཤོག་ཁྲམ་ {n}', 'ใบตั้งค่า {n} ใบ'], 'History': ['ལོ་རྒྱུས་', 'ประวัติ'],
+        'Password and security profile: 🔑 Charger access below.': ['ཆོག་ཡིག་དང་ ཉེན་སྲུང་ profile: འོག་གི་ 🔑 གློག་བླུགས་འཕྲུལ་ཆས་ཀྱི་འཛུལ་སྤྱོད་ནང་', 'รหัสผ่านและ security profile: ดูที่ 🔑 การเข้าถึงของตู้ชาร์จ ด้านล่าง'],
+        'Charger ID {cp}': ['གློག་བླུགས་འཕྲུལ་ཆས་ ID {cp}', 'ID ตู้ {cp}'], 'Prefix': ['མགོ་ཡིག་', 'คำนำหน้า'], 'Digits of the number': ['ཨང་གི་གྲངས་', 'จำนวนหลักของเลข'],
+        'Security profile of new IDs': ['ID གསརཔ་ཚུ་གི་ ཉེན་སྲུང་ profile', 'Security profile ของ ID ใหม่'],
+        'Automatic (2 on wss://, else 1)': ['རང་བཞིན་ (wss:// ཨིན་པ་ཅིན་ 2 མེན་པ་ཅིན་ 1)', 'อัตโนมัติ (wss:// ใช้ 2 ไม่งั้นใช้ 1)'],
+        'Address given to the chargers (empty = automatic)': ['གློག་བླུགས་འཕྲུལ་ཆས་ཚུ་ལུ་ སྤྲོད་མི་ཁ་བྱང་ (སྟོངམ་ = རང་བཞིན་)', 'ที่อยู่ที่ให้ตู้ใช้ (เว้นว่าง = อัตโนมัติ)'],
+        'Hide the station of a new ID in the driver app until the charger connects': ['ID གསརཔ་གི་ས་ཚིགས་ གློག་བླུགས་འཕྲུལ་ཆས་ མཐུད་ཚུན་ཚོད་ དེད་པའི་ app ནང་ སྦ་བཞག', 'ซ่อนสถานีของ ID ใหม่ในแอปผู้ขับจนกว่าตู้จะเชื่อมต่อ'],
+        'Chargers that are not Accepted cannot start charging (Authorize / StartTransaction answered Invalid)': ['Accepted མེན་པའི་གློག་བླུགས་འཕྲུལ་ཆས་ཚུ་གིས་ གློག་བླུགས་འགོ་བཙུགས་མི་ཚུགས་ (Authorize / StartTransaction ལུ་ Invalid ལན་གསལ་)', 'ตู้ที่ไม่ได้ Accepted เริ่มชาร์จไม่ได้ (ตอบ Authorize / StartTransaction ด้วย Invalid)'],
+        'Dzongkhag codes (one per line: CODE = name)': ['རྫོང་ཁག་གི་ཨང་རྟགས་ (ཐིག་རེ་ལུ་གཅིག་: CODE = མིང་)', 'รหัสซองคาก (บรรทัดละหนึ่ง: CODE = ชื่อ)'],
+        'IDs already issued keep their name; a new prefix or number of digits applies to new IDs only. Numbers are never used twice.': ['སྤྲོད་ཚར་བའི་ ID ཚུ་གི་མིང་ མི་འགྱུར། མགོ་ཡིག་ ཡང་ན་ ཨང་གྲངས་གསརཔ་འདི་ ID གསརཔ་ཚུ་ལུ་རྐྱངམ་ཅིག་ ཕན། ཨང་ཚུ་ ཚར་གཉིས་ནམ་ཡང་ ལག་ལེན་མི་འཐབ།', 'ID ที่ออกไปแล้วใช้ชื่อเดิม คำนำหน้าหรือจำนวนหลักใหม่มีผลกับ ID ใหม่เท่านั้น ไม่มีการใช้เลขซ้ำ'],
+        '⚙️ Charger ID settings': ['⚙️ གློག་བླུགས་འཕྲུལ་ཆས་ ID སྒྲིག་སྟངས་', '⚙️ ตั้งค่า ID ตู้ชาร์จ'],
+        // health issue / alerts, security log, audit log
+        'Charger identity changed': ['གློག་བླུགས་འཕྲུལ་ཆས་ཀྱི་ངོ་རྟགས་བསྒྱུར་ཡོད་', 'ตัวตนของตู้เปลี่ยน'], 'Charger identity changed: {what}': ['གློག་བླུགས་འཕྲུལ་ཆས་ཀྱི་ངོ་རྟགས་བསྒྱུར་ཡོད་: {what}', 'ตัวตนของตู้เปลี่ยน: {what}'],
+        '🆔 Charger ID issued': ['🆔 གློག་བླུགས་འཕྲུལ་ཆས་ ID སྤྲོད་ཡོད་', '🆔 ออก ID ตู้'], '🔌 Issued ID connected': ['🔌 སྤྲོད་ཡོད་པའི་ ID མཐུད་ཡོད་', '🔌 ID ที่ออกเชื่อมต่อแล้ว'],
+        '⚡ First charging session': ['⚡ གློག་བླུགས་ཐེངས་དང་པ་', '⚡ ชาร์จครั้งแรก'], '✅ Identity as confirmed again': ['✅ ངོ་རྟགས་ ལོག་མཐུན་ཡོད་', '✅ ตัวตนตรงกับที่ยืนยันไว้อีกครั้ง'],
+        '✅ New identity confirmed': ['✅ ངོ་རྟགས་གསརཔ་ ངེས་བདེན་བཟོ་ཡོད་', '✅ ยืนยันตัวตนใหม่แล้ว'], '⛔ Charger ID retired': ['⛔ གློག་བླུགས་འཕྲུལ་ཆས་ ID ལག་ལེན་མཚམས་བཞག་ཡོད་', '⛔ เลิกใช้ ID ตู้'],
+        '↩️ Charger ID reactivated': ['↩️ གློག་བླུགས་འཕྲུལ་ཆས་ ID ལོག་ཤུགས་ལྡན་བཟོ་ཡོད་', '↩️ ใช้งาน ID ตู้อีกครั้ง'],
+        '🚫 Charging refused (charger not accepted)': ['🚫 གློག་བླུགས་ ངོས་ལེན་མེད་ (གློག་བླུགས་འཕྲུལ་ཆས་ Accepted མེན་)', '🚫 ปฏิเสธการชาร์จ (ตู้ยังไม่ได้ Accepted)'],
+        'Charger IDs issued': ['གློག་བླུགས་འཕྲུལ་ཆས་ ID སྤྲོད་ཡོད་', 'ออก ID ตู้'], 'Charger ID changed': ['གློག་བླུགས་འཕྲུལ་ཆས་ ID བསྒྱུར་ཡོད་', 'แก้ไข ID ตู้'],
+        'Charger ID retired / reactivated': ['གློག་བླུགས་འཕྲུལ་ཆས་ ID ལག་ལེན་མཚམས་བཞག་ / ལོག་ཤུགས་ལྡན་', 'เลิกใช้ / ใช้งาน ID ตู้อีกครั้ง'],
+        'Charger identity confirmed': ['གློག་བླུགས་འཕྲུལ་ཆས་ཀྱི་ངོ་རྟགས་ ངེས་བདེན་བཟོ་ཡོད་', 'ยืนยันตัวตนตู้'], 'Charger ID settings changed': ['གློག་བླུགས་འཕྲུལ་ཆས་ ID སྒྲིག་སྟངས་ བསྒྱུར་ཡོད་', 'เปลี่ยนการตั้งค่า ID ตู้'],
+        // reasons written by the CSMS (security log, history)
+        'first connection': ['མཐུད་ཐེངས་དང་པ་', 'เชื่อมต่อครั้งแรก'], 'first BootNotification': ['BootNotification དང་པ་', 'BootNotification ครั้งแรก'],
+        'first charging session': ['གློག་བླུགས་ཐེངས་དང་པ་', 'ชาร์จครั้งแรก'], 'identity matches the confirmed one again': ['ངོ་རྟགས་ ངེས་བདེན་བཟོ་མི་དང་ ལོག་མཐུན་ཡོད་', 'ตัวตนตรงกับที่ยืนยันไว้อีกครั้ง'],
+        'identity confirmed': ['ངོ་རྟགས་ ངེས་བདེན་བཟོ་ཡོད་', 'ยืนยันตัวตนแล้ว'], 'charger id reactivated': ['གློག་བླུགས་འཕྲུལ་ཆས་ ID ལོག་ཤུགས་ལྡན་བཟོ་ཡོད་', 'ใช้งาน ID ตู้อีกครั้ง'],
+        'charger id retired - refused from now on': ['གློག་བླུགས་འཕྲུལ་ཆས་ ID ལག་ལེན་མཚམས་བཞག་ཡོད་ - ད་ལས་ཕར་ ངོས་ལེན་མེད་', 'เลิกใช้ ID ตู้ - ปฏิเสธตั้งแต่นี้'],
+        'first BootNotification of the real charger': ['ངོ་མའི་གློག་བླུགས་འཕྲུལ་ཆས་ཀྱི་ BootNotification དང་པ་', 'BootNotification แรกของตู้จริง'],
+        // server messages
+        'Choose a dzongkhag from the list': ['ཐོ་ཡིག་ནང་ལས་ རྫོང་ཁག་ཅིག་ གདམ་ཁ་རྐྱབ།', 'เลือกซองคากจากรายการ'], 'Between 1 and 50 ids at a time': ['ཚར་རེ་ལུ་ ID 1 ལས་ 50 ཚུན་', 'ครั้งละ 1 ถึง 50 ID'],
+        'Connectors: 1 to 8': ['མཐུད་ཆས་: 1 ལས་ 8 ཚུན་', 'หัวชาร์จ: 1 ถึง 8'], 'Latitude / longitude must be numbers': ['ཞེང་ཐིག་ / སྲིད་ཐིག་ ཨང་གྲངས་ཨིན་དགོ', 'ละติจูด / ลองจิจูดต้องเป็นตัวเลข'],
+        'Give both latitude and longitude (or neither)': ['ཞེང་ཐིག་དང་སྲིད་ཐིག་ གཉིས་ཆ་ར་ བཀོད་ (ཡང་ན་ གཅིག་ཡང་མ་བཀོད་)', 'ใส่ทั้งละติจูดและลองจิจูด (หรือไม่ใส่ทั้งคู่)'],
+        'A serial number belongs to one charger - issue one id at a time for it': ['ཨང་རིམ་འདི་ གློག་བླུགས་འཕྲུལ་ཆས་གཅིག་གི་ཨིན་ - དེ་གི་དོན་ལུ་ ཚར་རེ་ལུ་ ID གཅིག་ སྤྲོད།', 'ซีเรียลเป็นของตู้เดียว - ให้ออกทีละ ID'],
+        'No numbers left for this dzongkhag with the current number of digits': ['ཨང་གྲངས་ད་ལྟོ་ཡོད་མི་ནང་ རྫོང་ཁག་འདི་གི་དོན་ལུ་ ཨང་ལྷག་མེད།', 'เลขของซองคากนี้หมดแล้วสำหรับจำนวนหลักปัจจุบัน'],
+        'Not an issued charger id': ['སྤྲོད་ཡོད་པའི་ ID མེན།', 'ไม่ใช่ ID ที่ระบบออก'], 'This id is not retired': ['ID འདི་ ལག་ལེན་མཚམས་མ་བཞག', 'ID นี้ยังไม่ได้เลิกใช้'],
+        'Already retired': ['ཧེ་མ་ལས་ ལག་ལེན་མཚམས་བཞག་ཡོད།', 'เลิกใช้ไปแล้ว'], 'No identity known for this charger yet': ['གློག་བླུགས་འཕྲུལ་ཆས་འདི་གི་ངོ་རྟགས་ ད་ཚུན་ མ་ཤེས།', 'ยังไม่รู้ตัวตนของตู้นี้'],
+        'The charger has not reported its identity yet': ['གློག་བླུགས་འཕྲུལ་ཆས་ཀྱིས་ རང་གི་ངོ་རྟགས་ ད་ཚུན་ སྙན་ཞུ་མ་འབད།', 'ตู้ยังไม่ได้แจ้งตัวตน'],
+        'Prefix: 2 - 6 letters or digits, starting with a letter': ['མགོ་ཡིག་: ཡིག་འབྲུ་ ཡང་ན་ ཨང་ 2 - 6 ཡིག་འབྲུ་གིས་ འགོ་བཙུགས།', 'คำนำหน้า: ตัวอักษรหรือตัวเลข 2 - 6 ตัว ขึ้นต้นด้วยตัวอักษร'],
+        'Charger address: ws://… or wss://… (for example wss://csms.example.bt/ocpp), or empty': ['གློག་བླུགས་འཕྲུལ་ཆས་ཀྱི་ཁ་བྱང་: ws://… ཡང་ན་ wss://… (དཔེར་ན་ wss://csms.example.bt/ocpp) ཡང་ན་ སྟོངམ་', 'ที่อยู่สำหรับตู้: ws://… หรือ wss://… (เช่น wss://csms.example.bt/ocpp) หรือเว้นว่าง'],
+        'Each line: CODE = Dzongkhag name (3 letters), e.g. THM = Thimphu': ['ཐིག་རེ་རེ་: CODE = རྫོང་ཁག་གི་མིང་ (ཡིག་འབྲུ་ 3) དཔེར་ན་ THM = Thimphu', 'แต่ละบรรทัด: CODE = ชื่อซองคาก (ตัวอักษร 3 ตัว) เช่น THM = Thimphu'],
+        'Give 1 - 60 dzongkhag codes': ['རྫོང་ཁག་གི་ཨང་རྟགས་ 1 - 60 བཀོད།', 'ใส่รหัสซองคาก 1 - 60 รายการ']
     });
 })();
 ''')
