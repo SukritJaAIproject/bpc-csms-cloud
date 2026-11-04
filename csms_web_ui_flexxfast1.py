@@ -511,7 +511,7 @@ import sys as _db_sys
 
 DB_SETTINGS_FILE = str((APP_DIR / 'database.json') if 'APP_DIR' in globals() else 'database.json')
 DB_DEFAULTS = {'type': 'json', 'uri': '', 'db_name': 'bpc_csms', 'log_to_db': True, 'log_retention_days': 30, 'keep_json_backup': True}
-DB_COLLECTIONS = ('payments', 'customers', 'tokens', 'settings', 'stations', 'rfid_cards', 'transactions', 'ocpp_logs', 'ops_users', 'ops_settings', 'ops_audit', 'ops_status', 'ops_sessions', 'ops_alerts', 'ops_notify', 'ops_tickets', 'ops_pm', 'ops_charger_access', 'ops_charger_unknown', 'ops_security', 'ops_free_active', 'ops_free_cards', 'ops_free_log', 'ops_lm_sites', 'ops_lm_log', 'ops_open_tx', 'ops_fw_files', 'ops_fw_jobs', 'ops_diag_jobs')
+DB_COLLECTIONS = ('payments', 'customers', 'tokens', 'settings', 'stations', 'rfid_cards', 'transactions', 'ocpp_logs', 'ops_users', 'ops_settings', 'ops_audit', 'ops_status', 'ops_sessions', 'ops_alerts', 'ops_notify', 'ops_tickets', 'ops_pm', 'ops_charger_access', 'ops_charger_unknown', 'ops_security', 'ops_free_active', 'ops_free_cards', 'ops_free_log', 'ops_lm_sites', 'ops_lm_log', 'ops_open_tx', 'ops_fw_files', 'ops_fw_jobs', 'ops_diag_jobs', 'ops_bookings')
 DB_LOG_BATCH = 500                      # log inserts per bulk write
 DB_QUEUE_MAX = 60000                    # queued operations before the oldest log inserts are dropped
 DB_TXN_METER_INTERVAL = 30.0            # seconds between transaction-document updates from MeterValues
@@ -2009,7 +2009,10 @@ class CentralSystem(cp):
         # ถ้า transaction นี้เกิดจาก RemoteStart ที่ operator สั่งจาก CSMS -> Accepted (authorized โดย operator)
         # ไม่งั้นตรวจตามรายการบัตรปกติ (บัตรไม่ลงทะเบียน = Invalid ตามเดิม)
         _rs_key = str(id_tag).upper()
-        if app_state.take_remote_start_pending(self.id, connector_id, id_tag):
+        _bk_gate = ops_bk_start_gate(self.id, connector_id, id_tag, kwargs.get('reservation_id'), timestamp)   # [OPS] v1.12 bookings
+        if _bk_gate is not None:
+            id_tag_info = _bk_gate
+        elif app_state.take_remote_start_pending(self.id, connector_id, id_tag):
             id_tag_info = {'status': AuthorizationStatus.accepted}
             logger.info(f"StartTransaction C{connector_id} idTag={_rs_key}: "
                         f"Accepted (CSMS-initiated RemoteStart)")
@@ -2041,7 +2044,7 @@ class CentralSystem(cp):
             await pay_on_start_transaction(self.id, connector_id, id_tag, txn_id, meter_start, timestamp)
         db_on_transaction_start(self.id, connector_id, id_tag, txn_id, meter_start, timestamp)   # [DB]
         ops_emit('tx_start', cp_id=self.id, connector=connector_id, txn_id=txn_id, id_tag=id_tag,   # [OPS]
-                 meter_start=meter_start, timestamp=timestamp,
+                 meter_start=meter_start, timestamp=timestamp, reservation_id=kwargs.get('reservation_id'),
                  accepted=str(id_tag_info.get('status', '')).split('.')[-1].lower() == 'accepted')
 
         app_state.add_log('⬅️ IN', self.id, 'StartTransaction', {
@@ -2391,6 +2394,9 @@ class CentralSystem(cp):
     # Commands to send to CP
     # ========================================================================
     async def cmd_remote_start(self, id_tag: str, connector_id: int = None):
+        _bk = await ops_bk_before_remote_start(self, id_tag, connector_id)   # [OPS] v1.12 a connector kept for a booking
+        if _bk is not None:
+            return _bk
         kwargs = {'id_tag': id_tag}
         if connector_id:
             kwargs['connector_id'] = connector_id
@@ -6067,6 +6073,7 @@ HTML_TEMPLATE = '''
         <button class="tab" data-tab="log" onclick="showTab('log')"><span data-i18n="📋 Message Log">📋 Message Log</span><span class="tab-badge" id="logBadge"></span></button>
         <button class="tab" data-tab="payments" onclick="showTab('payments')"><span data-i18n="💳 Payments">💳 Payments</span><span class="tab-badge pay-tab-badge" id="payBadge"></span></button>
         <button class="tab" data-tab="free" onclick="showTab('free')"><span data-i18n="🎟️ Free charging">🎟️ Free charging</span><span class="tab-badge" id="freeBadge"></span></button>
+        <button class="tab" data-tab="booking" onclick="showTab('booking')"><span data-i18n="📅 Bookings">📅 Bookings</span><span class="tab-badge" id="bookingBadge"></span></button>
         <button class="tab" data-tab="customers" onclick="showTab('customers')"><span data-i18n="👥 Customers">👥 Customers</span></button>
         <button class="tab" data-tab="rfid" onclick="showTab('rfid')"><span data-i18n="🎴 RFID Cards">🎴 RFID Cards</span></button>
         <button class="tab" data-tab="registration" onclick="showTab('registration')"><span data-i18n="🔐 Registration">🔐 Registration</span><span class="tab-badge warn" id="pendingBadge"></span></button>
@@ -6521,6 +6528,7 @@ HTML_TEMPLATE = '''
     <main class="view" id="view-lm"></main>
     <main class="view" id="view-fwdiag"></main>
     <main class="view" id="view-server"></main>
+    <main class="view" id="view-booking"></main>
     <main class="view" id="view-users"></main>
 
     <main class="view" id="view-db">
@@ -14581,7 +14589,13 @@ async def _pay_run_hooks(event: str, rec: dict):
 # ---------------------------------------------------------------------------
 # Flow
 # ---------------------------------------------------------------------------
-def _pay_station_public(cp_id: str) -> dict:
+def _pay_station_public(cp_id: str, viewer: str = None) -> dict:
+    """Station facts the customer page may see; [OPS] v1.12 a connector kept for the booking of another driver shows as
+    Reserved (busy), the viewer's own booked connector stays free for them (viewer = app customer id)."""
+    return ops_bk_mark_station(_pay_station_public_raw(cp_id), viewer)
+
+
+def _pay_station_public_raw(cp_id: str) -> dict:
     """Station facts the customer page may see (no vendor data, no log)."""
     rec = app_state.station_record(cp_id)
     status = rec.get('status') or {}
@@ -15001,7 +15015,7 @@ async def handle_pay_public_create(request):
         return web.json_response({'error': 'Payment method not available'}, status=400)
     if amount < float(t.get('min_amount') or 0) or amount > float(t.get('max_amount') or 1e12):
         return web.json_response({'error': 'Amount must be between %s and %s' % (t.get('min_amount'), t.get('max_amount'))}, status=400)
-    station = _pay_station_public(cp_id)
+    station = _pay_station_public(cp_id, viewer=customer['id'] if customer is not None else None)   # [OPS] v1.12 own booking
     if not station['connected']:
         return web.json_response({'error': 'This station is offline right now'}, status=409)
     conns = {c['id']: c for c in station['connectors']}
@@ -15089,7 +15103,7 @@ async def handle_pay_public_status(request):
         usage = _pay_usage(rec, snap.get('energy_wh'))
         rec.update(usage)
     out = pay_ledger.public_view(rec)
-    out['station'] = _pay_station_public(rec['cp_id'])
+    out['station'] = _pay_station_public(rec['cp_id'], viewer=rec.get('customer_id'))   # [OPS] v1.12 own booking
     cs = app_state.charge_points.get(rec['cp_id'])
     snap = (cs.data.meter.get(rec.get('connector_id')) if cs else None) or {}
     out['live'] = {'power_w': snap.get('power_w'), 'soc': snap.get('soc')}
@@ -17137,7 +17151,7 @@ def _app_station_list(c: Optional[dict] = None) -> list:
         info = station_info.data.get(s['id']) or {}
         if info.get('hidden'):
             continue
-        pub = _pay_station_public(s['id'])
+        pub = _pay_station_public(s['id'], viewer=(c or {}).get('id'))   # [OPS] v1.12 own booking
         conns = pub['connectors']
         out.append({'id': s['id'], 'name': info.get('name') or s['id'], 'address': info.get('address') or '', 'hours': info.get('hours') or '',
                     'note': info.get('note') or '', 'lat': info.get('lat'), 'lon': info.get('lon'), 'online': bool(s.get('connected')),
@@ -17864,7 +17878,9 @@ APP_PAGE_TEMPLATE = r"""<!DOCTYPE html>
   function fmtDate(iso) { if (!iso) return ''; var d = new Date(iso); if (isNaN(d.getTime())) return iso; return d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}); }
   function connLabel(c, online) {
     if (!online) return ['Offline', 'bad'];
+    if (c.booking && c.booking.mine) return ['Your booking', 'ok'];   // [OPS] v1.12 bookings
     var s = c.status || 'Unknown';
+    if (s === 'Reserved') return ['Reserved', 'warn'];
     if (s === 'Available') return ['Available', 'ok'];
     if (s === 'Preparing') return ['Plugged in', 'info'];
     if (s === 'Charging' || s === 'SuspendedEV' || s === 'SuspendedEVSE' || s === 'Finishing') return ['Charging', 'info'];
@@ -17950,6 +17966,7 @@ APP_PAGE_TEMPLATE = r"""<!DOCTYPE html>
     var ns = (me._notifications || []).slice(0, 3);
     if (ns.length) html += '<div class="card"><h2>' + trh('Recent notifications') + '</h2>' + ns.map(function (n) { return '<div class="noti ' + (n.read ? '' : 'unread') + '"><div class="t">' + esc(n.title) + '</div><div class="b">' + esc(n.body) + '</div><div class="d">' + esc(fmtDate(n.at)) + '</div></div>'; }).join('') + '</div>';
     wrap(html);
+    if (window.BPCAPP && BPCAPP.hooks.home) BPCAPP.hooks.home();   // [OPS] v1.12 bookings
   }
 
   // ---- map (dependency-free slippy map on OSM raster tiles)
@@ -18037,6 +18054,7 @@ APP_PAGE_TEMPLATE = r"""<!DOCTYPE html>
     wrap(html);
     V.querySelectorAll('.conn').forEach(function (b) { b.onclick = function () { go('#/charge/' + encodeURIComponent(s.id) + '/' + b.dataset.c); }; });
     var sm = document.getElementById('btnShowMap'); if (sm) sm.onclick = function () { map.sel = s.id; map.lat = s.lat; map.lon = s.lon; map.z = 13; map._init = true; };
+    if (window.BPCAPP && BPCAPP.hooks.station) BPCAPP.hooks.station(s);   // [OPS] v1.12 bookings
   }
 
   var charge = {amount: 0, method: 'wallet', promo: null};
@@ -18280,6 +18298,7 @@ APP_PAGE_TEMPLATE = r"""<!DOCTYPE html>
     var bt = document.getElementById('btnPushTest'); if (bt) bt.onclick = async function () { var r = await api('/api/app/push/test', {method: 'POST', body: {}}); toast(r.error || 'OK'); };
     var bi = document.getElementById('btnInstall'); if (bi) bi.onclick = async function () { if (!deferredInstall) return; deferredInstall.prompt(); deferredInstall = null; };
     document.getElementById('btnOut').onclick = async function () { var ep = await currentPushEndpoint(); await api('/api/app/logout', {method: 'POST', body: {endpoint: ep}}); signOutLocal(); stopMePoll(); go('#/login'); };
+    if (window.BPCAPP && BPCAPP.hooks.account) BPCAPP.hooks.account();   // [OPS] v1.12 bookings
   }
 
   async function viewScan() {
@@ -18357,9 +18376,17 @@ APP_PAGE_TEMPLATE = r"""<!DOCTYPE html>
       case 'notifications': viewNotifications(); break;
       case 'account': viewAccount(); break;
       case 'scan': viewScan(); break;
-      default: viewHome();
+      default: if (window.BPCAPP && BPCAPP.routes[route]) { BPCAPP.routes[route](args); break; }   // [OPS] add-on pages (bookings)
+        viewHome();
     }
   }
+  // [OPS] v1.12: a small API for add-on scripts (/app/booking.js); their words only fill missing translations
+  window.BPCAPP = {
+    tr: tr, trh: trh, esc: esc, api: api, go: go, toast: toast, wrap: wrap, navActive: navActive, setErr: setErr, render: render,
+    loadMe: loadMe, me: function () { return me; }, cur: function () { return cur; }, lang: function () { return lang; },
+    routes: {}, hooks: {},
+    addI18n: function (t) { Object.keys(t || {}).forEach(function (l) { if (!I18N[l]) return; Object.keys(t[l]).forEach(function (k) { if (!(k in I18N[l])) I18N[l][k] = t[l][k]; }); }); }
+  };
   window.addEventListener('hashchange', render);
   window.go = go;
   (async function init() {
@@ -18565,7 +18592,7 @@ import re as _ops_re
 import csv as _ops_csv
 import io as _ops_io
 
-OPS_VERSION = '1.11.2'
+OPS_VERSION = '1.12.0'
 OPS_FEATURES: List[str] = ['users']
 OPS_DIR = str(APP_DIR / 'ops_data')
 OPS_TZ = timezone(timedelta(hours=6))           # Bhutan Time (BTT, UTC+06:00): ops views, monthly files, reports
@@ -25417,8 +25444,8 @@ def _ops_free_public_cfg() -> dict:
             'date_to': cfg.get('date_to') or ''}
 
 
-def _ops_free_station(cp_id: str) -> dict:
-    pub = _pay_station_public(cp_id)
+def _ops_free_station(cp_id: str, viewer: str = None) -> dict:
+    pub = _pay_station_public(cp_id, viewer)   # [OPS] v1.12 bookings
     info = station_info.data.get(cp_id) or {}
     ok, why = ops_free_open_at(cp_id)
     busy = {(s.get('cp'), s.get('conn')) for s in ops_free_active.data.values() if s.get('state') in OPS_FREE_ACTIVE_STATES}
@@ -25505,7 +25532,7 @@ async def ops_free_api_start(request):
         return ops_err('Type your mobile number')
     if not plate and not phone:
         return ops_err('Type the vehicle number plate or your mobile number')
-    st = _ops_free_station(cp)
+    st = _ops_free_station(cp, (cust or {}).get('id'))   # [OPS] v1.12 the driver's own booking
     if not st['connected']:
         return ops_err('The charger is offline right now', 409)
     if not st['accepted']:
@@ -30495,6 +30522,1873 @@ OPS_JS_PARTS.append(r'''/* [OPS] v1.11.2 Dzongkha for the operations tabs: machi
 });
     // a few words the Users tab brought in v1.1 with other wording: the console says ཆོག་ཡིག་ / ནང་བསྐྱོད་
     try { if (typeof I18N !== 'undefined' && I18N.dz) Object.assign(I18N.dz, {"New password": "ཆོག་ཡིག་གསརཔ་", "Signed in now": "ད་ལྟོ་ནང་བསྐྱོད་ཡོད་མི་", "🔑 Change password": "🔑 ཆོག་ཡིག་སོར་"}); } catch (e) { console.error('ops dz', e); }
+})();
+''')
+
+
+# ---- [OPS] v1.12 pre-booking of connectors: drivers book in the BPC EV app ("reserve now" or a time slot ahead), operators
+#      in the 📅 Bookings tab. Shortly before the slot the CSMS sends OCPP 1.6 ReserveNow (expiryDate = end of the arrival
+#      window); a charger that cannot reserve (Rejected / no answer / not implemented) is held by the CSMS itself: other
+#      idTags are refused on that connector (RemoteStart, StartTransaction) and other drivers see it as reserved. A connector
+#      that is in use, plugged in or starting for somebody else when the window opens is never taken away: the booking waits.
+#      Free of charge; drivers who miss bookings (no-shows) cannot book for a while.
+import math as _bk_math
+OPS_FEATURES.append('booking')
+ops_bookings = OpsDocStore('bookings', 'ops_bookings')   # booking id (BK1001) -> booking
+OPS_BK_DEFAULTS = {
+    'on': True, 'app': True, 'chargers': '', 'now_hold_min': 30, 'durations': [30, 60, 90, 120], 'step_min': 15,
+    'max_days': 7, 'min_ahead_min': 30, 'lead_min': 10, 'grace_min': 15, 'max_active': 1,
+    'noshow_limit': 3, 'noshow_days': 30, 'block_days': 7, 'keep_days': 90,
+    'max_per_day': 8, 'call_timeout_s': 20,
+}
+OPS_BK_ACTIVE = ('booked', 'waiting', 'held', 'starting')   # not finished yet
+OPS_BK_HOLDING = ('held', 'starting')                       # the connector is kept for the driver right now
+OPS_BK_ENDED = ('used', 'cancelled', 'no_show', 'missed')
+OPS_BK_REASONS = {'offline': 'charger offline', 'occupied': 'connector in use', 'faulted': 'connector faulted',
+                  'unavailable': 'connector unavailable', 'driver': 'cancelled by the driver', 'operator': 'cancelled by the operator',
+                  'refused': 'the charger refused the reservation', 'window': 'not started in time',
+                  'csms': 'the CSMS was not running', 'unknown': 'the connector does not exist'}
+_BK_BUSY: set = set()                                     # bookings with a ReserveNow / CancelReservation in flight
+_BK_STATE = {'last_clean': 0.0, 'dirty': False}
+_BK_IDX = {'key': None, 'by_cp': {}, 'ver': 0}             # active bookings per charger (the station views ask often)
+_BK_REFUSED: dict = {}                                     # (cp, connector, idTag) refused at StartTransaction -> time
+_BK_TASKS: set = set()
+for _p in ('/api/ops/booking/create', '/api/ops/booking/cancel'):
+    ops_perm_rule('POST', _p, 'control')
+ops_perm_rule('POST', '/api/ops/booking/unblock', 'customers')
+ops_perm_rule('POST', '/api/ops/booking/config', 'config')
+OPS_TAB_PERMS['booking'] = 'view'
+PUBLIC_PATHS.add('/app/booking.js')
+
+
+def ops_bk_cfg() -> dict:
+    d = ops_cfg('booking', OPS_BK_DEFAULTS)
+    if not isinstance(d.get('durations'), list) or not d['durations']:
+        d['durations'] = list(OPS_BK_DEFAULTS['durations'])
+    return d
+
+
+def ops_bk_public_cfg() -> dict:
+    c = ops_bk_cfg()
+    return {k: c.get(k) for k in ('on', 'app', 'now_hold_min', 'durations', 'step_min', 'max_days', 'min_ahead_min', 'lead_min',
+                                  'grace_min', 'max_active', 'noshow_limit', 'noshow_days', 'block_days')}
+
+
+def _bk_save(flush: bool = False):
+    """Every change goes through here (index version). flush=False: written by the background loop within a few seconds."""
+    _BK_IDX['ver'] += 1
+    _BK_STATE['dirty'] = True
+    if flush:
+        _bk_flush()
+
+
+def _bk_flush():
+    if _BK_STATE.get('dirty'):
+        _BK_STATE['dirty'] = False
+        ops_bookings.save()
+
+
+def _bk_index() -> dict:
+    key = (_BK_IDX['ver'], id(ops_bookings.data), len(ops_bookings.data))
+    if _BK_IDX['key'] != key:
+        by = {}
+        for b in ops_bookings.data.values():
+            if b.get('state') in OPS_BK_ACTIVE:
+                by.setdefault(b.get('cp'), []).append(b)
+        _BK_IDX.update(key=key, by_cp=by)
+    return _BK_IDX['by_cp']
+
+
+def _bk_active_for(cp_id: str) -> list:
+    return _bk_index().get(cp_id) or []
+
+
+def _bk_active_all() -> list:
+    return [b for rows in _bk_index().values() for b in rows]
+
+
+def _bk_time(t) -> str:
+    return ops_dt(t).strftime('%H:%M') if t else '—'
+
+
+def _bk_day(t) -> str:
+    return ops_dt(t).strftime('%Y-%m-%d') if t else ''
+
+
+def _bk_parse_start(v):
+    """Epoch seconds, or 'YYYY-MM-DD HH:MM' / 'YYYY-MM-DDTHH:MM' in Bhutan Time -> epoch seconds (None when unreadable)."""
+    if v is None or v == '' or isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v) if _bk_math.isfinite(v) else None
+    s = str(v).strip().replace('T', ' ')
+    try:
+        x = float(s)
+        return x if _bk_math.isfinite(x) else None
+    except ValueError:
+        pass
+    for fmt in ('%Y-%m-%d %H:%M', '%Y-%m-%d %H:%M:%S'):
+        try:
+            return datetime.strptime(s[:19] if fmt.endswith('%S') else s[:16], fmt).replace(tzinfo=OPS_TZ).timestamp()
+        except ValueError:
+            continue
+    return None
+
+
+def _bk_ts(v):
+    """OCPP dateTime (UTC when no zone is given) -> epoch seconds, None when unreadable."""
+    try:
+        s = str(v or '').strip()
+        if not s:
+            return None
+        dt = datetime.fromisoformat(s.replace('Z', '+00:00'))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+def _bk_charger_allowed(cp_id: str) -> bool:
+    allowed = [x.strip() for x in str(ops_bk_cfg().get('chargers') or '').replace(';', ',').split(',') if x.strip()]
+    return not allowed or cp_id in allowed
+
+
+def _bk_next_rid() -> int:
+    seq = ops_cfg('booking_seq', {'next': 1001})
+    n = max(int(seq.get('next') or 1001), max([int(b.get('rid') or 0) for b in ops_bookings.data.values()] or [0]) + 1)
+    seq['next'] = n + 1
+    ops_settings.save()
+    return n
+
+
+def _bk_seen_conns(cp_id: str) -> list:
+    """Connectors this charger has reported (kept, so a charger that is offline after a restart is not guessed)."""
+    return list((ops_cfg('booking_conns', {}) or {}).get(cp_id) or [])
+
+
+def _bk_raw(cp_id: str) -> dict:
+    """Connector facts without the bookings: {'connected', 'conns': {n: {'status', 'busy'}}} - only connectors the charger reported."""
+    pub = _pay_station_public_raw(cp_id)
+    live = sorted(int(k) for k in (app_state.station_record(cp_id).get('status') or {}).keys() if str(k).isdigit() and int(k) > 0)
+    known = sorted(set(live) | set(int(x) for x in _bk_seen_conns(cp_id)))
+    conns = {c['id']: {'status': c['status'], 'busy': c['busy']} for c in pub['connectors'] if c['id'] in known}
+    for n in known:
+        conns.setdefault(n, {'status': 'Unknown', 'busy': False})
+    return {'connected': pub['connected'], 'registration': pub.get('registration'), 'known': pub.get('known'),
+            'conns': dict(sorted(conns.items()))}
+
+
+def _bk_block(b: dict):
+    """[from, until) during which the booking keeps the connector from other bookings. A used booking keeps its slot
+    until the booked end, or until its charging session ended if that was earlier."""
+    f, end = float(b.get('hold_from') or 0), float(b.get('end') or 0)
+    if b.get('state') == 'used':
+        done = float(b.get('done_at') or 0)
+        return f, min(end, done) if done else end
+    return f, max(end, float(b.get('hold_until') or 0))
+
+
+def ops_bk_holding(cp_id: str, conn, now: float = None):
+    """The booking keeping this connector for its driver right now (held at the charger or by the CSMS), else None."""
+    now = ops_now() if now is None else now
+    for b in _bk_active_for(cp_id):
+        if b.get('cp') == cp_id and b.get('conn') == conn and b.get('state') in OPS_BK_HOLDING and \
+                float(b.get('hold_from') or 0) <= now < float(b.get('hold_until') or 0) + (120 if b.get('state') == 'starting' else 0):
+            return b
+    return None
+
+
+def _bk_next_booked(cp_id: str, conn, now: float = None):
+    now = ops_now() if now is None else now
+    nxt = [b for b in _bk_active_for(cp_id) if b.get('cp') == cp_id and b.get('conn') == conn and b.get('state') in ('booked', 'waiting')
+           and float(b.get('hold_until') or 0) > now]
+    return min(nxt, key=lambda b: b['start']) if nxt else None
+
+
+def _bk_overlap(cp_id: str, conn, a: float, z: float, exclude: str = None):
+    """A booking of this connector whose block overlaps [a, z), else None (used bookings keep their slot)."""
+    for b in ops_bookings.data.values():
+        if b.get('id') == exclude or b.get('cp') != cp_id or b.get('conn') != conn:
+            continue
+        if b.get('state') not in OPS_BK_ACTIVE and b.get('state') != 'used':
+            continue
+        f, u = _bk_block(b)
+        if f < z and a < u:
+            return b
+    return None
+
+
+def _bk_tag_permitted(b: dict, id_tag) -> bool:
+    """May this idTag use the connector kept for booking b? (its own tag, or a payment / free session of its app driver)"""
+    t = str(id_tag or '').strip().upper()
+    if not t:
+        return False
+    if t == str(b.get('id_tag') or '').upper() or t in (b.get('owner_tags') or []):
+        return True
+    cust = b.get('customer') or ''
+    if not cust:
+        return False
+    if t.startswith(str(getattr(app_state, 'payment_prefix', 'PAY-')).upper()):
+        rec = pay_ledger.get(t)
+        return bool(rec) and rec.get('customer_id') == cust
+    if t.startswith('FREE-'):
+        s = ops_free_active.data.get(t) if 'ops_free_active' in globals() else None
+        return bool(s) and s.get('customer') == cust
+    return False
+
+
+def _bk_may_hold(b: dict) -> bool:
+    """Can the charger itself hold a reservation for this booking? (accepted, or the answer never came)"""
+    return b.get('via') == 'ocpp' or str(b.get('ocpp') or '').startswith('NoAnswer') or bool(b.get('late_accept'))
+
+
+def _bk_occupant(b: dict, raw: dict, cs) -> str:
+    """Why the connector cannot be kept for booking b now: '' free, 'offline', 'faulted', 'unavailable', 'unknown',
+    'occupied' (somebody else charges, is plugged in or is starting), 'own' (its driver already charges there),
+    'own_start' (its driver's start is under way)."""
+    if cs is None or not raw['connected']:
+        return 'offline'
+    cst = raw['conns'].get(b['conn'])
+    if cst is None:
+        return 'unknown'
+    st = cst.get('status') or 'Unknown'
+    if st == 'Faulted':
+        return 'faulted'
+    if st == 'Unavailable':
+        return 'unavailable'
+    for t in list((getattr(cs.data, 'transactions', None) or {}).values()):
+        if int(t.get('connector_id') or 0) == b['conn']:
+            return 'own' if _bk_tag_permitted(b, t.get('id_tag')) else 'occupied'
+    now_dt = datetime.now()
+    for (cp, cid, tag), exp in list((getattr(app_state, 'remote_start_pending', None) or {}).items()):
+        if cp == b['cp'] and cid in (None, b['conn']) and exp > now_dt:
+            return 'own_start' if _bk_tag_permitted(b, tag) else 'occupied'
+    rec = pay_ledger.active_for_connector(b['cp'], b['conn'])
+    if rec is not None:
+        return 'own_start' if b.get('customer') and rec.get('customer_id') == b.get('customer') else 'occupied'
+    if 'ops_free_active' in globals():
+        for s in list(ops_free_active.data.values()):
+            if s.get('cp') == b['cp'] and s.get('conn') == b['conn'] and s.get('state') in OPS_FREE_ACTIVE_STATES:
+                return 'own_start' if _bk_tag_permitted(b, s.get('tag') or s.get('id')) else 'occupied'
+    if cst.get('busy') or st in ('Preparing', 'Charging', 'SuspendedEV', 'SuspendedEVSE', 'Finishing'):
+        return 'occupied'
+    return ''
+
+
+def ops_bk_mark_station(pub: dict, viewer: str = None) -> dict:
+    """Station view for the pay page / free page / app: a connector kept for another driver is busy ('Reserved'),
+    the viewer's own booked connector is free for them; the next booking of each connector is shown."""
+    if not pub or not pub.get('connectors'):
+        return pub
+    now = ops_now()
+    for c in pub['connectors']:
+        b = ops_bk_holding(pub.get('id'), c['id'], now)
+        mine = bool(b and viewer and b.get('customer') == viewer)
+        if b:
+            c['booking'] = {'until': b.get('hold_until'), 'mine': mine, 'id': b['id'] if mine else None}
+            if not mine:
+                c['charger_status'] = c.get('status')
+                c['status'] = 'Reserved'
+                c['busy'] = True
+        elif c.get('status') == 'Reserved':
+            c['busy'] = True                     # reserved at the charger itself (e.g. from the console's command panel)
+        nb = _bk_next_booked(pub.get('id'), c['id'], now)
+        if nb:
+            c['next_booking'] = {'from': nb.get('hold_from'), 'start': nb.get('start'),
+                                 'mine': bool(viewer and nb.get('customer') == viewer)}
+    return pub
+
+
+# ---- notifications ------------------------------------------------------------------------------------------------
+_BK_MSG = {
+    'confirmed': {'en': ['Booking confirmed', '{station} · connector {conn} · {day} {start}–{end} (BTT). Arrive by {grace}.'],
+                  'th': ['ยืนยันการจองแล้ว', '{station} · หัวชาร์จ {conn} · {day} {start}–{end} (เวลาภูฏาน) มาถึงก่อน {grace}'],
+                  'dz': ['སྔོན་བཟུང་ངེས་གཏན་བཟོ་ཡི་', '{station} · མཐུད་ཆས་ {conn} · {day} {start}–{end} (BTT). {grace} ཚུན་ལྷོད་དགོ་']},
+    'held_now': {'en': ['Connector reserved', '{station} · connector {conn} is kept for you until {until} (BTT).'],
+                 'th': ['จองหัวชาร์จแล้ว', '{station} · หัวชาร์จ {conn} ถูกกันไว้ให้คุณถึง {until} (เวลาภูฏาน)'],
+                 'dz': ['མཐུད་ཆས་སྔོན་བཟུང་འབད་ཡི་', '{station} · མཐུད་ཆས་ {conn} ཁྱོད་ཀྱི་དོན་ལུ་ {until} (BTT) ཚུན་བཞག་ཡོད་']},
+    'held': {'en': ['Your booking starts now', '{station} · connector {conn} is reserved for you until {until} (BTT).'],
+             'th': ['ถึงเวลาการจองของคุณแล้ว', '{station} · หัวชาร์จ {conn} ถูกกันไว้ให้คุณถึง {until} (เวลาภูฏาน)'],
+             'dz': ['ཁྱོད་ཀྱི་སྔོན་བཟུང་འགོ་བཙུགས་ཡི་', '{station} · མཐུད་ཆས་ {conn} ཁྱོད་ཀྱི་དོན་ལུ་ {until} (BTT) ཚུན་སྔོན་བཟུང་འབད་ཡོད་']},
+    'waiting': {'en': ['Your connector is not free yet', '{station} · connector {conn}: {why}. We keep it for you as soon as possible.'],
+                'th': ['หัวชาร์จที่จองยังไม่ว่าง', '{station} · หัวชาร์จ {conn}: {why} ระบบจะกันไว้ให้คุณทันทีที่ทำได้'],
+                'dz': ['ཁྱོད་ཀྱི་མཐུད་ཆས་ད་ལྟོ་འཐོབ་མི་ཚུགས་', '{station} · མཐུད་ཆས་ {conn}: {why}. འཐོབ་ཚུགས་ཚེ་ཁྱོད་ཀྱི་དོན་ལུ་བཞག་འོང་']},
+    'no_show': {'en': ['Booking expired', 'You did not start charging at {station} by {until} (BTT). Missed bookings: {n} of {limit} in {days} days.'],
+                'th': ['การจองหมดเวลา', 'คุณไม่ได้เริ่มชาร์จที่ {station} ภายใน {until} (เวลาภูฏาน) จองแล้วไม่มา {n} จาก {limit} ครั้งใน {days} วัน'],
+                'dz': ['སྔོན་བཟུང་དུས་ཚོད་རྫོགས་ཡི་', '{station} ལུ་ {until} (BTT) ཚུན་གློག་བླུགས་འགོ་མ་བཙུགས་. ཉིན་ {days} ནང་ མ་ལྷོད་པའི་སྔོན་བཟུང་ {limit} ལས་ {n}']},
+    'blocked': {'en': ['Booking paused', 'After {n} missed bookings you can book again from {day}.'],
+                'th': ['ระงับการจองชั่วคราว', 'จองแล้วไม่มา {n} ครั้ง จองได้อีกครั้งตั้งแต่ {day}'],
+                'dz': ['སྔོན་བཟུང་བར་བཀག་', 'སྔོན་བཟུང་ {n} ལུ་མ་ལྷོད་པའི་རྐྱེན་ལས་ {day} ལས་ལོག་སྟེ་སྔོན་བཟུང་འབད་ཚུགས་']},
+    'missed': {'en': ['Booking could not be kept', 'Sorry - {station} · connector {conn}: {why}. This does not count as a missed booking.'],
+               'th': ['ไม่สามารถกันหัวชาร์จตามที่จองได้', 'ขออภัย - {station} · หัวชาร์จ {conn}: {why} ไม่นับเป็นการจองแล้วไม่มา'],
+               'dz': ['སྔོན་བཟུང་བཞག་མ་ཚུགས་', 'དགོངསམ་མ་ཁྲེལ་ - {station} · མཐུད་ཆས་ {conn}: {why}. འདི་མ་ལྷོད་པའི་སྔོན་བཟུང་ནང་མི་རྩིས་']},
+    'cancelled_op': {'en': ['Booking cancelled', 'The operator cancelled your booking at {station} ({why}).'],
+                     'th': ['การจองถูกยกเลิก', 'เจ้าหน้าที่ยกเลิกการจองของคุณที่ {station} ({why})'],
+                     'dz': ['སྔོན་བཟུང་ཆ་མེད་བཏང་ཡི་', 'བཀོལ་སྤྱོད་པ་གིས་ {station} གི་སྔོན་བཟུང་ཆ་མེད་བཏང་ཡི་ ({why})']},
+}
+_BK_WHY = {
+    'th': {'charger offline': 'ตู้ชาร์จออฟไลน์', 'connector in use': 'หัวชาร์จยังมีคนใช้อยู่', 'connector faulted': 'หัวชาร์จขัดข้อง',
+           'connector unavailable': 'หัวชาร์จปิดใช้งาน', 'the charger refused the reservation': 'ตู้ชาร์จไม่รับการจอง',
+           'cancelled by the operator': 'เจ้าหน้าที่ยกเลิก', 'the CSMS was not running': 'ระบบ CSMS ไม่ได้ทำงานในช่วงนั้น',
+           'not started in time': 'ไม่ได้เริ่มชาร์จตามเวลา', 'the connector does not exist': 'ไม่มีหัวชาร์จนี้'},
+    'dz': {'charger offline': 'གློག་བླུགས་ཆས་མཐུད་མེད་', 'connector in use': 'མཐུད་ཆས་ལག་ལེན་འཐབ་དོ་', 'connector faulted': 'མཐུད་ཆས་འཛོལ་བ་',
+           'connector unavailable': 'མཐུད་ཆས་འཐོབ་མི་ཚུགས་', 'the charger refused the reservation': 'གློག་བླུགས་ཆས་ཀྱིས་སྔོན་བཟུང་ངོས་མ་ལེན་',
+           'cancelled by the operator': 'བཀོལ་སྤྱོད་པ་གིས་ཆ་མེད་བཏང་ཡོད་', 'the CSMS was not running': 'CSMS ལཱ་འབད་མ་ཚུགས་',
+           'not started in time': 'དུས་ཚོད་ནང་གློག་བླུགས་འགོ་མ་བཙུགས་', 'the connector does not exist': 'མཐུད་ཆས་འདི་མེད་'},
+}
+
+
+def _bk_station_name(cp_id: str) -> str:
+    return (station_info.data.get(cp_id) or {}).get('name') or cp_id
+
+
+def _bk_notify(b: dict, key: str, **extra):
+    """In-app notification (+ Web Push) to the app driver of the booking, in their language."""
+    cust = customers.get(b.get('customer')) if b.get('customer') else None
+    if cust is None:
+        return
+    lang = cust.get('lang') if cust.get('lang') in ('th', 'dz') else 'en'
+    title, body = _BK_MSG[key].get(lang) or _BK_MSG[key]['en']
+    why = str(extra.pop('why', '') or '')
+    if lang != 'en':
+        why = _BK_WHY.get(lang, {}).get(why, why)
+    vals = {'station': _bk_station_name(b.get('cp')), 'conn': b.get('conn'), 'day': _bk_day(b.get('start')),
+            'start': _bk_time(b.get('start')), 'end': _bk_time(b.get('end')), 'grace': _bk_time(b.get('hold_until')),
+            'until': _bk_time(b.get('hold_until')), 'why': why}
+    vals.update({k: v for k, v in extra.items()})
+    for k, v in vals.items():
+        body = body.replace('{' + k + '}', str(v))
+    try:
+        app_notify(cust, title, body, '/app/#/bookings', 'booking', b.get('id') or '')
+    except Exception as e:
+        logger.debug(f"booking: notify failed: {e}")
+
+
+# ---- driver limits (no-shows) -------------------------------------------------------------------------------------
+def _bk_who(b: dict) -> str:
+    return b.get('customer') or str(b.get('id_tag') or '').upper()
+
+
+def _bk_noshow_rows(now: float, who: str = None) -> dict:
+    """who -> [ended, ...] of the no-shows that can still count (window + pause), not forgiven by the operator."""
+    cfg = ops_bk_cfg()
+    back = (float(cfg.get('noshow_days') or 30) + float(cfg.get('block_days') or 0)) * 86400
+    out = {}
+    for b in ops_bookings.data.values():
+        if b.get('state') != 'no_show' or b.get('forgiven') or float(b.get('ended') or 0) < now - back:
+            continue
+        w = _bk_who(b)
+        if who is None or w == who or (not b.get('customer') and w == str(who or '').upper()):
+            out.setdefault(w, []).append(float(b.get('ended') or 0))
+    return out
+
+
+def _bk_noshow_info(ended: list, now: float) -> dict:
+    """Missed bookings in the last noshow_days, and the pause: from the moment a driver reached the limit within
+    noshow_days, for block_days - it does not end early when an old no-show leaves the window."""
+    cfg = ops_bk_cfg()
+    days, limit, block = float(cfg.get('noshow_days') or 30) * 86400, int(cfg.get('noshow_limit') or 0), float(cfg.get('block_days') or 0) * 86400
+    ended = sorted(ended)
+    out = {'n': sum(1 for t in ended if t >= now - days), 'limit': limit, 'days': days / 86400, 'blocked_until': None}
+    if limit and block:
+        until = 0.0
+        for i, t in enumerate(ended):
+            if sum(1 for x in ended[:i + 1] if x >= t - days) >= limit:
+                until = max(until, t + block)
+        if until > now:
+            out['blocked_until'] = until
+    return out
+
+
+def ops_bk_noshows(who: str, now: float = None) -> dict:
+    """{'n', 'limit', 'days', 'blocked_until'} for an app customer id (or an RFID idTag)."""
+    now = ops_now() if now is None else now
+    rows = _bk_noshow_rows(now, who)
+    return _bk_noshow_info([t for v in rows.values() for t in v], now)
+
+
+# ---- create / cancel / end ------------------------------------------------------------------------------------------
+def _bk_err(msg: str, status: int = 409, **vars):
+    return None, (msg, status, vars)
+
+
+_BK_NOT_FREE = {'offline': 'This station is offline right now', 'occupied': 'Connector {conn} is not free right now',
+                'faulted': 'Connector {conn} is out of order right now', 'unavailable': 'Connector {conn} is switched off right now',
+                'own': 'You are already charging on connector {conn}', 'own_start': 'You are already starting a session on connector {conn}',
+                'unknown': 'Choose a connector', 'busy': 'Connector {conn} is not free right now'}
+
+
+async def ops_bk_create(spec: dict, owner: dict, by: str = 'app', app: bool = True):
+    """Make a booking. spec: cp, conn, kind ('now' | 'slot'), start, minutes. owner: customer (app id) or id_tag, name, phone.
+    app=True: limits of the BPC EV app. Returns (booking, None) or (None, (message, http status, vars))."""
+    cfg, now = ops_bk_cfg(), ops_now()
+    if not cfg.get('on'):
+        return _bk_err('Booking is switched off', 403)
+    if app and not cfg.get('app'):
+        return _bk_err('Booking in the app is switched off', 403)
+    cp = str(spec.get('cp') or '').strip()
+    if not cp or not (cp in app_state.cp_registrations or cp in app_state.cp_data):
+        return _bk_err('Unknown station', 404)
+    if app_state.get_cp_registration_status(cp) != 'Accepted' or (app and (station_info.data.get(cp) or {}).get('hidden')):
+        return _bk_err('This station cannot be booked', 409)
+    if not _bk_charger_allowed(cp):
+        return _bk_err('This station cannot be booked', 409)
+    raw = _bk_raw(cp)
+    if not raw['conns']:
+        return _bk_err('This station cannot be booked yet', 409)
+    conn = ops_int(spec.get('conn'), 0)
+    if conn not in raw['conns']:
+        if conn == 0 and len(raw['conns']) == 1:
+            conn = list(raw['conns'])[0]
+        else:
+            return _bk_err('Choose a connector', 400)
+    kind = 'slot' if str(spec.get('kind') or '') == 'slot' else 'now'
+    who = owner.get('customer') or str(owner.get('id_tag') or '').strip().upper()
+    if not who:
+        return _bk_err('Choose the driver (app account or RFID card)', 400)
+    if app or owner.get('customer'):
+        ns = ops_bk_noshows(who, now)
+        if ns['blocked_until'] and app:
+            return _bk_err('You missed {n} bookings - you can book again from {day}', 403, n=ns['n'], day=_bk_day(ns['blocked_until']))
+    if app:
+        mine = [b for b in ops_bookings.data.values() if b.get('customer') == who and b.get('source') == 'app']
+        act = [b for b in mine if b.get('state') in OPS_BK_ACTIVE]
+        if len(act) >= max(1, int(cfg.get('max_active') or 1)):
+            return _bk_err('You already have a booking ({id}) - cancel it first to book another one', 409, id=act[0]['id'])
+        if sum(1 for b in mine if float(b.get('created') or 0) > now - 86400) >= max(1, int(cfg.get('max_per_day') or 8)):
+            return _bk_err('You made many bookings today - please try again tomorrow', 429)
+        if kind == 'now':
+            gap = max(0.05, float(cfg.get('now_hold_min') or 30)) * 60
+            last = [b for b in mine if b.get('kind') == 'now' and b.get('cp') == cp and b.get('state') == 'cancelled'
+                    and b.get('reason') == 'driver' and float(b.get('ended') or 0) > now - gap]
+            if last:
+                wait = max(1, int(_bk_math.ceil((float(last[-1]['ended']) + gap - now) / 60)))
+                return _bk_err('You cancelled a booking here just now - you can reserve again in {m} min', 429, m=wait)
+    tmp = {'cp': cp, 'conn': conn, 'customer': owner.get('customer') or '', 'id_tag': who if not owner.get('customer') else ''}
+    if kind == 'now':
+        occ = _bk_occupant(tmp, raw, app_state.charge_points.get(cp))
+        if occ or raw['conns'][conn].get('status') == 'Reserved' or ops_bk_holding(cp, conn, now):
+            return _bk_err(_BK_NOT_FREE.get(occ or 'busy'), 409, conn=conn)
+        start = now
+        hold = max(0.05, float(cfg.get('now_hold_min') or 30)) * 60
+        end = hold_until = start + hold
+        hold_from = start
+        minutes = round(hold / 60.0, 2)
+    else:
+        start = _bk_parse_start(spec.get('start'))
+        if start is None:
+            return _bk_err('Choose the date and time', 400)
+        try:
+            minutes = float(spec.get('minutes') or 0)
+        except (TypeError, ValueError):
+            minutes = 0
+        if not _bk_math.isfinite(minutes):
+            minutes = 0
+        allowed = [float(x) for x in (cfg.get('durations') or [])]
+        if app and minutes not in allowed:
+            return _bk_err('Choose how long you need the connector', 400)
+        if not (0 < minutes <= 24 * 60):
+            return _bk_err('Choose how long you need the connector', 400)
+        ahead = float(cfg.get('min_ahead_min') or 0) * 60
+        if app and start < now + ahead - 30:
+            return _bk_err('Book at least {m} minutes ahead - or use "Reserve now"', 409, m=int(ahead / 60))
+        if not app and start < now - 60:
+            return _bk_err('This time is in the past', 409)
+        if start > now + float(cfg.get('max_days') or 7) * 86400 + 60:
+            return _bk_err('You can book up to {d} days ahead', 409, d=int(float(cfg.get('max_days') or 7)))
+        end = start + minutes * 60
+        hold_from = max(now, start - float(cfg.get('lead_min') or 0) * 60)
+        hold_until = start + min(float(cfg.get('grace_min') or 15) * 60, minutes * 60)
+    clash = _bk_overlap(cp, conn, hold_from, max(end, hold_until))
+    if clash is not None:
+        return _bk_err('Connector {conn} is already booked {from} - {to} (BTT)', 409, conn=conn, **{
+            'from': _bk_time(_bk_block(clash)[0]), 'to': _bk_time(_bk_block(clash)[1])})
+    rid = _bk_next_rid()
+    bid = f'BK{rid}'
+    b = {'id': bid, 'rid': rid, 'cp': cp, 'conn': conn, 'kind': kind, 'start': round(start, 3), 'end': round(end, 3),
+         'minutes': minutes, 'hold_from': int(hold_from * 1000) / 1000.0, 'hold_until': round(hold_until, 3), 'state': 'booked',
+         'via': '', 'ocpp': '', 'tries': 0, 'customer': owner.get('customer') or '',
+         'id_tag': (str(owner.get('id_tag') or '').strip().upper() or bid)[:20],
+         'name': str(owner.get('name') or '')[:60], 'phone': str(owner.get('phone') or '')[:20], 'plate': str(owner.get('plate') or '')[:20],
+         'note': str(spec.get('note') or '')[:200], 'source': 'app' if app else 'console', 'by': by,
+         'created': round(now, 1), 'updated': round(now, 1)}
+    ops_bookings.data[bid] = b
+    _bk_save(True)
+    logger.info(f"📅 booking {bid} ({kind}) {cp} #{conn} {_bk_day(start)} {_bk_time(start)}-{_bk_time(end)} for "
+                f"{b['customer'] or b['id_tag']} ({b['source']}, by {by})")
+    if kind == 'now':
+        out = await ops_bk_activate(b)
+        if b['state'] != 'held':
+            reason = b.get('wait_reason') or out or 'refused'
+            if _bk_may_hold(b):
+                _bk_spawn(_bk_cancel_at_charger(b))
+            ops_bookings.data.pop(bid, None)
+            _bk_save(True)
+            logger.info(f"📅 booking {bid} not made: {OPS_BK_REASONS.get(reason, reason)} ({out})")
+            return _bk_err(_BK_NOT_FREE.get(reason, 'The charger could not reserve connector {conn} - please try again'), 409, conn=conn)
+        _bk_notify(b, 'held_now')
+    else:
+        _bk_notify(b, 'confirmed')
+    return b, None
+
+
+def _bk_finish(b: dict, state: str, reason: str = '', notify: bool = True, flush: bool = True):
+    now = ops_now()
+    prev = b.get('state')
+    b.update(state=state, reason=reason, ended=round(now, 1), updated=round(now, 1))
+    _bk_save(flush)
+    logger.info(f"📅 booking {b['id']} {prev} -> {state}" + (f" ({reason})" if reason else ''))
+    if state != 'used' and _bk_may_hold(b) and prev in OPS_BK_ACTIVE:
+        _bk_spawn(_bk_cancel_at_charger(b))
+    if not notify:
+        return
+    if state == 'no_show':
+        ns = ops_bk_noshows(b.get('customer') or b.get('id_tag'), now)
+        _bk_notify(b, 'no_show', n=ns['n'], limit=ns['limit'] or '-', days=int(ns['days']))
+        if ns['blocked_until']:
+            _bk_notify(b, 'blocked', n=ns['n'], day=_bk_day(ns['blocked_until']))
+    elif state == 'missed':
+        _bk_notify(b, 'missed', why=OPS_BK_REASONS.get(reason, reason))
+    elif state == 'cancelled' and reason == 'operator':
+        _bk_notify(b, 'cancelled_op', why=b.get('cancel_note') or OPS_BK_REASONS['operator'])
+
+
+def _bk_spawn(coro):
+    """Run a charger conversation in the background (a charger that does not answer must not hold up the others)."""
+    async def _run():
+        try:
+            await coro
+        except Exception as e:
+            logger.error(f"booking: background step failed: {e}")
+    try:
+        t = asyncio.get_running_loop().create_task(_run())
+    except RuntimeError:
+        coro.close()
+        return
+    _BK_TASKS.add(t)
+    t.add_done_callback(_BK_TASKS.discard)
+
+
+def _bk_timeout() -> float:
+    return max(2.0, min(60.0, float(ops_bk_cfg().get('call_timeout_s') or 20)))
+
+
+async def _bk_call(coro, timeout: float, on_late=None):
+    """Wait for a charger call without cancelling it: the ocpp library keeps waiting for the answer (one call at a time per
+    charger), so a late answer is still read in order - never left behind to confuse the next call. on_late(task) runs
+    when the answer comes after we stopped waiting."""
+    task = asyncio.ensure_future(coro)
+    done, _ = await asyncio.wait({task}, timeout=timeout)
+    if task in done:
+        return task.result()
+
+    def _after(t):
+        if t.cancelled():
+            return
+        if t.exception() is not None:
+            return
+        if on_late is not None:
+            try:
+                on_late(t.result())
+            except Exception as e:
+                logger.error(f"booking: late answer handling failed: {e}")
+    task.add_done_callback(_after)
+    raise asyncio.TimeoutError()
+
+
+async def _bk_wait_idle(b: dict, limit: float = 30.0):
+    """Wait until no ReserveNow / CancelReservation for this booking is in flight."""
+    t0 = ops_now()
+    while b['id'] in _BK_BUSY and ops_now() - t0 < limit:
+        await asyncio.sleep(0.2)
+
+
+async def _bk_cancel_at_charger(b: dict, wait: bool = True):
+    """CancelReservation for a booking the charger may hold (Rejected when it had none - harmless)."""
+    if wait:
+        await _bk_wait_idle(b)
+    cs = app_state.charge_points.get(b.get('cp'))
+    if cs is None or b['id'] in _BK_BUSY:
+        return
+    _BK_BUSY.add(b['id'])
+    try:
+        r = await _bk_call(cs.cmd_cancel_reservation(int(b['rid'])), _bk_timeout())
+        b['cancel_ocpp'] = str((r or {}).get('status', '')).split('.')[-1] or 'NotSupported'
+    except Exception as e:
+        b['cancel_ocpp'] = 'NotSupported' if isinstance(e, AttributeError) else f'no answer ({type(e).__name__})'
+    finally:
+        _BK_BUSY.discard(b['id'])
+    if b['cancel_ocpp'] in ('Accepted', 'Rejected', 'NotSupported'):
+        b.pop('late_accept', None)
+    _bk_save()
+
+
+def ops_bk_cancel(b: dict, by: str, note: str = '', driver: bool = False) -> bool:
+    if b.get('state') not in OPS_BK_ACTIVE:
+        return False
+    b['cancel_note'] = str(note or '')[:120]
+    b['cancelled_by'] = by
+    _bk_finish(b, 'cancelled', 'driver' if driver else 'operator', notify=not driver)
+    return True
+
+
+# ---- holding the connector (OCPP ReserveNow or the CSMS gate) ------------------------------------------------------
+def _bk_wait(b: dict, code: str, now: float) -> str:
+    first = b.get('state') != 'waiting'
+    b.update(state='waiting', wait_reason=code, next_try=round(now + 20, 1))
+    if first:
+        b['updated'] = round(now, 1)
+        _bk_save()
+        if b.get('kind') == 'slot' and not b.get('notified_wait'):
+            b['notified_wait'] = True
+            _bk_notify(b, 'waiting', why=OPS_BK_REASONS.get(code, code))
+    return OPS_BK_REASONS.get(code, code)
+
+
+def _bk_mark_used(b: dict, txn, conn, tag, when: float):
+    now = ops_now()
+    prev = b.get('state')
+    b.update(state='used', txn=txn, used_conn=conn, used_at=round(when, 1), used_tag=str(tag or '').upper(),
+             ended=round(now, 1), updated=round(now, 1), reason='')
+    _bk_save(True)
+    logger.info(f"📅 booking {b['id']} used ({prev}): transaction {txn} at {b['cp']} #{conn} ({tag})")
+    if conn != b.get('conn') and _bk_may_hold(b):
+        _bk_spawn(_bk_cancel_at_charger(b))        # charging on another connector: free the booked one at the charger
+
+
+async def ops_bk_activate(b: dict) -> str:
+    """Keep the connector for the driver now: ReserveNow at the charger, or the CSMS itself when the charger cannot.
+    A connector in use / plugged in / starting for somebody else is never taken: the booking waits."""
+    if b['id'] in _BK_BUSY:
+        return 'busy'
+    st0 = b.get('state')
+    if st0 not in OPS_BK_ACTIVE:
+        return 'ended'
+    _BK_BUSY.add(b['id'])
+    try:
+        now = ops_now()
+        cs = app_state.charge_points.get(b['cp'])
+        raw = _bk_raw(b['cp'])
+        occ = _bk_occupant(b, raw, cs)
+        if occ == 'own':
+            t = next((x for k, x in (cs.data.transactions or {}).items() if int(x.get('connector_id') or 0) == b['conn']), {})
+            txn = next((k for k, x in (cs.data.transactions or {}).items() if x is t), None)
+            _bk_mark_used(b, txn, b['conn'], t.get('id_tag'), now)
+            return 'own'
+        if occ == 'own_start':
+            if st0 != 'starting':
+                b.update(state='starting', start_at=round(now, 1), pre_start=st0, updated=round(now, 1))
+                _bk_save()
+            return 'own_start'
+        if occ == 'unknown':
+            _bk_finish(b, 'missed', 'unknown', flush=False)
+            return 'unknown'
+        if occ:
+            if st0 == 'held' and b.get('via') == 'ocpp' and occ == 'occupied':
+                return 'occupied'                  # the charger keeps it (Preparing = maybe its driver): leave it
+            return _bk_wait(b, occ, now)
+        secs = max(5, int(float(b['hold_until']) - now))
+
+        def _late(r):                           # the charger answered after we stopped waiting
+            if str((r or {}).get('status', '')).split('.')[-1].lower() != 'accepted':
+                return
+            b['late_accept'] = True
+            logger.info(f"📅 booking {b['id']}: ReserveNow Accepted late by {b['cp']} (booking {b.get('state')})")
+            if b.get('state') == 'held' and b.get('via') == 'csms':
+                b.update(via='ocpp', ocpp='Accepted (late)', reserved_at=round(ops_now(), 1))
+                _bk_save()
+            elif b.get('state') not in OPS_BK_ACTIVE:
+                _bk_spawn(_bk_cancel_at_charger(b))
+        try:
+            r = await _bk_call(cs.cmd_reserve_now(int(b['conn']), b['id_tag'], int(b['rid']), secs), _bk_timeout(), _late)
+            st = str((r or {}).get('status', '')).split('.')[-1] or 'NoAnswer'
+        except Exception as e:                  # CallError (suppressed -> None), timeout, disconnect
+            st = 'NotSupported' if isinstance(e, AttributeError) else f'NoAnswer ({type(e).__name__})'
+        now = ops_now()
+        if b.get('state') != st0:               # changed while we waited for the charger (cancelled, used, ...)
+            if st.lower() == 'accepted' or st.startswith('NoAnswer'):
+                b['late_accept'] = True
+                if b.get('state') != 'used' or b.get('used_conn') != b.get('conn'):
+                    _bk_spawn(_bk_cancel_at_charger(b))
+            logger.info(f"📅 booking {b['id']}: ReserveNow answered {st} after it became {b.get('state')} - not kept")
+            return st
+        b.update(ocpp=st, tries=int(b.get('tries') or 0) + 1, reserved_at=round(now, 1), updated=round(now, 1))
+        first = st0 in ('booked', 'waiting') and not b.get('held_at')
+        if st.lower() == 'accepted':
+            via = 'ocpp'
+        elif st.lower() in ('occupied', 'faulted', 'unavailable'):
+            if st.lower() == 'occupied' and st0 == 'held' and b.get('via') == 'ocpp':
+                return st                         # already reserved for the same id at the charger
+            return _bk_wait(b, st.lower(), now)
+        else:                                   # Rejected (not configured for reservations) / CallError / no answer
+            via = 'csms'
+        if st0 != 'held' or b.get('via') != via:
+            b['held_since'] = round(now, 1)
+        b.update(state='held', via=via)
+        if first:
+            b['held_at'] = round(now, 1)
+            if b.get('kind') == 'slot':
+                _bk_notify(b, 'held')
+        _bk_save()
+        logger.info(f"📅 booking {b['id']} held at {b['cp']} #{b['conn']} until {_bk_time(b['hold_until'])} "
+                    f"({'ReserveNow Accepted' if via == 'ocpp' else 'kept by the CSMS: ReserveNow ' + st})")
+        return st
+    finally:
+        _BK_BUSY.discard(b['id'])
+
+
+async def ops_bk_before_remote_start(cs, id_tag, connector_id):
+    """RemoteStartTransaction to a connector kept for a booking: its driver goes ahead (a reservation the charger may hold
+    is cancelled first so it accepts the driver's payment / free-session tag), anybody else is refused. None = carry on."""
+    try:
+        conn = int(connector_id) if connector_id else None
+    except (TypeError, ValueError):
+        conn = None
+    now = ops_now()
+    rows = [b for b in _bk_active_for(cs.id) if b.get('cp') == cs.id and (conn is None or b.get('conn') == conn)
+            and float(b.get('hold_from') or 0) - 1800 <= now < float(b.get('hold_until') or 0) + (120 if b.get('state') == 'starting' else 0)]
+    own = [b for b in rows if _bk_tag_permitted(b, id_tag)]
+    if own:
+        b = sorted(own, key=lambda x: (x.get('conn') != conn, x.get('start') or 0))[0]
+        if _bk_may_hold(b):
+            await _bk_wait_idle(b, 25)
+            await _bk_cancel_at_charger(b, wait=False)
+        if b.get('state') in OPS_BK_ACTIVE:     # still the driver's booking after talking to the charger
+            tags = [t for t in (b.get('owner_tags') or []) if t]
+            tags.append(str(id_tag or '').upper())
+            if b.get('state') != 'starting':
+                b['pre_start'] = b.get('state')
+            b.update(state='starting', start_at=round(ops_now(), 1), owner_tags=tags[-5:], updated=round(ops_now(), 1))
+            _bk_save(True)
+            logger.info(f"📅 booking {b['id']}: its driver starts ({id_tag})")
+        return None
+    holds = [b for b in rows if b.get('state') in OPS_BK_HOLDING and float(b.get('hold_from') or 0) <= now]
+    if not holds or conn is None:
+        return None                             # no connector given: the charger picks one; a kept one refuses other tags
+    b = holds[0]
+    logger.info(f"📅 RemoteStart {id_tag} to {cs.id} #{conn} refused: kept for booking {b['id']} until {_bk_time(b['hold_until'])}")
+    app_state.add_log('📅 BOOK', cs.id, 'RemoteStart refused', {'connector': conn, 'idTag': id_tag, 'booking': b['id']})
+    return {'status': 'Rejected', 'reason': f"connector {conn} is reserved for booking {b['id']} until {_bk_time(b['hold_until'])} (BTT)"}
+
+
+def ops_bk_start_gate(cp_id: str, connector_id, id_tag: str, reservation_id=None, timestamp=None):
+    """StartTransaction on a connector kept for a booking: None = carry on, else the idTagInfo refusing it.
+    Not refused: the booking's driver, and sessions that began before the connector was kept (offline queue)."""
+    try:
+        conn = int(connector_id)
+    except (TypeError, ValueError):
+        return None
+    b = ops_bk_holding(cp_id, conn)
+    if b is None or _bk_tag_permitted(b, id_tag):
+        return None
+    ts = _bk_ts(timestamp)
+    if ts is not None and ts < float(b.get('held_since') or b.get('held_at') or b.get('hold_from') or 0) - 30:
+        logger.info(f"📅 StartTransaction {id_tag} at {cp_id} #{conn} began before booking {b['id']} kept the connector - accepted")
+        return None
+    logger.info(f"📅 StartTransaction {id_tag} at {cp_id} #{conn} refused: kept for booking {b['id']} until {_bk_time(b['hold_until'])}"
+                + (f" (reservationId {reservation_id})" if reservation_id is not None else ''))
+    app_state.add_log('📅 BOOK', cp_id, 'StartTransaction refused', {'connector': conn, 'idTag': id_tag, 'booking': b['id']})
+    _BK_REFUSED[(cp_id, conn, str(id_tag or '').upper())] = ops_now()
+    # chargers keep idTagInfo in their Authorization Cache (OCPP 1.6 3.4.1): the refusal expires after a minute
+    until = datetime.fromtimestamp(ops_now() + 60, timezone.utc)
+    return {'status': AuthorizationStatus.blocked, 'expiryDate': until.strftime('%Y-%m-%dT%H:%M:%SZ')}
+
+
+async def _bk_stop_refused(cp_id: str, txn_id):
+    """The charger started anyway (StopTransactionOnInvalidId false): RemoteStop, so the kept connector is freed."""
+    await asyncio.sleep(2)
+    cs = app_state.charge_points.get(cp_id)
+    if cs is None or txn_id not in (cs.data.transactions or {}):
+        return
+    try:
+        await _bk_call(cs.cmd_remote_stop(txn_id), _bk_timeout())
+        logger.info(f"📅 RemoteStop {txn_id} at {cp_id}: refused on a connector kept for a booking")
+    except Exception as e:
+        logger.info(f"📅 RemoteStop {txn_id} at {cp_id} not answered: {e}")
+
+
+@ops_on('tx_start')
+def _ops_bk_tx_start(cp_id=None, connector=None, txn_id=None, id_tag='', accepted=True, reservation_id=None, timestamp='', **kw):
+    tag = str(id_tag or '').upper()
+    if not accepted:
+        if _BK_REFUSED.pop((cp_id, connector, tag), None) is not None:
+            _bk_spawn(_bk_stop_refused(cp_id, txn_id))
+        return
+    now = ops_now()
+    ts = _bk_ts(timestamp)
+    if ts is None or ts > now + 300:
+        ts = now
+    cands = []
+    for x in ops_bookings.data.values():
+        if x.get('cp') != cp_id or not _bk_tag_permitted(x, tag):
+            continue
+        st = x.get('state')
+        if st not in OPS_BK_ACTIVE and not (st in ('no_show', 'missed') and float(x.get('ended') or 0) > now - 2 * 86400):
+            continue
+        late = 120 if st in OPS_BK_ACTIVE else 0      # an ended booking only for a session that really began inside its window
+        if float(x.get('hold_from') or 0) - 1800 <= ts < float(x.get('hold_until') or 0) + late:
+            cands.append(x)
+    if not cands:
+        b = ops_bk_holding(cp_id, connector, now)
+        if b is not None:                          # somebody else's session (it began before the hold): wait for the connector
+            _bk_wait(b, 'occupied', now)
+            _bk_save(True)
+        return
+    cands.sort(key=lambda x: (x.get('conn') != connector, x.get('state') not in OPS_BK_ACTIVE, abs(float(x.get('start') or 0) - ts)))
+    b = cands[0]
+    _bk_mark_used(b, txn_id, connector, tag, ts)
+
+
+@ops_on('tx_stop')
+def _ops_bk_tx_stop(cp_id=None, txn_id=None, **kw):
+    now = ops_now()
+    for b in ops_bookings.data.values():
+        if b.get('state') == 'used' and b.get('cp') == cp_id and b.get('txn') == txn_id and not b.get('done_at') \
+                and float(b.get('used_at') or 0) > now - 3 * 86400:
+            b['done_at'] = now                     # exact: a booking made right after must not overlap by rounding
+            _bk_save(True)
+            break
+
+
+@ops_on('status')
+def _ops_bk_status(cp_id=None, connector=None, status='', **kw):
+    try:
+        conn = int(connector)
+    except (TypeError, ValueError):
+        return
+    if conn > 0:
+        seen = ops_cfg('booking_conns', {})
+        lst = seen.setdefault(cp_id, []) if isinstance(seen, dict) else []
+        if conn not in lst:
+            lst.append(conn)
+            lst.sort()
+            ops_settings.save()
+    now = ops_now()
+    for b in _bk_active_for(cp_id):
+        if b.get('conn') != conn or b.get('id') in _BK_BUSY:
+            continue
+        st = b.get('state')
+        if status in ('Faulted', 'Unavailable') and st == 'held':
+            _bk_wait(b, status.lower(), now)       # the charger ends its reservation itself (OCPP 1.6 5.13): wait for the repair
+            b['next_try'] = round(now + 20, 1)
+        elif status in ('Available', 'Preparing') and st == 'waiting':
+            b['next_try'] = 0                      # the connector may be free now: ask the charger again at once
+        elif status == 'Available' and st == 'held' and b.get('via') == 'ocpp' and now - float(b.get('reserved_at') or 0) > 3:
+            b['reassert_at'] = round(now + 5, 1)   # the charger dropped the reservation (reboot?): ReserveNow again
+
+
+@ops_on('connect')
+def _ops_bk_connect(cp_id=None, **kw):
+    for b in _bk_active_for(cp_id):
+        if b.get('state') == 'waiting':
+            b['next_try'] = 0
+
+
+@ops_on('disconnect')
+def _ops_bk_disconnect(cp_id=None, **kw):
+    now = ops_now()
+    for b in _bk_active_for(cp_id):
+        if b.get('state') == 'held' and float(b.get('hold_from') or 0) <= now and b.get('id') not in _BK_BUSY:
+            _bk_wait(b, 'offline', now)            # nobody can start there now; kept again when the charger is back
+
+
+# ---- background ---------------------------------------------------------------------------------------------------
+async def ops_bk_tick():
+    now = ops_now()
+    started = _BK_STATE.setdefault('started', now)    # first check after the CSMS (re)started
+    for b in _bk_active_all():
+        st = b.get('state')
+        if st not in OPS_BK_ACTIVE or b.get('id') in _BK_BUSY:
+            continue
+        hu = float(b.get('hold_until') or 0)
+        if now >= hu:
+            if st == 'starting' and now < hu + 120:
+                continue                          # the driver pressed Start at the last moment
+            if hu < started - 30:
+                _bk_finish(b, 'missed', 'csms', flush=False)   # the window ended while the CSMS was not running
+            elif st in ('held', 'starting'):
+                _bk_finish(b, 'no_show', 'window', flush=False)
+            else:
+                _bk_finish(b, 'missed', b.get('wait_reason') or ('csms' if st == 'booked' else 'window'), flush=False)
+            continue
+        if st == 'booked' and now >= float(b.get('hold_from') or 0):
+            _bk_spawn(ops_bk_activate(b))
+        elif st == 'waiting' and now >= float(b.get('next_try') or 0):
+            b['next_try'] = round(now + 20, 1)
+            _bk_spawn(ops_bk_activate(b))
+        elif st == 'starting' and now - float(b.get('start_at') or now) > 180:
+            back = b.pop('pre_start', '') or 'held'     # the start did not happen: as before
+            b['state'] = 'booked' if back == 'booked' and now < float(b.get('hold_from') or 0) else ('waiting' if back == 'waiting' else 'held')
+            b['next_try'] = 0
+            _bk_save()
+            if b['state'] != 'booked':
+                _bk_spawn(ops_bk_activate(b))
+        elif st == 'held' and b.get('via') == 'ocpp' and (now >= float(b.get('reassert_at') or 9e18) or now - float(b.get('reserved_at') or now) > 60):
+            b.pop('reassert_at', None)
+            raw = _bk_raw(b['cp'])
+            cst = raw['conns'].get(b['conn']) or {}
+            if raw['connected'] and cst.get('status') == 'Available' and not cst.get('busy'):
+                logger.info(f"📅 booking {b['id']}: the charger shows connector {b['conn']} Available again - ReserveNow again")
+                b['reserved_at'] = round(now, 1)
+                _bk_spawn(ops_bk_activate(b))
+    for k, t in list(_BK_REFUSED.items()):
+        if now - t > 120:
+            _BK_REFUSED.pop(k, None)
+    if now - _BK_STATE['last_clean'] > 3600:
+        _BK_STATE['last_clean'] = now
+        cfg = ops_bk_cfg()
+        keep = float(cfg.get('keep_days') or 90) * 86400
+        keep_ns = max(keep, (float(cfg.get('noshow_days') or 30) + float(cfg.get('block_days') or 0) + 1) * 86400)
+        old = [k for k, b in ops_bookings.data.items() if b.get('state') in OPS_BK_ENDED
+               and float(b.get('ended') or b.get('end') or now) < now - (keep_ns if b.get('state') == 'no_show' else keep)]
+        for k in old:
+            ops_bookings.data.pop(k, None)
+        if old:
+            _bk_save()
+    _bk_flush()
+
+
+async def ops_bk_loop():
+    while True:
+        try:
+            await ops_bk_tick()
+        except Exception as e:
+            logger.error(f"booking: background check failed: {e}")
+        await asyncio.sleep(max(1.0, min(5.0, float(os.environ.get('OPS_TICK', '5') or 5))))
+
+OPS_TASKS.append(ops_bk_loop)
+
+
+# ---- views ----------------------------------------------------------------------------------------------------------
+def ops_bk_view(b: dict, full: bool = True) -> dict:
+    out = {k: b.get(k) for k in ('id', 'rid', 'cp', 'conn', 'kind', 'start', 'end', 'minutes', 'hold_from', 'hold_until', 'state',
+                                 'via', 'ocpp', 'reason', 'wait_reason', 'created', 'ended', 'used_at', 'txn', 'source')}
+    out['station'] = _bk_station_name(b.get('cp'))
+    if full:
+        out.update({k: b.get(k) for k in ('customer', 'id_tag', 'name', 'phone', 'plate', 'note', 'by', 'tries', 'cancel_note',
+                                          'cancelled_by', 'forgiven', 'used_conn', 'cancel_ocpp')})
+    return out
+
+
+def _bk_can(request, perm: str) -> bool:
+    u = ops_request_user(request)
+    return perm in ops_role_perms(u.get('role') or 'viewer')
+
+
+def _bk_mask_text(v: str, keep: int = 2) -> str:
+    s = str(v or '')
+    return ('•••' + s[-keep:]) if len(s) > keep else ('•••' if s else '')
+
+
+def _bk_mask(v: dict) -> dict:
+    """Driver details for users without the customers permission: no names, numbers, plates or card ids."""
+    out = dict(v)
+    name = str(out.get('name') or '').split()
+    out['name'] = (name[0] + (' ' + name[-1][:1] + '.' if len(name) > 1 else '')) if name else ''
+    out['phone'] = _bk_mask_text(out.get('phone'), 3)
+    out['plate'] = _bk_mask_text(out.get('plate'), 2)
+    if out.get('id_tag') and not str(out['id_tag']).startswith('BK'):
+        out['id_tag'] = _bk_mask_text(out['id_tag'], 2)
+    if out.get('customer'):
+        out['customer'] = 'app'
+    for k in ('who', 'used_tag'):
+        if out.get(k):
+            out[k] = ''
+    return out
+
+
+def _bk_stations_for_console() -> list:
+    out = []
+    for s in app_state.station_records():
+        if s.get('registration_status') != 'Accepted':
+            continue
+        raw = _bk_raw(s['id'])
+        out.append({'id': s['id'], 'name': _bk_station_name(s['id']), 'online': bool(raw.get('connected')),
+                    'connectors': list(raw['conns']), 'bookable': _bk_charger_allowed(s['id']) and bool(raw['conns'])})
+    return out
+
+
+def _bk_stats(now: float) -> dict:
+    day0 = ops_day_start(ops_dt(now).strftime('%Y-%m-%d'))
+    rows = list(ops_bookings.data.values())
+    last30 = [b for b in rows if b.get('state') in OPS_BK_ENDED and float(b.get('ended') or 0) >= now - 30 * 86400]
+    used = sum(1 for b in last30 if b.get('state') == 'used')
+    noshow = sum(1 for b in last30 if b.get('state') == 'no_show')
+    return {'active': sum(1 for b in rows if b.get('state') in OPS_BK_ACTIVE),
+            'holding': sum(1 for b in rows if b.get('state') in OPS_BK_HOLDING),
+            'today': sum(1 for b in rows if day0 <= float(b.get('start') or 0) < day0 + 86400 and b.get('state') != 'cancelled'),
+            'upcoming': sum(1 for b in rows if b.get('state') == 'booked'),
+            'used_30': used, 'noshow_30': noshow, 'show_rate': round(100.0 * used / (used + noshow), 1) if used + noshow else None,
+            'via_csms': sum(1 for b in rows if b.get('state') in OPS_BK_HOLDING and b.get('via') == 'csms')}
+
+
+def _bk_blocked_list(now: float) -> list:
+    rows, last, out = _bk_noshow_rows(now), {}, []
+    for b in ops_bookings.data.values():
+        if b.get('state') == 'no_show':
+            w = _bk_who(b)
+            if w in rows and float(b.get('ended') or 0) >= float((last.get(w) or {}).get('ended') or 0):
+                last[w] = b
+    for w, ended in rows.items():
+        ns, b = _bk_noshow_info(ended, now), last.get(w) or {}
+        if not ns['n'] and not ns['blocked_until']:
+            continue
+        out.append({'who': w, 'customer': b.get('customer') or '', 'id_tag': '' if b.get('customer') else b.get('id_tag'),
+                    'name': b.get('name') or '', 'phone': b.get('phone') or '', 'n': ns['n'], 'blocked_until': ns['blocked_until']})
+    out.sort(key=lambda x: (-(x['blocked_until'] or 0), -x['n']))
+    return out
+
+
+# ---- console API ----------------------------------------------------------------------------------------------------
+async def ops_api_booking(request):
+    now = ops_now()
+    q = request.query
+    t0, t1 = ops_range_from_query(q, 7)
+    if not q.get('from') and not q.get('to'):
+        t0, t1 = now - 86400, now + float(ops_bk_cfg().get('max_days') or 7) * 86400 + 86400
+    text = str(q.get('q') or '').strip().lower()
+    state = str(q.get('state') or '').strip()
+    pii = _bk_can(request, 'view_customers')
+    rows = []
+    for b in ops_bookings.data.values():
+        active = b.get('state') in OPS_BK_ACTIVE
+        if not active and not (t0 <= float(b.get('start') or 0) < t1):
+            continue
+        if state == 'active' and not active or state and state not in ('active',) and b.get('state') != state:
+            continue
+        v = ops_bk_view(b)
+        fields = ('id', 'cp', 'station', 'name', 'phone', 'id_tag', 'plate', 'customer', 'note') if pii else ('id', 'cp', 'station', 'note')
+        if text and text not in ' '.join(str(v.get(k) or '') for k in fields).lower():
+            continue
+        rows.append(v if pii else _bk_mask(v))
+    rows.sort(key=lambda v: (v['state'] not in OPS_BK_ACTIVE, v['start'] if v['state'] in OPS_BK_ACTIVE else -float(v['start'] or 0)))
+    blocked = _bk_blocked_list(now)
+    return ops_json({'cfg': ops_bk_cfg(), 'bookings': rows[:1000], 'stats': _bk_stats(now), 'stations': _bk_stations_for_console(),
+                     'blocked': blocked if pii else [_bk_mask(x) for x in blocked], 'pii': pii, 'now': now, 'from': t0, 'to': t1})
+
+
+async def ops_api_booking_create(request):
+    b = await ops_body(request)
+    user = ops_request_user(request).get('username', '?')
+    owner = {'name': b.get('name'), 'phone': b.get('phone'), 'plate': b.get('plate')}
+    login = str(b.get('login') or '').strip()
+    if login:
+        if not _bk_can(request, 'view_customers'):
+            return ops_err('Booking for an app account needs the permission to see customers - use an RFID card', 403)
+        cust = customers.by_login(login) or customers.get(login)
+        if cust is None:
+            return ops_err('No app account with this mobile number / e-mail', 404)
+        owner.update(customer=cust['id'], name=owner.get('name') or cust.get('name'), phone=owner.get('phone') or cust.get('phone'),
+                     plate=owner.get('plate') or cust.get('plate'))
+    elif str(b.get('id_tag') or '').strip():
+        owner['id_tag'] = str(b['id_tag']).strip().upper()[:20]
+    bk, err = await ops_bk_create(b, owner, by=user, app=False)
+    if err:
+        msg, status, vars_ = err
+        for k, v in vars_.items():
+            msg = msg.replace('{' + k + '}', str(v))
+        return ops_err(msg, status)
+    v = ops_bk_view(bk)
+    return ops_json({'ok': True, 'booking': v if _bk_can(request, 'view_customers') else _bk_mask(v)})
+
+
+async def ops_api_booking_cancel(request):
+    b = await ops_body(request)
+    bk = ops_bookings.data.get(str(b.get('id') or '').strip().upper())
+    if bk is None:
+        return ops_err('Unknown booking', 404)
+    if not ops_bk_cancel(bk, ops_request_user(request).get('username', 'operator'), b.get('note') or b.get('reason') or ''):
+        return ops_err('This booking has already ended', 409)
+    v = ops_bk_view(bk)
+    return ops_json({'ok': True, 'booking': v if _bk_can(request, 'view_customers') else _bk_mask(v)})
+
+
+async def ops_api_booking_unblock(request):
+    b = await ops_body(request)
+    who = str(b.get('who') or '').strip()
+    n = 0
+    for x in ops_bookings.data.values():
+        if x.get('state') == 'no_show' and not x.get('forgiven') and who and \
+                (x.get('customer') == who or (not x.get('customer') and str(x.get('id_tag') or '').upper() == who.upper())):
+            x['forgiven'] = ops_request_user(request).get('username', '?')
+            n += 1
+    if not n:
+        return ops_err('Nothing to unblock', 404)
+    _bk_save(True)
+    return ops_json({'ok': True, 'forgiven': n})
+
+
+def _bk_num(v, lo, hi, default, integer=False):
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return default
+    if not _bk_math.isfinite(x):
+        return default
+    x = max(lo, min(hi, x))
+    return int(round(x)) if integer else round(x, 2)
+
+
+async def ops_api_booking_config(request):
+    b = await ops_body(request)
+    cfg = ops_bk_cfg()
+    for k in ('on', 'app'):
+        if k in b:
+            cfg[k] = bool(b[k])
+    if 'chargers' in b:
+        cfg['chargers'] = ', '.join(x.strip() for x in str(b.get('chargers') or '').replace(';', ',').split(',') if x.strip())[:2000]
+    limits = {'now_hold_min': (0.05, 240), 'step_min': (1, 60), 'max_days': (0, 60), 'min_ahead_min': (0, 1440), 'lead_min': (0, 60),
+              'grace_min': (0.05, 120), 'max_active': (1, 10), 'noshow_limit': (0, 50), 'noshow_days': (1, 365), 'block_days': (0, 365),
+              'keep_days': (7, 3650), 'max_per_day': (1, 100), 'call_timeout_s': (2, 60)}
+    for k, (lo, hi) in limits.items():
+        if k in b:
+            cfg[k] = _bk_num(b[k], lo, hi, cfg.get(k), integer=k in ('step_min', 'max_active', 'noshow_limit', 'keep_days', 'max_per_day'))
+    if 'durations' in b:
+        vals = b['durations'] if isinstance(b['durations'], list) else str(b['durations']).replace(';', ',').split(',')
+        ds = sorted({_bk_num(x, 0.05, 1440, None) for x in vals if str(x).strip()} - {None})
+        if not ds:
+            return ops_err('Give at least one booking length (minutes)')
+        cfg['durations'] = [int(x) if float(x).is_integer() else x for x in ds][:12]
+    ops_settings.save()
+    return ops_json({'ok': True, 'cfg': cfg})
+
+
+async def ops_api_booking_csv(request):
+    t0, t1 = ops_range_from_query(request.query, 30)
+    if not request.query.get('to'):
+        t1 = max(t1, ops_now() + 61 * 86400)          # bookings ahead are included
+    pii = _bk_can(request, 'view_customers')
+    cols = ['id', 'state', 'kind', 'cp', 'station', 'conn', 'start', 'end', 'minutes', 'hold_from', 'hold_until', 'via', 'ocpp',
+            'customer', 'id_tag', 'name', 'phone', 'plate', 'source', 'by', 'reason', 'used_at', 'txn', 'note']
+    rows = [ops_bk_view(b) for b in ops_bookings.data.values() if t0 <= float(b.get('start') or 0) < t1]
+    if not pii:
+        rows = [_bk_mask(v) for v in rows]
+    rows.sort(key=lambda v: v['start'] or 0)
+    buf = _ops_io.StringIO()
+    w = _ops_csv.writer(buf)
+    w.writerow([c + (' (BTT)' if c in ('start', 'end', 'hold_from', 'hold_until', 'used_at') else '') for c in cols])
+    for v in rows:
+        vals = []
+        for c in cols:
+            x = v.get(c)
+            if c in ('start', 'end', 'hold_from', 'hold_until', 'used_at'):
+                x = ops_dt(float(x)).strftime('%Y-%m-%d %H:%M') if x else ''
+            elif c == 'reason':
+                x = OPS_BK_REASONS.get(x or '', x or '')
+            vals.append(ops_csv_safe('' if x is None else x))
+        w.writerow(vals)
+    name = 'csms_bookings_%s.csv' % ops_dt().strftime('%Y%m%d_%H%M')
+    return web.Response(body=('﻿' + buf.getvalue()).encode('utf-8'), content_type='text/csv',
+                        headers={'Content-Disposition': f'attachment; filename="{name}"'})
+
+
+# ---- app API ----------------------------------------------------------------------------------------------------------
+def _bk_msg_text(err):
+    msg, status, vars_ = err
+    out = msg
+    for k, v in vars_.items():
+        out = out.replace('{' + k + '}', str(v))
+    return out, status, msg, vars_
+
+
+async def handle_app_bookings(request):
+    c = _app_customer(request)
+    if c is None:
+        return _app_unauth()
+    now = ops_now()
+    mine = [b for b in ops_bookings.data.values() if b.get('customer') == c['id'] and
+            (b.get('state') in OPS_BK_ACTIVE or float(b.get('ended') or b.get('end') or 0) >= now - 30 * 86400)]
+    mine.sort(key=lambda b: (b.get('state') not in OPS_BK_ACTIVE, float(b.get('start') or 0) * (1 if b.get('state') in OPS_BK_ACTIVE else -1)))
+    ns = ops_bk_noshows(c['id'], now)
+    cfg = ops_bk_public_cfg()
+    return _app_json({'cfg': cfg, 'enabled': bool(cfg['on'] and cfg['app']), 'bookings': [ops_bk_view(b, False) for b in mine[:40]],
+                      'noshows': ns['n'], 'blocked_until': ns['blocked_until'], 'now': now})
+
+
+async def handle_app_booking_availability(request):
+    c = _app_customer(request)
+    if c is None:
+        return _app_unauth()
+    cp = str(request.query.get('cp') or '').strip()
+    if not cp or not (cp in app_state.cp_registrations or cp in app_state.cp_data) or app_state.get_cp_registration_status(cp) != 'Accepted':
+        return web.json_response({'error': 'Station not found'}, status=404)
+    now = ops_now()
+    day = str(request.query.get('date') or ops_dt(now).strftime('%Y-%m-%d'))[:10]
+    try:
+        d0 = ops_day_start(day)
+    except ValueError:
+        d0 = ops_day_start(ops_dt(now).strftime('%Y-%m-%d'))
+        day = ops_dt(now).strftime('%Y-%m-%d')
+    known = _bk_raw(cp)['conns']
+    pub = ops_bk_mark_station(_pay_station_public_raw(cp), c['id'])
+    conns = []
+    for cn in pub['connectors']:
+        if cn['id'] not in known:
+            continue
+        taken = []
+        for b in ops_bookings.data.values():
+            if b.get('cp') != cp or b.get('conn') != cn['id'] or (b.get('state') not in OPS_BK_ACTIVE and b.get('state') != 'used'):
+                continue
+            f, u = _bk_block(b)
+            if f < d0 + 86400 and d0 < u and u > now:
+                taken.append({'from': f, 'to': u, 'mine': b.get('customer') == c['id']})
+        taken.sort(key=lambda x: x['from'])
+        conns.append({'id': cn['id'], 'status': cn['status'], 'busy': cn['busy'], 'booking': cn.get('booking'), 'taken': taken})
+    cfg = ops_bk_public_cfg()
+    bookable = bool(cfg['on'] and cfg['app'] and _bk_charger_allowed(cp) and conns and not (station_info.data.get(cp) or {}).get('hidden'))
+    return _app_json({'cp': cp, 'name': _bk_station_name(cp), 'online': pub['connected'], 'date': day, 'day_start': d0, 'now': now,
+                      'connectors': conns, 'cfg': cfg, 'enabled': bookable,
+                      'earliest': now + float(cfg.get('min_ahead_min') or 0) * 60, 'latest': now + float(cfg.get('max_days') or 7) * 86400})
+
+
+async def handle_app_booking_create(request):
+    d = await _app_body(request)
+    c = _app_customer(request, d)
+    if c is None:
+        return _app_unauth()
+    if not _pay_rate_ok(_client_ip(request), 'booking', 20):
+        return web.json_response({'error': 'Too many requests - please wait a minute'}, status=429)
+    owner = {'customer': c['id'], 'name': c.get('name'), 'phone': c.get('phone'), 'plate': c.get('plate')}
+    bk, err = await ops_bk_create(d, owner, by='app', app=True)
+    if err:
+        text, status, key, vars_ = _bk_msg_text(err)
+        return web.json_response({'error': text, 'error_key': key, 'error_vars': vars_}, status=status)
+    return _app_json({'ok': True, 'booking': ops_bk_view(bk, False)})
+
+
+async def handle_app_booking_cancel(request):
+    d = await _app_body(request)
+    c = _app_customer(request, d)
+    if c is None:
+        return _app_unauth()
+    bk = ops_bookings.data.get(str(d.get('id') or '').strip().upper())
+    if bk is None or bk.get('customer') != c['id']:
+        return web.json_response({'error': 'Booking not found'}, status=404)
+    if not ops_bk_cancel(bk, 'app', driver=True):
+        return web.json_response({'error': 'This booking has already ended'}, status=409)
+    return _app_json({'ok': True, 'booking': ops_bk_view(bk, False)})
+
+
+async def handle_app_booking_js(request):
+    return web.Response(text=OPS_BOOKING_APP_JS, content_type='application/javascript', headers={'Cache-Control': 'no-cache'})
+
+
+_ops_bk_orig_app_index = handle_app_index
+
+
+async def handle_app_index(request):
+    resp = await _ops_bk_orig_app_index(request)
+    try:
+        if isinstance(resp, web.Response) and resp.text and '</body>' in resp.text:
+            resp.text = resp.text.replace('</body>', '<script src="/app/booking.js" defer></script></body>', 1)
+    except Exception:
+        pass
+    return resp
+
+
+OPS_ROUTES += [
+    ('GET', '/api/ops/booking', ops_api_booking), ('GET', '/api/ops/booking/bookings.csv', ops_api_booking_csv),
+    ('POST', '/api/ops/booking/create', ops_api_booking_create), ('POST', '/api/ops/booking/cancel', ops_api_booking_cancel),
+    ('POST', '/api/ops/booking/unblock', ops_api_booking_unblock), ('POST', '/api/ops/booking/config', ops_api_booking_config),
+    ('GET', '/app/booking.js', handle_app_booking_js), ('GET', '/api/app/bookings', handle_app_bookings),
+    ('GET', '/api/app/booking/availability', handle_app_booking_availability),
+    ('POST', '/api/app/booking', handle_app_booking_create), ('POST', '/api/app/booking/cancel', handle_app_booking_cancel),
+]
+
+OPS_BOOKING_APP_JS = r'''/* [OPS] v1.12 BPC EV app: pre-booking of connectors - "Reserve now" or a time slot ahead, My bookings, cards on Home and the station page */
+(function () {
+  'use strict';
+  var A = window.BPCAPP;
+  if (!A) return;
+  var TZ = 'Asia/Thimphu';
+  var cache = {t: 0, data: null};
+  var form = {cp: '', conn: 0, mode: 'slot', date: '', dur: 0, time: null, avail: null};
+
+  function tr(k, v) { return A.tr(k, v); }
+  function trh(k, v) { return A.trh(k, v); }
+  function esc(s) { return A.esc(s); }
+  function hm(t) { try { return new Date(t * 1000).toLocaleTimeString('en-GB', {hour: '2-digit', minute: '2-digit', hour12: false, timeZone: TZ}); } catch (e) { return new Date(t * 1000 + 6 * 3600 * 1000).toISOString().slice(11, 16); } }
+  function loc() { return A.lang() === 'th' ? 'th-TH-u-ca-gregory' : 'en-GB'; }   // dates in the app language (Dzongkha: English dates, as in Bhutan)
+  function dayLabel(t) { try { return new Date(t * 1000).toLocaleDateString(loc(), {weekday: 'short', day: 'numeric', month: 'short', timeZone: TZ}); } catch (e) { return new Date(t * 1000 + 6 * 3600 * 1000).toISOString().slice(0, 10); } }
+  function ymd(t) { var d = new Date(t * 1000 + 6 * 3600 * 1000); return d.toISOString().slice(0, 10); }
+  function active(b) { return ['booked', 'waiting', 'held', 'starting'].indexOf(b.state) >= 0; }
+  var STATE = {booked: ['Booked', 'info'], waiting: ['Waiting for the connector', 'warn'], held: ['Connector kept for you', 'ok'], starting: ['Starting…', 'info'],
+    used: ['Used', 'ok'], cancelled: ['Cancelled', ''], no_show: ['Missed', 'bad'], missed: ['Could not be kept', 'warn']};
+
+  async function bookings(force) {
+    if (!force && cache.data && Date.now() - cache.t < 20000) return cache.data;
+    var r = await A.api('/api/app/bookings');
+    if (!r.error) { cache.data = r; cache.t = Date.now(); }
+    return r;
+  }
+
+  function bookingCard(b, compact) {
+    var st = STATE[b.state] || [b.state, ''];
+    var when = b.kind === 'now' ? trh('Kept until {t}', {t: hm(b.hold_until)}) : esc(dayLabel(b.start)) + ' · <b>' + esc(hm(b.start)) + '–' + esc(hm(b.end)) + '</b>';
+    var html = '<div class="card bk-card" data-bk="' + esc(b.id) + '"><div class="row"><div class="grow"><div class="muted">📅 ' + trh(b.kind === 'now' ? 'Reserved now' : 'Booked time') + ' · ' + esc(b.id) + '</div>' +
+      '<div style="font-weight:800">' + esc(b.station) + ' · ' + trh('Connector {n}', {n: b.conn}) + '</div><div class="muted">' + when + '</div></div>' +
+      '<span class="chip ' + st[1] + '">' + trh(st[0]) + '</span></div>';
+    if (active(b)) {
+      if (b.state === 'held' || b.state === 'starting') html += '<div class="note">' + trh('Start charging by {t} (BTT) - after that the booking ends.', {t: hm(b.hold_until)}) + '</div>';
+      else if (b.state === 'waiting') html += '<div class="note">' + trh('The connector is not free yet - we keep it for you as soon as it is free (until {t}, BTT).', {t: hm(b.hold_until)}) + '</div>';
+      else html += '<div class="muted" style="margin-top:0.4rem">' + trh('The connector is kept for you from {a}. Start charging by {b}.', {a: hm(b.hold_from), b: hm(b.hold_until)}) + '</div>';
+      html += '<div class="row" style="margin-top:0.5rem;flex-wrap:wrap">' +
+        (b.state === 'held' || b.state === 'starting' ? '<a class="btn sm" href="#/charge/' + encodeURIComponent(b.cp) + '/' + b.conn + '">⚡ ' + trh('Start charging') + '</a>' : '') +
+        '<a class="btn sec sm" href="#/station/' + encodeURIComponent(b.cp) + '">🗺️ ' + trh('Station') + '</a>' +
+        (compact ? '<a class="btn sec sm" href="#/bookings">' + trh('My bookings') + '</a>' : '<button class="btn bad sm" data-cancel="' + esc(b.id) + '">✖ ' + trh('Cancel booking') + '</button>') + '</div>';
+    } else if (b.reason && !compact) {
+      html += '<div class="muted" style="margin-top:0.3rem">' + trh(b.reason === 'driver' ? 'You cancelled it' : b.reason === 'operator' ? 'Cancelled by the operator' : b.reason === 'window' ? 'Charging did not start in time' : b.state === 'missed' ? 'The charger could not keep it - not counted as missed' : '') + '</div>';
+    }
+    return html + '</div>';
+  }
+
+  function wireCancel(root, after) {
+    root.querySelectorAll('[data-cancel]').forEach(function (btn) {
+      btn.onclick = async function () {
+        if (!window.confirm(tr('Cancel booking {id}?', {id: btn.dataset.cancel}))) return;
+        btn.disabled = true;
+        var r = await A.api('/api/app/booking/cancel', {method: 'POST', body: {id: btn.dataset.cancel}});
+        btn.disabled = false;
+        if (r.error) return A.toast(tr(r.error));
+        A.toast(tr('Booking cancelled'));
+        cache.t = 0;
+        after();
+      };
+    });
+  }
+
+  // ---- My bookings
+  async function viewBookings() {
+    A.navActive('account');
+    A.wrap('<div class="card"><div class="muted">' + trh('Loading…') + '</div></div>');
+    var r = await bookings(true);
+    if (r.error) return A.wrap('<div class="card"><div class="err show">' + esc(tr(r.error)) + '</div></div>');
+    var list = r.bookings || [];
+    var act = list.filter(active), past = list.filter(function (b) { return !active(b); });
+    var html = '<div class="card"><h1 style="margin:0 0 0.3rem">📅 ' + trh('My bookings') + '</h1><div class="muted">' +
+      (r.enabled ? trh('Book a connector now or for later from the station page. Booking is free.') : trh('Booking is not available at the moment.')) + '</div>' +
+      (r.blocked_until ? '<div class="err show">' + trh('You missed {n} bookings - you can book again from {d}.', {n: r.noshows, d: esc(dayLabel(r.blocked_until))}) + '</div>' :
+        (r.noshows ? '<div class="note">' + trh('Missed bookings: {n} of {l} in {d} days.', {n: r.noshows, l: r.cfg.noshow_limit || '-', d: r.cfg.noshow_days}) + '</div>' : '')) +
+      (r.enabled ? '<a class="btn" href="#/map">🗺️ ' + trh('Find a charger to book') + '</a>' : '') + '</div>';
+    html += act.map(function (b) { return bookingCard(b, false); }).join('');
+    if (past.length) html += '<div class="card"><h2>' + trh('Earlier bookings') + '</h2>' + past.map(function (b) {
+      var st = STATE[b.state] || [b.state, ''];
+      return '<div class="row" style="padding:0.45rem 0;border-top:1px solid var(--line)"><div class="grow"><b>' + esc(b.station) + '</b> · ' + trh('Connector {n}', {n: b.conn}) +
+        '<div class="muted">' + esc(dayLabel(b.start)) + ' ' + esc(hm(b.start)) + (b.kind === 'slot' ? '–' + esc(hm(b.end)) : '') + '</div></div><span class="chip ' + st[1] + '">' + trh(st[0]) + '</span></div>';
+    }).join('') + '</div>';
+    A.wrap(html);
+    wireCancel(document.getElementById('view'), viewBookings);
+  }
+
+  // ---- booking form for one station
+  function slotFree(t, conn, dur, lead) {
+    var a = t - lead * 60, z = t + dur * 60;
+    return !(conn.taken || []).some(function (x) { return a < x.to && x.from < z; });
+  }
+
+  async function loadAvail() {
+    var r = await A.api('/api/app/booking/availability?cp=' + encodeURIComponent(form.cp) + '&date=' + encodeURIComponent(form.date));
+    form.avail = r;
+    return r;
+  }
+
+  async function viewBook(args) {
+    A.navActive('map');
+    var cp = args[0] || '';
+    if (form.cp !== cp) form = {cp: cp, conn: parseInt(args[1] || '0', 10) || 0, mode: 'slot', date: '', dur: 0, time: null, avail: null};
+    A.wrap('<div class="card"><div class="muted">' + trh('Loading…') + '</div></div>');
+    var mine = await bookings(true);
+    var r = await loadAvail();
+    if (r.error) return A.wrap('<div class="card"><div class="err show">' + esc(tr(r.error)) + '</div><a class="btn sec" href="#/map">' + trh('Back') + '</a></div>');
+    if (!form.date) form.date = r.date;
+    if (!form.conn || !r.connectors.some(function (c) { return c.id === form.conn; })) form.conn = (r.connectors[0] || {}).id || 1;
+    if (!form.dur) form.dur = (r.cfg.durations || [60])[Math.min(1, (r.cfg.durations || [60]).length - 1)];
+    render(mine);
+  }
+
+  function render(mine) {
+    var r = form.avail, cfg = r.cfg, now = r.now;
+    var activeMine = (mine && mine.bookings || []).filter(active);
+    var html = '<div class="card"><div class="row"><div class="grow"><div class="muted">📅 ' + trh('Book a connector') + '</div><h1 style="margin:0">' + esc(r.name) + '</h1></div>' +
+      '<span class="chip ' + (r.online ? 'ok' : 'bad') + '">' + trh(r.online ? 'Online' : 'Offline') + '</span></div>';
+    if (!r.enabled) {
+      A.wrap(html + '<div class="err show">' + trh('Booking is not available at this station.') + '</div><a class="btn sec" href="#/station/' + encodeURIComponent(form.cp) + '">' + trh('Back') + '</a></div>');
+      return;
+    }
+    if (mine && mine.blocked_until) html += '<div class="err show">' + trh('You missed {n} bookings - you can book again from {d}.', {n: mine.noshows, d: esc(dayLabel(mine.blocked_until))}) + '</div>';
+    else if (activeMine.length >= (cfg.max_active || 1)) html += '<div class="note">' + trh('You already have a booking ({id}) - cancel it first to book another one.', {id: esc(activeMine[0].id)}) + ' <a href="#/bookings">' + trh('My bookings') + '</a></div>';
+    html += '<label>' + trh('Connector') + '</label><div class="conns">' + r.connectors.map(function (c) {
+      var lab = c.booking && c.booking.mine ? ['Your booking', 'ok'] : c.status === 'Reserved' ? ['Reserved', 'warn'] : c.busy ? ['Busy', 'warn'] : [c.status === 'Unknown' ? 'Available' : c.status, c.status === 'Available' || c.status === 'Unknown' ? 'ok' : ''];
+      return '<button class="conn' + (form.conn === c.id ? ' sel' : '') + '" data-c="' + c.id + '"><b>' + trh('Connector {n}', {n: c.id}) + '</b><span class="chip ' + lab[1] + '">' + trh(lab[0]) + '</span></button>';
+    }).join('') + '</div>';
+    html += '<div class="bk-seg"><button class="' + (form.mode === 'now' ? 'sel' : '') + '" data-mode="now">⚡ ' + trh('Reserve now') + '</button><button class="' + (form.mode === 'slot' ? 'sel' : '') + '" data-mode="slot">🗓️ ' + trh('Book a time') + '</button></div>';
+    var conn = r.connectors.find(function (c) { return c.id === form.conn; }) || r.connectors[0];
+    if (form.mode === 'now') {
+      var nowOk = r.online && conn && !conn.busy && conn.status !== 'Reserved' && slotFree(now, conn, cfg.now_hold_min, 0);
+      html += '<div class="note">' + trh('We keep connector {n} for you for {m} minutes from now. Start charging within that time.', {n: form.conn, m: cfg.now_hold_min}) + '</div>' +
+        (nowOk ? '' : '<div class="err show">' + trh('This connector is not free right now - choose another connector or book a time.') + '</div>') +
+        '<div class="err" id="bkErr"></div><button class="btn" id="bkGo"' + (nowOk ? '' : ' disabled') + '>⚡ ' + trh('Reserve connector {n} now', {n: form.conn}) + '</button>';
+    } else {
+      var days = [];
+      var today0 = Math.floor((now + 6 * 3600) / 86400) * 86400 - 6 * 3600;
+      for (var i = 0; i <= Math.max(0, Math.floor(cfg.max_days)); i++) days.push(today0 + i * 86400);
+      html += '<label>' + trh('Day') + '</label><div class="bk-chips">' + days.map(function (t) {
+        var v = ymd(t);
+        return '<button class="' + (v === form.date ? 'sel' : '') + '" data-day="' + v + '">' + (t === today0 ? trh('Today') : t === today0 + 86400 ? trh('Tomorrow') : esc(dayLabel(t))) + '</button>';
+      }).join('') + '</div>';
+      html += '<label>' + trh('How long') + '</label><div class="bk-chips">' + (cfg.durations || []).map(function (m) {
+        return '<button class="' + (Number(m) === Number(form.dur) ? 'sel' : '') + '" data-dur="' + m + '">' + (m >= 60 && m % 60 === 0 ? trh('{h} h', {h: m / 60}) : trh('{m} min', {m: m})) + '</button>';
+      }).join('') + '</div>';
+      var step = Math.max(5, cfg.step_min || 15) * 60, times = [];
+      for (var t = r.day_start; t < r.day_start + 86400; t += step) {
+        if (t < r.earliest || t > r.latest) continue;
+        times.push({t: t, ok: slotFree(t, conn, form.dur, cfg.lead_min)});
+      }
+      if (form.time && !times.some(function (x) { return x.t === form.time && x.ok; })) form.time = null;
+      html += '<label>' + trh('Start time (BTT)') + '</label>' + (times.length ? '<div class="bk-times">' + times.map(function (x) {
+        return '<button ' + (x.ok ? '' : 'disabled ') + 'class="' + (form.time === x.t ? 'sel' : '') + '" data-time="' + x.t + '">' + esc(hm(x.t)) + '</button>';
+      }).join('') + '</div>' : '<div class="muted">' + trh('No start times left on this day.') + '</div>');
+      if (form.time) html += '<div class="note">' + trh('Connector {n} · {d} {a}–{b}. It is kept for you from {k}; start charging by {g}.', {n: form.conn, d: esc(dayLabel(form.time)), a: esc(hm(form.time)), b: esc(hm(form.time + form.dur * 60)),
+        k: esc(hm(Math.max(now, form.time - cfg.lead_min * 60))), g: esc(hm(form.time + Math.min(cfg.grace_min, form.dur) * 60))}) + '</div>';
+      html += '<div class="err" id="bkErr"></div><button class="btn" id="bkGo"' + (form.time ? '' : ' disabled') + '>🗓️ ' + trh('Book this time') + '</button>';
+    }
+    html += '<div class="muted" style="margin-top:0.6rem">' + trh('Booking is free. If you cannot come, cancel it - {n} missed bookings in {d} days pause booking for {b} days.', {n: cfg.noshow_limit || '-', d: cfg.noshow_days, b: cfg.block_days}) + '</div></div>';
+    A.wrap(html);
+    var V = document.getElementById('view');
+    V.querySelectorAll('[data-c]').forEach(function (b) { b.onclick = function () { form.conn = parseInt(b.dataset.c, 10); form.time = null; render(mine); }; });
+    V.querySelectorAll('[data-mode]').forEach(function (b) { b.onclick = function () { form.mode = b.dataset.mode; render(mine); }; });
+    V.querySelectorAll('[data-day]').forEach(function (b) { b.onclick = async function () { form.date = b.dataset.day; form.time = null; await loadAvail(); render(mine); }; });
+    V.querySelectorAll('[data-dur]').forEach(function (b) { b.onclick = function () { form.dur = Number(b.dataset.dur); render(mine); }; });
+    V.querySelectorAll('[data-time]').forEach(function (b) { b.onclick = function () { form.time = Number(b.dataset.time); render(mine); }; });
+    var go = document.getElementById('bkGo');
+    if (go) go.onclick = async function () {
+      go.disabled = true;
+      A.setErr('bkErr', '');
+      var body = form.mode === 'now' ? {cp: form.cp, conn: form.conn, kind: 'now'} : {cp: form.cp, conn: form.conn, kind: 'slot', start: form.time, minutes: form.dur};
+      var res = await A.api('/api/app/booking', {method: 'POST', body: body});
+      go.disabled = false;
+      if (res.error) {
+        var msg = res.error_key ? tr(res.error_key, res.error_vars || {}) : tr(res.error);
+        await loadAvail();
+        if (!form.avail.error) render(mine);
+        A.setErr('bkErr', msg);
+        return;
+      }
+      cache.t = 0;
+      A.toast(tr(form.mode === 'now' ? 'Connector reserved' : 'Booking confirmed'));
+      form.time = null;
+      A.go('#/bookings');
+    };
+  }
+
+  // ---- hooks into the app views (called after the view is drawn; the view may be redrawn while we wait for the server)
+  var APP_ROUTES = ['login', 'map', 'station', 'charge', 'session', 'wallet', 'history', 'notifications', 'account', 'scan'];
+  function onView(route, id) { var c = A.cur(); return c.route === route && (id == null || c.args[0] === id); }
+  function homeShown() { var c = A.cur().route; return APP_ROUTES.indexOf(c) < 0 && !A.routes[c]; }   // unknown routes show Home too
+  function place(cls, html, where) {
+    var V = document.getElementById('view');
+    if (!V) return;
+    V.querySelectorAll('.' + cls).forEach(function (el) { el.remove(); });
+    var first = V.querySelector('.card');
+    if (where === 'end') V.insertAdjacentHTML('beforeend', html);
+    else if (first) first.insertAdjacentHTML('afterend', html);
+    else V.insertAdjacentHTML('afterbegin', html);
+  }
+  A.hooks.home = async function () {
+    var r = await bookings(false);
+    if (r.error || !r.bookings) return;
+    var act = r.bookings.filter(active);
+    if (!act.length || !homeShown()) return;
+    place('bk-home', bookingCard(act[0], true).replace('class="card bk-card"', 'class="card bk-card bk-home"'));
+  };
+  A.hooks.station = async function (s) {
+    var r = await bookings(false);
+    if (r.error || !r.enabled || !onView('station', s.id)) return;
+    var mine = (r.bookings || []).filter(function (b) { return active(b) && b.cp === s.id; });
+    var html = '<div class="card bk-card bk-station"><div class="row"><div class="grow"><b>📅 ' + trh('Book a connector') + '</b><div class="muted">' + trh('Keep a connector now for {m} min, or book a time up to {d} days ahead. Free.', {m: r.cfg.now_hold_min, d: r.cfg.max_days}) + '</div></div></div>' +
+      (mine.length ? '<div class="note">' + trh('Your booking here: connector {n}, kept until {t}.', {n: mine[0].conn, t: hm(mine[0].hold_until)}) + ' <a href="#/bookings">' + trh('My bookings') + '</a></div>' : '') +
+      '<a class="btn" href="#/book/' + encodeURIComponent(s.id) + '">📅 ' + trh('Book a connector') + '</a></div>';
+    place('bk-station', html, 'end');
+  };
+  A.hooks.account = function () {
+    var html = '<div class="card bk-account"><div class="row"><div class="grow"><b>📅 ' + trh('My bookings') + '</b><div class="muted">' + trh('Connectors you booked, and earlier bookings') + '</div></div><a class="btn sm" href="#/bookings">' + trh('View') + '</a></div></div>';
+    place('bk-account', html);
+  };
+  A.routes.bookings = function () { viewBookings(); };
+  A.routes.book = function (args) { viewBook(args); };
+
+  var css = document.createElement('style');
+  css.textContent = '.bk-seg{display:flex;gap:0.4rem;margin:0.8rem 0 0.2rem}.bk-seg button,.bk-chips button,.bk-times button{border:2px solid var(--line);background:#fff;border-radius:10px;padding:0.5rem 0.7rem;font:inherit;font-weight:700;cursor:pointer;color:var(--text)}' +
+    '.bk-seg button{flex:1}.bk-seg button.sel,.bk-chips button.sel,.bk-times button.sel{border-color:var(--g);background:#eef8f1;color:var(--g2)}' +
+    '.bk-chips{display:flex;gap:0.35rem;flex-wrap:wrap}.bk-times{display:grid;grid-template-columns:repeat(auto-fill,minmax(64px,1fr));gap:0.35rem}.bk-times button:disabled{opacity:0.35;cursor:not-allowed;text-decoration:line-through}';
+  document.head.appendChild(css);
+
+  A.addI18n({
+    th: {
+      'The connector is not free yet - we keep it for you as soon as it is free (until {t}, BTT).': 'หัวชาร์จยังไม่ว่าง - ระบบจะกันไว้ให้คุณทันทีที่ว่าง (ถึง {t} เวลาภูฏาน)',
+      'Connector {conn} is out of order right now': 'หัวชาร์จ {conn} ขัดข้องอยู่', 'Connector {conn} is switched off right now': 'หัวชาร์จ {conn} ปิดใช้งานอยู่',
+      'You are already charging on connector {conn}': 'คุณกำลังชาร์จที่หัวชาร์จ {conn} อยู่แล้ว', 'You are already starting a session on connector {conn}': 'คุณกำลังเริ่มชาร์จที่หัวชาร์จ {conn} อยู่แล้ว',
+      'The charger could not reserve connector {conn} - please try again': 'ตู้กันหัวชาร์จ {conn} ไม่ได้ - กรุณาลองใหม่',
+      'You made many bookings today - please try again tomorrow': 'วันนี้คุณจองหลายครั้งแล้ว - กรุณาลองใหม่พรุ่งนี้',
+      'You cancelled a booking here just now - you can reserve again in {m} min': 'คุณเพิ่งยกเลิกการจองที่นี่ - จองทันทีได้อีกครั้งในอีก {m} นาที',
+      'This station cannot be booked yet': 'สถานีนี้ยังจองไม่ได้', 'Too many requests - please wait a minute': 'คำขอมากเกินไป - กรุณารอสักครู่',
+      'Booked': 'จองแล้ว', 'Waiting for the connector': 'รอหัวชาร์จว่าง', 'Connector kept for you': 'กันหัวไว้ให้คุณแล้ว', 'Starting…': 'กำลังเริ่ม…', 'Used': 'ใช้แล้ว',
+      'Cancelled': 'ยกเลิกแล้ว', 'Missed': 'ไม่มาตามนัด', 'Could not be kept': 'กันหัวไม่ได้', 'Kept until {t}': 'กันไว้ถึง {t}', 'Reserved now': 'จองทันที',
+      'Booked time': 'จองช่วงเวลา', 'Start charging by {t} (BTT) - after that the booking ends.': 'เริ่มชาร์จภายใน {t} (เวลาภูฏาน) - หลังจากนั้นการจองจะสิ้นสุด',
+      'The connector is kept for you from {a}. Start charging by {b}.': 'ระบบกันหัวไว้ให้คุณตั้งแต่ {a} เริ่มชาร์จภายใน {b}', 'Station': 'สถานี', 'My bookings': 'การจองของฉัน',
+      'Cancel booking': 'ยกเลิกการจอง', 'You cancelled it': 'คุณยกเลิกเอง', 'Cancelled by the operator': 'เจ้าหน้าที่ยกเลิก', 'Charging did not start in time': 'ไม่ได้เริ่มชาร์จตามเวลา',
+      'The charger could not keep it - not counted as missed': 'ตู้กันหัวไว้ไม่ได้ - ไม่นับเป็นการไม่มา', 'Cancel booking {id}?': 'ยกเลิกการจอง {id}?', 'Booking cancelled': 'ยกเลิกการจองแล้ว',
+      'Book a connector now or for later from the station page. Booking is free.': 'จองหัวชาร์จทันทีหรือล่วงหน้าได้จากหน้าสถานี ไม่มีค่าใช้จ่าย',
+      'Booking is not available at the moment.': 'ยังไม่เปิดให้จองในตอนนี้', 'You missed {n} bookings - you can book again from {d}.': 'คุณจองแล้วไม่มา {n} ครั้ง - จองได้อีกครั้งตั้งแต่ {d}',
+      'Missed bookings: {n} of {l} in {d} days.': 'จองแล้วไม่มา: {n} จาก {l} ครั้งใน {d} วัน', 'Find a charger to book': 'หาตู้ชาร์จเพื่อจอง', 'Earlier bookings': 'การจองก่อนหน้า',
+      'Book a connector': 'จองหัวชาร์จ', 'Booking is not available at this station.': 'สถานีนี้ยังไม่เปิดให้จอง', 'Back': 'กลับ',
+      'You already have a booking ({id}) - cancel it first to book another one.': 'คุณมีการจองอยู่แล้ว ({id}) - ยกเลิกก่อนจึงจองใหม่ได้', 'Connector': 'หัวชาร์จ',
+      'Your booking': 'การจองของคุณ', 'Reserved': 'ถูกจองแล้ว', 'Busy': 'ไม่ว่าง', 'Available': 'ว่าง', 'Reserve now': 'จองทันที', 'Book a time': 'จองช่วงเวลา',
+      'We keep connector {n} for you for {m} minutes from now. Start charging within that time.': 'ระบบจะกันหัวชาร์จ {n} ไว้ให้คุณ {m} นาทีนับจากนี้ เริ่มชาร์จภายในเวลานั้น',
+      'This connector is not free right now - choose another connector or book a time.': 'หัวชาร์จนี้ไม่ว่างตอนนี้ - เลือกหัวอื่นหรือจองช่วงเวลา',
+      'Reserve connector {n} now': 'จองหัวชาร์จ {n} ทันที', 'Day': 'วัน', 'Today': 'วันนี้', 'Tomorrow': 'พรุ่งนี้', 'How long': 'ใช้นานเท่าไร', '{h} h': '{h} ชม.', '{m} min': '{m} นาที',
+      'Start time (BTT)': 'เวลาเริ่ม (เวลาภูฏาน)', 'No start times left on this day.': 'วันนี้ไม่มีเวลาว่างแล้ว',
+      'Connector {n} · {d} {a}–{b}. It is kept for you from {k}; start charging by {g}.': 'หัวชาร์จ {n} · {d} {a}–{b} ระบบกันหัวให้ตั้งแต่ {k} เริ่มชาร์จภายใน {g}',
+      'Book this time': 'จองเวลานี้', 'Booking is free. If you cannot come, cancel it - {n} missed bookings in {d} days pause booking for {b} days.': 'การจองไม่มีค่าใช้จ่าย ถ้ามาไม่ได้ให้ยกเลิก - จองแล้วไม่มา {n} ครั้งใน {d} วัน จะจองไม่ได้ {b} วัน',
+      'Connector reserved': 'จองหัวชาร์จแล้ว', 'Booking confirmed': 'ยืนยันการจองแล้ว',
+      'Keep a connector now for {m} min, or book a time up to {d} days ahead. Free.': 'กันหัวชาร์จทันที {m} นาที หรือจองล่วงหน้าได้ถึง {d} วัน ฟรี',
+      'Your booking here: connector {n}, kept until {t}.': 'การจองของคุณที่นี่: หัวชาร์จ {n} กันไว้ถึง {t}', 'Connectors you booked, and earlier bookings': 'หัวชาร์จที่คุณจอง และการจองก่อนหน้า',
+      'Booking is switched off': 'ปิดการจองอยู่', 'Booking in the app is switched off': 'ปิดการจองในแอป', 'Unknown station': 'ไม่พบสถานี', 'This station cannot be booked': 'สถานีนี้จองไม่ได้',
+      'Choose a connector': 'เลือกหัวชาร์จ', 'You missed {n} bookings - you can book again from {day}': 'คุณจองแล้วไม่มา {n} ครั้ง - จองได้อีกครั้งตั้งแต่ {day}',
+      'You already have a booking ({id}) - cancel it first to book another one': 'คุณมีการจองอยู่แล้ว ({id}) - ยกเลิกก่อนจึงจองใหม่ได้', 'This station is offline right now': 'สถานีนี้ออฟไลน์อยู่',
+      'Connector {conn} is not free right now': 'หัวชาร์จ {conn} ไม่ว่างตอนนี้', 'Choose the date and time': 'เลือกวันที่และเวลา', 'Choose how long you need the connector': 'เลือกระยะเวลาที่ต้องการใช้',
+      'Book at least {m} minutes ahead - or use "Reserve now"': 'ต้องจองล่วงหน้าอย่างน้อย {m} นาที - หรือใช้ "จองทันที"', 'You can book up to {d} days ahead': 'จองล่วงหน้าได้ไม่เกิน {d} วัน',
+      'Connector {conn} is already booked {from} - {to} (BTT)': 'หัวชาร์จ {conn} ถูกจองแล้ว {from} - {to} (เวลาภูฏาน)',
+      'Booking not found': 'ไม่พบการจอง', 'This booking has already ended': 'การจองนี้สิ้นสุดแล้ว'
+    },
+    dz: {
+      'The connector is not free yet - we keep it for you as soon as it is free (until {t}, BTT).': 'མཐུད་ཆས་ད་ལྟོ་འཐོབ་མི་ཚུགས་ - འཐོབ་ཚུགས་ཚེ་ཁྱོད་ཀྱི་དོན་ལུ་བཞག་འོང་ ({t} ཚུན་, BTT)',
+      'Connector {conn} is out of order right now': 'མཐུད་ཆས་ {conn} ད་ལྟོ་འཛོལ་བ་ཨིན་', 'Connector {conn} is switched off right now': 'མཐུད་ཆས་ {conn} ད་ལྟོ་ཁ་བསྡམས་ཡོད་',
+      'You are already charging on connector {conn}': 'ཁྱོད་ཀྱིས་མཐུད་ཆས་ {conn} ནང་གློག་བླུགས་དོ་', 'You are already starting a session on connector {conn}': 'ཁྱོད་ཀྱིས་མཐུད་ཆས་ {conn} ནང་གློག་བླུགས་འགོ་བཙུགས་དོ་',
+      'The charger could not reserve connector {conn} - please try again': 'གློག་བླུགས་ཆས་ཀྱིས་མཐུད་ཆས་ {conn} སྔོན་བཟུང་འབད་མ་ཚུགས་ - ལོག་སྟེ་འབད་',
+      'You made many bookings today - please try again tomorrow': 'ད་རིས་སྔོན་བཟུང་ལེ་ཤ་འབད་ཡོད་ - ནངས་པ་ལོག་སྟེ་འབད་',
+      'You cancelled a booking here just now - you can reserve again in {m} min': 'ད་ལྟོ་རང་ནཱ་ལུ་སྔོན་བཟུང་ཆ་མེད་བཏང་ཡོད་ - སྐར་མ་ {m} ཤུལ་ལས་ལོག་སྟེ་སྔོན་བཟུང་འབད་ཚུགས་',
+      'This station cannot be booked yet': 'ས་ཚིགས་འདི་ད་ལྟོ་སྔོན་བཟུང་འབད་མི་ཚུགས་', 'Too many requests - please wait a minute': 'ཞུ་བ་ལེ་ཤ་ཡོད་ - སྐར་མ་གཅིག་སྒུག་',
+      'Booked': 'སྔོན་བཟུང་འབད་ཡོད་', 'Waiting for the connector': 'མཐུད་ཆས་ལུ་བསྒུག་དོ་', 'Connector kept for you': 'ཁྱོད་ཀྱི་དོན་ལུ་མཐུད་ཆས་བཞག་ཡོད་', 'Starting…': 'འགོ་བཙུགས་དོ་…', 'Used': 'ལག་ལེན་འཐབ་ཡོད་',
+      'Cancelled': 'ཆ་མེད་བཏང་ཡོད་', 'Missed': 'མ་ལྷོད་', 'Could not be kept': 'བཞག་མ་ཚུགས་', 'Kept until {t}': '{t} ཚུན་བཞག་ཡོད་', 'Reserved now': 'ད་ལྟོ་སྔོན་བཟུང་',
+      'Booked time': 'དུས་ཚོད་སྔོན་བཟུང་', 'Start charging by {t} (BTT) - after that the booking ends.': '{t} (BTT) ཚུན་གློག་བླུགས་འགོ་བཙུགས་ - དེ་ལས་སྔོན་བཟུང་རྫོགསཔ་ཨིན་',
+      'The connector is kept for you from {a}. Start charging by {b}.': '{a} ལས་ཁྱོད་ཀྱི་དོན་ལུ་མཐུད་ཆས་བཞག་འོང་. {b} ཚུན་གློག་བླུགས་འགོ་བཙུགས་', 'Station': 'ས་ཚིགས་', 'My bookings': 'ངའི་སྔོན་བཟུང་ཚུ་',
+      'Cancel booking': 'སྔོན་བཟུང་ཆ་མེད་', 'You cancelled it': 'ཁྱོད་ཀྱིས་ཆ་མེད་བཏང་ཡོད་', 'Cancelled by the operator': 'བཀོལ་སྤྱོད་པ་གིས་ཆ་མེད་བཏང་ཡོད་', 'Charging did not start in time': 'དུས་ཚོད་ནང་གློག་བླུགས་འགོ་མ་བཙུགས་',
+      'The charger could not keep it - not counted as missed': 'གློག་བླུགས་ཆས་ཀྱིས་བཞག་མ་ཚུགས་ - མ་ལྷོད་ནང་མི་རྩིས་', 'Cancel booking {id}?': 'སྔོན་བཟུང་ {id} ཆ་མེད་གཏང་ག?', 'Booking cancelled': 'སྔོན་བཟུང་ཆ་མེད་བཏང་ཡི་',
+      'Book a connector now or for later from the station page. Booking is free.': 'ས་ཚིགས་ཀྱི་ཤོག་ལེབ་ལས་ ད་ལྟོ་ ཡང་ན་ ཤུལ་ལས་ཀྱི་དོན་ལུ་མཐུད་ཆས་སྔོན་བཟུང་འབད་. སྔོན་བཟུང་རིན་མེད་ཨིན་',
+      'Booking is not available at the moment.': 'ད་ལྟོ་སྔོན་བཟུང་འབད་མི་ཚུགས་', 'You missed {n} bookings - you can book again from {d}.': 'སྔོན་བཟུང་ {n} ལུ་མ་ལྷོད་ - {d} ལས་ལོག་སྟེ་སྔོན་བཟུང་འབད་ཚུགས་',
+      'Missed bookings: {n} of {l} in {d} days.': 'མ་ལྷོད་པའི་སྔོན་བཟུང་: ཉིན་ {d} ནང་ {l} ལས་ {n}', 'Find a charger to book': 'སྔོན་བཟུང་འབད་ནིའི་གློག་བླུགས་ཆས་འཚོལ་', 'Earlier bookings': 'ཧེ་མའི་སྔོན་བཟུང་ཚུ་',
+      'Book a connector': 'མཐུད་ཆས་སྔོན་བཟུང་', 'Booking is not available at this station.': 'ས་ཚིགས་འདི་ནང་སྔོན་བཟུང་འབད་མི་ཚུགས་', 'Back': 'ལོག་',
+      'You already have a booking ({id}) - cancel it first to book another one.': 'ཁྱོད་ལུ་སྔོན་བཟུང་ ({id}) ཡོདཔ་ཨིན་ - གཞན་ཅིག་འབད་ནི་ལུ་ དང་པ་དེ་ཆ་མེད་གཏང་', 'Connector': 'མཐུད་ཆས་',
+      'Your booking': 'ཁྱོད་ཀྱི་སྔོན་བཟུང་', 'Reserved': 'སྔོན་བཟུང་ཡོད་', 'Busy': 'ལག་ལེན་འཐབ་དོ་', 'Available': 'འཐོབ་ཚུགས་', 'Reserve now': 'ད་ལྟོ་སྔོན་བཟུང་', 'Book a time': 'དུས་ཚོད་སྔོན་བཟུང་',
+      'We keep connector {n} for you for {m} minutes from now. Start charging within that time.': 'ད་ལས་སྐར་མ་ {m} ཚུན་ ཁྱོད་ཀྱི་དོན་ལུ་མཐུད་ཆས་ {n} བཞག་འོང་. དུས་ཚོད་དེ་ནང་གློག་བླུགས་འགོ་བཙུགས་',
+      'This connector is not free right now - choose another connector or book a time.': 'མཐུད་ཆས་འདི་ད་ལྟོ་འཐོབ་མི་ཚུགས་ - མཐུད་ཆས་གཞན་ ཡང་ན་ དུས་ཚོད་སྔོན་བཟུང་འབད་',
+      'Reserve connector {n} now': 'མཐུད་ཆས་ {n} ད་ལྟོ་སྔོན་བཟུང་', 'Day': 'ཉིན་', 'Today': 'ད་རིས་', 'Tomorrow': 'ནངས་པ་', 'How long': 'ཡུན་ཚད་', '{h} h': 'ཆུ་ཚོད་ {h}', '{m} min': 'སྐར་མ་ {m}',
+      'Start time (BTT)': 'འགོ་བཙུགས་ཆུ་ཚོད་ (BTT)', 'No start times left on this day.': 'ཉིན་འདི་ནང་འགོ་བཙུགས་ཆུ་ཚོད་ལྷག་མེད་',
+      'Connector {n} · {d} {a}–{b}. It is kept for you from {k}; start charging by {g}.': 'མཐུད་ཆས་ {n} · {d} {a}–{b}. {k} ལས་ཁྱོད་ཀྱི་དོན་ལུ་བཞག་འོང་; {g} ཚུན་གློག་བླུགས་འགོ་བཙུགས་',
+      'Book this time': 'དུས་ཚོད་འདི་སྔོན་བཟུང་', 'Booking is free. If you cannot come, cancel it - {n} missed bookings in {d} days pause booking for {b} days.': 'སྔོན་བཟུང་རིན་མེད་ཨིན་. ལྷོད་མ་ཚུགས་པ་ཅིན་ ཆ་མེད་གཏང་ - ཉིན་ {d} ནང་ སྔོན་བཟུང་ {n} ལུ་མ་ལྷོད་པ་ཅིན་ ཉིན་ {b} སྔོན་བཟུང་བར་བཀག་འབདཝ་ཨིན་',
+      'Connector reserved': 'མཐུད་ཆས་སྔོན་བཟུང་འབད་ཡི་', 'Booking confirmed': 'སྔོན་བཟུང་ངེས་གཏན་བཟོ་ཡི་',
+      'Keep a connector now for {m} min, or book a time up to {d} days ahead. Free.': 'ད་ལྟོ་སྐར་མ་ {m} ཚུན་མཐུད་ཆས་བཞག་ ཡང་ན་ ཉིན་ {d} གི་ཧེ་མ་ཚུན་དུས་ཚོད་སྔོན་བཟུང་. རིན་མེད་',
+      'Your booking here: connector {n}, kept until {t}.': 'ནཱ་གི་ཁྱོད་ཀྱི་སྔོན་བཟུང་: མཐུད་ཆས་ {n}, {t} ཚུན་བཞག་ཡོད་', 'Connectors you booked, and earlier bookings': 'ཁྱོད་ཀྱིས་སྔོན་བཟུང་འབད་མི་མཐུད་ཆས་དང་ ཧེ་མའི་སྔོན་བཟུང་ཚུ་',
+      'Booking is switched off': 'སྔོན་བཟུང་ཁ་བསྡམས་ཡོད་', 'Booking in the app is switched off': 'app ནང་སྔོན་བཟུང་ཁ་བསྡམས་ཡོད་', 'Unknown station': 'ས་ཚིགས་མ་ཤེས་', 'This station cannot be booked': 'ས་ཚིགས་འདི་སྔོན་བཟུང་འབད་མི་ཚུགས་',
+      'Choose a connector': 'མཐུད་ཆས་གདམ་', 'You missed {n} bookings - you can book again from {day}': 'སྔོན་བཟུང་ {n} ལུ་མ་ལྷོད་ - {day} ལས་ལོག་སྟེ་སྔོན་བཟུང་འབད་ཚུགས་',
+      'You already have a booking ({id}) - cancel it first to book another one': 'ཁྱོད་ལུ་སྔོན་བཟུང་ ({id}) ཡོདཔ་ཨིན་ - གཞན་ཅིག་འབད་ནི་ལུ་ དང་པ་དེ་ཆ་མེད་གཏང་', 'This station is offline right now': 'ས་ཚིགས་འདི་ད་ལྟོ་མཐུད་མེད་',
+      'Connector {conn} is not free right now': 'མཐུད་ཆས་ {conn} ད་ལྟོ་འཐོབ་མི་ཚུགས་', 'Choose the date and time': 'ཚེས་གྲངས་དང་ཆུ་ཚོད་གདམ་', 'Choose how long you need the connector': 'མཐུད་ཆས་ཡུན་ཚད་ག་དེ་ཅིག་དགོཔ་ཨིན་ན་གདམ་',
+      'Book at least {m} minutes ahead - or use "Reserve now"': 'ཉུང་མཐའ་སྐར་མ་ {m} ཧེ་མ་སྔོན་བཟུང་འབད་ - ཡང་ན་ "ད་ལྟོ་སྔོན་བཟུང་" ལག་ལེན་འཐབ་', 'You can book up to {d} days ahead': 'ཉིན་ {d} གི་ཧེ་མ་ཚུན་སྔོན་བཟུང་འབད་ཚུགས་',
+      'Connector {conn} is already booked {from} - {to} (BTT)': 'མཐུད་ཆས་ {conn} {from} - {to} (BTT) སྔོན་བཟུང་འབད་ཡོད་',
+      'Booking not found': 'སྔོན་བཟུང་མ་ཐོབ་', 'This booking has already ended': 'སྔོན་བཟུང་འདི་རྫོགས་ཡོད་'
+    }
+  });
+
+  // this script may arrive after the app drew its first page: draw it again so the booking pages / cards show
+  var r0 = A.cur().route;
+  if (r0 && (r0 === 'station' || r0 === 'account' || APP_ROUTES.indexOf(r0) < 0)) A.render();
+})();
+'''
+
+OPS_CSS_PARTS.append(r'''/* [OPS] v1.12 📅 Bookings tab */
+.ops-bk-status { border-radius: 10px; padding: 0.6rem 0.8rem; margin: 0.3rem 0 0.9rem; font-size: 0.8rem; line-height: 1.6; border: 1px solid var(--border); }
+.ops-bk-status.on { background: rgba(37, 99, 235, 0.07); border-color: rgba(37, 99, 235, 0.4); }
+.ops-bk-status.off { background: rgba(100, 116, 139, 0.08); }
+#bkList td[data-l] b { white-space: nowrap; }
+''')
+OPS_JS_PARTS.append(r'''/* [OPS] 📅 Bookings tab (v1.12): pre-booked connectors (app + console), hold status at the charger, missed bookings, settings */
+(function () {
+    'use strict';
+    const OPS = window.OPS;
+    if (!OPS) return;
+    const B = {data: null, view: 'active', q: ''};
+    const STATES = {booked: ['Booked', '#2563eb'], waiting: ['Waiting for the connector', '#d97706'], held: ['Connector kept', '#7c3aed'],
+        starting: ['Driver starting', '#0891b2'], used: ['Used', '#16a34a'], cancelled: ['Cancelled', '#94a3b8'], no_show: ['No-show', '#dc2626'],
+        missed: ['Not kept (charger)', '#a16207']};
+    const REASONS = {offline: 'charger offline', occupied: 'connector in use', faulted: 'connector faulted', unavailable: 'connector unavailable',
+        driver: 'cancelled by the driver', operator: 'cancelled by the operator', refused: 'the charger refused the reservation', window: 'not started in time',
+        csms: 'the CSMS was not running', unknown: 'the connector does not exist'};
+    const td = (l, h, c) => OPS.td(l, h, c);
+    const chip = s => '<span class="ops-st" style="--c:' + ((STATES[s] || [])[1] || '#94a3b8') + '">' + OPS.t((STATES[s] || [s])[0]) + '</span>';
+    const hm = t => (t ? OPS.fmt(t).slice(11, 16) : '—');
+
+    function build(v) {
+        v.dataset.built = '1';
+        v.innerHTML = '<section class="kpis ops-kpis">' + OPS.kpi('info', 'Kept now', 'bkKHold', '') + OPS.kpi('info', 'Upcoming', 'bkKUp', '') +
+            OPS.kpi('good', 'Today', 'bkKToday', '') + OPS.kpi('good', 'Show rate (30 days)', 'bkKRate', '') + OPS.kpi('warn', 'Kept by the CSMS', 'bkKCsms', 'charger cannot reserve') + '</section>' +
+            '<section class="pay-panel ops-panel"><div class="ops-head"><h3>' + OPS.t('📅 Bookings') + '</h3><div class="ops-actions">' +
+            '<button class="tb-btn" id="bkNew">' + OPS.t('➕ New booking') + '</button>' +
+            '<a class="tb-btn" id="bkCsv" href="#">' + OPS.t('⬇️ CSV') + '</a>' +
+            '<button class="tb-btn primary" id="bkCfgBtn">' + OPS.t('⚙️ Settings') + '</button></div></div>' +
+            '<div id="bkStatus" class="ops-bk-status"></div>' +
+            '<div class="ops-head"><div class="ops-actions ops-filters">' +
+            '<span class="ops-seg" id="bkView">' + [['active', 'Active'], ['7', '7 days'], ['30', '30 days']].map(d => '<button class="chip" data-v="' + d[0] + '">' + OPS.t(d[1]) + '</button>').join('') + '</span>' +
+            '<input class="tb-inp" type="search" id="bkQ" autocomplete="off" placeholder="' + OPS.esc(OPS.tx('Booking, station, driver, mobile, card…')) + '"></div></div>' +
+            '<div class="ops-table-wrap ops-tall"><table class="fleet-table ops-table ops-cards" id="bkList"></table></div></section>' +
+            '<section class="pay-panel ops-panel"><div class="ops-head"><h3>' + OPS.t('🚫 Drivers with missed bookings') + '</h3></div>' +
+            '<div class="pay-help" id="bkBlkHelp"></div>' +
+            '<div class="ops-table-wrap"><table class="fleet-table ops-table ops-cards" id="bkBlocked"></table></div></section>';
+        OPS.$('bkCfgBtn').onclick = settings;
+        OPS.$('bkNew').onclick = newBooking;
+        OPS.$('bkView').onclick = e => { const b = e.target.closest('[data-v]'); if (b) { B.view = b.dataset.v; load(); } };
+        let qt = null;
+        OPS.$('bkQ').addEventListener('input', () => { clearTimeout(qt); qt = setTimeout(() => { B.q = OPS.$('bkQ').value.trim(); load(); }, 350); });
+        v.addEventListener('click', onClick);
+    }
+
+    function query() {
+        const q = {};
+        if (B.view === 'active') q.state = 'active';
+        else { const days = parseInt(B.view, 10); q.from = OPS.day(Date.now() / 1000 - (days - 1) * 86400); q.to = OPS.day(Date.now() / 1000 + 8 * 86400); }
+        if (B.q) q.q = B.q;
+        return q;
+    }
+
+    async function load() {
+        document.querySelectorAll('#bkView [data-v]').forEach(b => b.classList.toggle('active', b.dataset.v === B.view));
+        try { B.data = await OPS.api(OPS.csvLink('/api/ops/booking', query())); } catch (e) { return OPS.fail(e); }
+        const days = B.view === 'active' ? 30 : parseInt(B.view, 10);
+        OPS.$('bkCsv').href = OPS.csvLink('/api/ops/booking/bookings.csv', {from: OPS.day(Date.now() / 1000 - (days - 1) * 86400), to: OPS.day(Date.now() / 1000 + 8 * 86400)});
+        render();
+    }
+
+    function whoHtml(b) {
+        return [b.name ? '<b>' + OPS.esc(b.name) + '</b>' : '', b.phone ? '📞 ' + OPS.esc(b.phone) : '', b.plate ? '🚗 ' + OPS.esc(b.plate) : '',
+            b.customer ? '<span class="muted">📱 ' + OPS.t('App') + '</span>' : '🎴 ' + OPS.esc(b.id_tag || '')].filter(Boolean).join('<br>') || '—';
+    }
+
+    function holdHtml(b) {
+        if (b.state === 'held' || b.state === 'starting') {
+            return (b.via === 'ocpp' ? '🔒 ' + OPS.t('reserved at the charger (ReserveNow)') : '🛡️ ' + OPS.t('kept by the CSMS (charger answered {s})', {s: b.ocpp || '—'})) +
+                '<br><span class="muted">' + OPS.t('until {t}', {t: hm(b.hold_until)}) + '</span>';
+        }
+        if (b.state === 'waiting') return '⏳ ' + OPS.t(REASONS[b.wait_reason] || b.wait_reason || '') + (b.ocpp ? ' · ' + OPS.esc(b.ocpp) : '');
+        if (b.state === 'booked') return '<span class="muted">' + OPS.t('kept from {t}', {t: hm(b.hold_from)}) + '</span>';
+        if (b.state === 'used') return '⚡ ' + OPS.t('started {t}', {t: hm(b.used_at)}) + (b.txn != null ? ' · Txn #' + OPS.esc(b.txn) : '');
+        if (b.reason) return '<span class="muted">' + OPS.t(REASONS[b.reason] || b.reason) + (b.cancel_note ? ': ' + OPS.esc(b.cancel_note) : '') + '</span>';
+        return '';
+    }
+
+    function render() {
+        const d = B.data, s = d.stats, c = d.cfg;
+        OPS.$('bkKHold').textContent = s.holding;
+        OPS.$('bkKHoldSub').innerHTML = OPS.t('{n} active bookings', {n: s.active});
+        OPS.$('bkKUp').textContent = s.upcoming;
+        OPS.$('bkKToday').textContent = s.today;
+        OPS.$('bkKRate').innerHTML = s.show_rate == null ? '—' : OPS.num(s.show_rate, 0) + ' <small>%</small>';
+        OPS.$('bkKRateSub').innerHTML = OPS.t('{u} used · {n} no-shows', {u: s.used_30, n: s.noshow_30});
+        OPS.$('bkKCsms').textContent = s.via_csms;
+        const st = [];
+        st.push(c.on ? '<span class="ops-ok">' + OPS.t('Booking is ON') + '</span>' : '<span class="muted">' + OPS.t('Booking is OFF') + '</span>');
+        if (c.on) {
+            st.push(c.app ? OPS.t('drivers book in the BPC EV app') : OPS.t('only the console books'));
+            st.push(OPS.t('reserve now: {m} min', {m: c.now_hold_min}));
+            st.push(OPS.t('time slots: {d} min, up to {n} days ahead', {d: (c.durations || []).join(' / '), n: c.max_days}));
+            st.push(OPS.t('kept {l} min before, arrive within {g} min', {l: c.lead_min, g: c.grace_min}));
+            if (c.noshow_limit) st.push(OPS.t('{n} no-shows in {d} days = no booking for {b} days', {n: c.noshow_limit, d: c.noshow_days, b: c.block_days}));
+            if (c.chargers) st.push(OPS.t('Chargers: {x}', {x: OPS.esc(c.chargers)}));
+        }
+        if (d.pii === false) st.push('<span class="muted">' + OPS.t('driver details are hidden (Customers permission)') + '</span>');
+        OPS.$('bkStatus').innerHTML = st.join(' · ');
+        OPS.$('bkStatus').className = 'ops-bk-status ' + (c.on ? 'on' : 'off');
+        const rows = d.bookings || [];
+        const canCtl = OPS.can('control');
+        OPS.$('bkList').innerHTML = '<thead><tr><th>' + [OPS.t('Booking'), OPS.t('Station'), OPS.t('Time (BTT)'), OPS.t('Driver'), OPS.t('Status'), OPS.t('Connector hold'), ''].join('</th><th>') + '</th></tr></thead><tbody>' +
+            (rows.length ? rows.map(b => {
+                const active = ['booked', 'waiting', 'held', 'starting'].includes(b.state);
+                return '<tr>' + td('Booking', '<b>' + OPS.esc(b.id) + '</b><br><span class="muted">' + (b.kind === 'now' ? OPS.t('⚡ Reserve now') : OPS.t('🗓️ Time slot')) + '</span>') +
+                    td('Station', OPS.esc(b.station) + '<br><span class="muted">' + OPS.t('Connector {n}', {n: b.conn}) + '</span>') +
+                    td('Time (BTT)', OPS.esc(OPS.fmt(b.start).slice(0, 10)) + '<br><b>' + hm(b.start) + ' – ' + hm(b.end) + '</b>') +
+                    td('Driver', whoHtml(b)) + td('Status', chip(b.state) + (b.source === 'console' ? '<br><span class="muted">' + OPS.t('by {u}', {u: OPS.esc(b.by || '')}) + '</span>' : '')) +
+                    td('Connector hold', holdHtml(b)) +
+                    td('', active && canCtl ? '<button class="tb-btn ops-mini" data-cancel="' + OPS.esc(b.id) + '">' + OPS.t('✖ Cancel') + '</button>' : '') + '</tr>';
+            }).join('') : '<tr><td colspan="7" class="muted">' + OPS.t('No bookings') + '</td></tr>') + '</tbody>';
+        OPS.$('bkBlkHelp').innerHTML = c.noshow_limit ? OPS.t('A driver who misses {n} bookings in {d} days cannot book for {b} days. Unblock forgives the missed bookings.', {n: c.noshow_limit, d: c.noshow_days, b: c.block_days}) : OPS.t('No limit for missed bookings (switched off in Settings).');
+        const bl = d.blocked || [];
+        const canCust = OPS.can('customers');
+        OPS.$('bkBlocked').innerHTML = '<thead><tr><th>' + [OPS.t('Driver'), OPS.t('Missed'), OPS.t('Can book again'), ''].join('</th><th>') + '</th></tr></thead><tbody>' +
+            (bl.length ? bl.map(x => '<tr>' + td('Driver', [x.name ? '<b>' + OPS.esc(x.name) + '</b>' : '', x.phone ? '📞 ' + OPS.esc(x.phone) : '', x.id_tag ? '🎴 ' + OPS.esc(x.id_tag) : ''].filter(Boolean).join('<br>') || OPS.esc(x.who)) +
+                td('Missed', String(x.n)) + td('Can book again', x.blocked_until ? '<b class="ops-bad">' + OPS.esc(OPS.fmt(x.blocked_until)) + '</b>' : OPS.t('now')) +
+                td('', canCust && x.who ? '<button class="tb-btn ops-mini" data-unblock="' + OPS.esc(x.who) + '">' + OPS.t('Unblock') + '</button>' : '') + '</tr>').join('')
+                : '<tr><td colspan="4" class="muted">' + OPS.t('Nobody has missed a booking') + '</td></tr>') + '</tbody>';
+    }
+
+    async function onClick(e) {
+        const c = e.target.closest('[data-cancel]');
+        if (c) {
+            const id = c.dataset.cancel;
+            OPS.modal('Cancel booking {id}?', '<div class="ops-form"><label class="wide">' + OPS.t('Reason for the driver (optional)') +
+                '<input class="tb-inp" id="bkCnNote" maxlength="120" autocomplete="off"></label></div>', [{label: 'Keep it'}, {label: '✖ Cancel booking', cls: 'primary', run: async box => {
+                    await OPS.post('/api/ops/booking/cancel', {id: id, note: OPS.val(box, '#bkCnNote')});
+                    OPS.toast(OPS.tx('Booking cancelled'), 'success');
+                    load();
+                    return true;
+                }}], {vars: {id: id}});
+            return;
+        }
+        const u = e.target.closest('[data-unblock]');
+        if (u) {
+            if (!OPS.confirm('Forgive the missed bookings of this driver?')) return;
+            try { await OPS.post('/api/ops/booking/unblock', {who: u.dataset.unblock}); OPS.toast(OPS.tx('Unblocked'), 'success'); load(); } catch (err) { OPS.fail(err); }
+        }
+    }
+
+    function newBooking() {
+        const d = B.data || {stations: [], cfg: {}};
+        const st = (d.stations || []).filter(s => s.bookable);
+        if (!st.length) { OPS.toast(OPS.tx('No station can be booked (none accepted / allowed)'), 'error'); return; }
+        const today = OPS.day();
+        const sel = (id, label, opts, cls) => '<label' + (cls ? ' class="' + cls + '"' : '') + '>' + OPS.t(label) + '<select class="tb-inp" id="' + id + '">' + opts + '</select></label>';
+        const inp = (id, label, attrs, cls) => '<label' + (cls ? ' class="' + cls + '"' : '') + '>' + OPS.t(label) + '<input class="tb-inp" id="' + id + '" ' + (attrs || '') + '></label>';
+        const html = '<div class="ops-form">' +
+            sel('nbCp', 'Station', st.map(s => '<option value="' + OPS.esc(s.id) + '">' + OPS.esc(s.name) + (s.name !== s.id ? ' (' + OPS.esc(s.id) + ')' : '') + (s.online ? '' : ' · ' + OPS.esc(OPS.tx('offline'))) + '</option>').join('')) +
+            sel('nbConn', 'Connector', '') +
+            sel('nbKind', 'Booking', OPS.opt('slot', '🗓️ Time slot', true) + OPS.opt('now', '⚡ Reserve now')) +
+            inp('nbDate', 'Date (BTT)', 'type="date" value="' + today + '"', 'nbSlotF') +
+            inp('nbTime', 'Start (HH:MM, BTT)', 'type="time" step="300"', 'nbSlotF') +
+            inp('nbMin', 'Minutes', 'type="number" min="5" max="1440" step="5" value="' + ((d.cfg.durations || [60])[1] || (d.cfg.durations || [60])[0]) + '"', 'nbSlotF') +
+            sel('nbWho', 'Driver', (OPS.can('view_customers') ? OPS.opt('app', 'App account (mobile number or e-mail)', true) : '') + OPS.opt('card', 'RFID card', !OPS.can('view_customers'))) +
+            inp('nbLogin', 'Mobile number or e-mail of the app account', 'type="text" autocomplete="off"', 'nbAppF') +
+            inp('nbTag', 'RFID card id', 'type="text" autocomplete="off" maxlength="20"', 'nbCardF') +
+            inp('nbName', 'Name (optional)', 'type="text" maxlength="60" autocomplete="off"') +
+            inp('nbNote', 'Note (optional)', 'type="text" maxlength="200" autocomplete="off"', 'wide') +
+            '<div class="pay-help wide">' + OPS.t('Console bookings skip the app limits (one booking per driver, how far ahead). The charger keeps the connector from {l} min before the start until {g} min after it.', {l: d.cfg.lead_min, g: d.cfg.grace_min}) + '</div></div>';
+        const box = OPS.modal('➕ New booking', html, [{label: 'Cancel'}, {label: '💾 Book', cls: 'primary', run: async box => {
+            const kind = OPS.val(box, '#nbKind');
+            const body = {cp: OPS.val(box, '#nbCp'), conn: parseInt(OPS.val(box, '#nbConn'), 10), kind: kind, name: OPS.val(box, '#nbName'), note: OPS.val(box, '#nbNote')};
+            if (kind === 'slot') {
+                if (!OPS.val(box, '#nbDate') || !OPS.val(box, '#nbTime')) { OPS.toast(OPS.tx('Choose the date and time'), 'error'); return false; }
+                body.start = OPS.val(box, '#nbDate') + ' ' + OPS.val(box, '#nbTime');
+                body.minutes = parseFloat(OPS.val(box, '#nbMin'));
+            }
+            if (OPS.val(box, '#nbWho') === 'card') body.id_tag = OPS.val(box, '#nbTag'); else body.login = OPS.val(box, '#nbLogin');
+            const r = await OPS.post('/api/ops/booking/create', body);
+            OPS.toast(OPS.tx('Booked: {id}', {id: r.booking.id}), 'success');
+            load();
+            return true;
+        }}], {wide: true});
+        const fillConn = () => {
+            const s = st.find(x => x.id === OPS.val(box, '#nbCp')) || st[0];
+            box.querySelector('#nbConn').innerHTML = (s.connectors || []).map(n => '<option value="' + n + '">' + OPS.esc(OPS.tx('Connector {n}', {n: n})) + '</option>').join('');
+        };
+        fillConn();
+        box.querySelector('#nbCp').onchange = fillConn;
+        const showIf = (cls, on) => box.querySelectorAll('.' + cls).forEach(el => { el.style.display = on ? '' : 'none'; });
+        box.querySelector('#nbKind').onchange = () => showIf('nbSlotF', OPS.val(box, '#nbKind') === 'slot');
+        box.querySelector('#nbWho').onchange = () => { const card = OPS.val(box, '#nbWho') === 'card'; showIf('nbAppF', !card); showIf('nbCardF', card); };
+        showIf('nbCardF', !OPS.can('view_customers'));
+        showIf('nbAppF', OPS.can('view_customers'));
+    }
+
+    function settings() {
+        const c = (B.data || {}).cfg || {};
+        const num = (id, label, v, step) => '<label>' + OPS.t(label) + '<input class="tb-inp" type="number" id="' + id + '" value="' + OPS.esc(v) + '" step="' + (step || 'any') + '" min="0"></label>';
+        const html = '<div class="ops-form">' +
+            '<label class="ops-check wide"><input type="checkbox" id="bcOn"' + (c.on ? ' checked' : '') + '> ' + OPS.t('Booking is on') + '</label>' +
+            '<label class="ops-check wide"><input type="checkbox" id="bcApp"' + (c.app ? ' checked' : '') + '> ' + OPS.t('Drivers can book in the BPC EV app') + '</label>' +
+            '<label class="wide">' + OPS.t('Only these chargers (comma separated, empty = all)') + '<input class="tb-inp" type="text" id="bcCh" value="' + OPS.esc(c.chargers || '') + '"></label>' +
+            num('bcNow', '"Reserve now" keeps the connector for (min)', c.now_hold_min) +
+            '<label class="wide">' + OPS.t('Time slot lengths the driver can choose (min, comma separated)') + '<input class="tb-inp" type="text" id="bcDur" value="' + OPS.esc((c.durations || []).join(', ')) + '"></label>' +
+            num('bcStep', 'Start times every (min)', c.step_min) + num('bcDays', 'Book up to … days ahead', c.max_days) +
+            num('bcAhead', 'Book at least … min ahead (app)', c.min_ahead_min) + num('bcLead', 'Keep the connector … min before the start', c.lead_min) +
+            num('bcGrace', 'The driver must start within … min of the start', c.grace_min) + num('bcMax', 'Bookings per driver at the same time (app)', c.max_active) +
+            num('bcNsL', 'Missed bookings allowed (0 = no limit)', c.noshow_limit) + num('bcNsD', '… within (days)', c.noshow_days) +
+            num('bcNsB', 'Then no booking for (days)', c.block_days) + num('bcKeep', 'Keep finished bookings for (days)', c.keep_days) +
+            '<div class="pay-help wide">' + OPS.t('At the start of a booking the CSMS sends ReserveNow to the charger (OCPP 1.6 Reservation profile): the connector shows Reserved and only the booking\'s driver can start. A charger that cannot reserve is kept by the CSMS: other cards and app / QR starts are refused on that connector. Booking is free; drivers who miss bookings are paused.') + '</div></div>';
+        OPS.modal('⚙️ Booking settings', html, [{label: 'Cancel'}, {label: '💾 Save', cls: 'primary', run: async box => {
+            const n = id => parseFloat(OPS.val(box, id));
+            await OPS.post('/api/ops/booking/config', {on: OPS.val(box, '#bcOn'), app: OPS.val(box, '#bcApp'), chargers: OPS.val(box, '#bcCh'),
+                now_hold_min: n('#bcNow'), durations: OPS.val(box, '#bcDur'), step_min: n('#bcStep'), max_days: n('#bcDays'), min_ahead_min: n('#bcAhead'),
+                lead_min: n('#bcLead'), grace_min: n('#bcGrace'), max_active: n('#bcMax'), noshow_limit: n('#bcNsL'), noshow_days: n('#bcNsD'),
+                block_days: n('#bcNsB'), keep_days: n('#bcKeep')});
+            OPS.toast(OPS.tx('Saved'), 'success');
+            load();
+            return true;
+        }}], {wide: true});
+    }
+
+    OPS.register({tab: 'booking', perm: 'view', every: 10,
+        show: function () { const v = OPS.$('view-booking'); if (!v) return; if (!v.dataset.built) build(v); load(); },
+        refresh: load,
+        relang: function () { const v = OPS.$('view-booking'); if (v) { v.dataset.built = ''; v.innerHTML = ''; OPS.mods.booking.show(); } }
+    });
+
+    OPS.addI18n({
+        'the CSMS was not running': ['CSMS ལཱ་འབད་མ་ཚུགས་', 'ระบบ CSMS ไม่ได้ทำงาน'], 'the connector does not exist': ['མཐུད་ཆས་འདི་མེད་', 'ไม่มีหัวชาร์จนี้'],
+        'driver details are hidden (Customers permission)': ['དེད་པའི་རྒྱས་བཤད་སྦ་བཞག་ཡོད་ (ཚོང་མགྲོན་གྱི་ཆོག་མཆན་)', 'ซ่อนข้อมูลผู้ขับ (ต้องมีสิทธิ์ลูกค้า)'],
+        '📅 Bookings': ['📅 སྔོན་བཟུང་ཚུ་', '📅 การจอง'], 'Kept now': ['ད་ལྟོ་བཞག་ཡོད་', 'กันหัวไว้ตอนนี้'], 'Upcoming': ['མ་འོངས་པ་', 'ที่จะมาถึง'],
+        'Show rate (30 days)': ['ལྷོད་ཚད་ (ཉིན་ ༣༠)', 'อัตรามาตามนัด (30 วัน)'], 'Kept by the CSMS': ['CSMS གིས་བཞག་ཡོད་', 'CSMS กันหัวเอง'],
+        'charger cannot reserve': ['གློག་བླུགས་ཆས་ཀྱིས་སྔོན་བཟུང་འབད་མི་ཚུགས་', 'ตู้จองเองไม่ได้'], '➕ New booking': ['➕ སྔོན་བཟུང་གསརཔ་', '➕ จองใหม่'],
+        'Active': ['ཤུགས་ལྡན་', 'ที่ใช้งานอยู่'], 'Booking, station, driver, mobile, card…': ['སྔོན་བཟུང་ ས་ཚིགས་ དེད་པ་ མོ་བཱའིལ་ ཤོག་བྱང་…', 'การจอง สถานี ผู้ขับ เบอร์โทร บัตร…'],
+        '🚫 Drivers with missed bookings': ['🚫 སྔོན་བཟུང་ལུ་མ་ལྷོད་མི་དེད་པ་ཚུ་', '🚫 ผู้ขับที่จองแล้วไม่มา'],
+        'Booked': ['སྔོན་བཟུང་འབད་ཡོད་', 'จองแล้ว'], 'Waiting for the connector': ['མཐུད་ཆས་ལུ་བསྒུག་དོ་', 'รอหัวชาร์จว่าง'], 'Connector kept': ['མཐུད་ཆས་བཞག་ཡོད་', 'กันหัวไว้แล้ว'],
+        'Driver starting': ['དེད་པ་གིས་འགོ་བཙུགས་དོ་', 'ผู้ขับกำลังเริ่มชาร์จ'], 'Used': ['ལག་ལེན་འཐབ་ཡོད་', 'ใช้แล้ว'], 'Cancelled': ['ཆ་མེད་བཏང་ཡོད་', 'ยกเลิกแล้ว'],
+        'No-show': ['མ་ལྷོད་', 'ไม่มาตามนัด'], 'Not kept (charger)': ['བཞག་མ་ཚུགས་ (གློག་བླུགས་ཆས་)', 'กันหัวไม่ได้ (ตู้)'],
+        'charger offline': ['གློག་བླུགས་ཆས་མཐུད་མེད་', 'ตู้ออฟไลน์'], 'connector in use': ['མཐུད་ཆས་ལག་ལེན་འཐབ་དོ་', 'หัวชาร์จมีคนใช้'],
+        'connector faulted': ['མཐུད་ཆས་འཛོལ་བ་', 'หัวชาร์จขัดข้อง'], 'connector unavailable': ['མཐུད་ཆས་འཐོབ་མི་ཚུགས་', 'หัวชาร์จปิดใช้งาน'],
+        'cancelled by the driver': ['དེད་པ་གིས་ཆ་མེད་བཏང་ཡོད་', 'ผู้ขับยกเลิก'], 'cancelled by the operator': ['བཀོལ་སྤྱོད་པ་གིས་ཆ་མེད་བཏང་ཡོད་', 'เจ้าหน้าที่ยกเลิก'],
+        'the charger refused the reservation': ['གློག་བླུགས་ཆས་ཀྱིས་སྔོན་བཟུང་ངོས་མ་ལེན་', 'ตู้ไม่รับการจอง'], 'not started in time': ['དུས་ཚོད་ནང་འགོ་མ་བཙུགས་', 'ไม่ได้เริ่มชาร์จตามเวลา'],
+        'CSMS restarted': ['CSMS ལོག་འགོ་བཙུགས་ཡོད་', 'CSMS เริ่มใหม่'], 'App': ['App', 'แอป'],
+        'reserved at the charger (ReserveNow)': ['གློག་བླུགས་ཆས་ནང་སྔོན་བཟུང་ (ReserveNow)', 'ตู้กันหัวไว้ (ReserveNow)'],
+        'kept by the CSMS (charger answered {s})': ['CSMS གིས་བཞག་ཡོད་ (གློག་བླུགས་ཆས་ཀྱི་ལན་ {s})', 'CSMS กันหัวเอง (ตู้ตอบ {s})'],
+        'until {t}': ['{t} ཚུན་', 'ถึง {t}'], 'kept from {t}': ['{t} ལས་བཞག་འོང་', 'กันหัวตั้งแต่ {t}'], 'started {t}': ['{t} ལུ་འགོ་བཙུགས་', 'เริ่มชาร์จ {t}'],
+        '{n} active bookings': ['ཤུགས་ལྡན་སྔོན་བཟུང་ {n}', 'การจองที่ใช้งาน {n} รายการ'], '{u} used · {n} no-shows': ['ལག་ལེན་ {u} · མ་ལྷོད་ {n}', 'ใช้ {u} · ไม่มา {n}'],
+        'Booking is ON': ['སྔོན་བཟུང་ཁ་ཕྱེ་ཡོད་', 'เปิดการจองอยู่'], 'Booking is OFF': ['སྔོན་བཟུང་ཁ་བསྡམས་ཡོད་', 'ปิดการจอง'],
+        'drivers book in the BPC EV app': ['དེད་པ་ཚུ་གིས་ BPC EV app ནང་སྔོན་བཟུང་འབདཝ་ཨིན་', 'ผู้ขับจองผ่านแอป BPC EV'], 'only the console books': ['console ཁོ་ར་གིས་སྔོན་བཟུང་འབདཝ་ཨིན་', 'จองได้เฉพาะจากหน้าเจ้าหน้าที่'],
+        'reserve now: {m} min': ['ད་ལྟོ་སྔོན་བཟུང་: སྐར་མ་ {m}', 'จองทันที: {m} นาที'], 'time slots: {d} min, up to {n} days ahead': ['དུས་ཚོད་: སྐར་མ་ {d}, ཉིན་ {n} གི་ཧེ་མ་ཚུན་', 'ช่วงเวลา: {d} นาที จองล่วงหน้าได้ {n} วัน'],
+        'kept {l} min before, arrive within {g} min': ['སྐར་མ་ {l} ཧེ་མ་ལས་བཞག་ སྐར་མ་ {g} ནང་ལྷོད་དགོ་', 'กันหัวก่อน {l} นาที ต้องมาถึงภายใน {g} นาที'],
+        '{n} no-shows in {d} days = no booking for {b} days': ['ཉིན་ {d} ནང་ མ་ལྷོད་ {n} = ཉིན་ {b} སྔོན་བཟུང་མེད་', 'ไม่มา {n} ครั้งใน {d} วัน = จองไม่ได้ {b} วัน'],
+        'Chargers: {x}': ['གློག་བླུགས་ཆས་: {x}', 'ตู้: {x}'], 'Booking': ['སྔོན་བཟུང་', 'การจอง'], 'Station': ['ས་ཚིགས་', 'สถานี'], 'Time (BTT)': ['ཆུ་ཚོད་ (BTT)', 'เวลา (ภูฏาน)'],
+        'Driver': ['དེད་པ་', 'ผู้ขับ'], 'Status': ['གནས་ཚད་', 'สถานะ'], 'Connector hold': ['མཐུད་ཆས་བཞག་ཐངས་', 'การกันหัว'],
+        '⚡ Reserve now': ['⚡ ད་ལྟོ་སྔོན་བཟུང་', '⚡ จองทันที'], '🗓️ Time slot': ['🗓️ དུས་ཚོད་', '🗓️ จองช่วงเวลา'], 'Connector {n}': ['མཐུད་ཆས་ {n}', 'หัวชาร์จ {n}'],
+        'by {u}': ['{u} གིས་', 'โดย {u}'], '✖ Cancel': ['✖ ཆ་མེད་', '✖ ยกเลิก'], 'No bookings': ['སྔོན་བཟུང་མེད་', 'ไม่มีการจอง'],
+        'A driver who misses {n} bookings in {d} days cannot book for {b} days. Unblock forgives the missed bookings.': ['ཉིན་ {d} ནང་ སྔོན་བཟུང་ {n} ལུ་མ་ལྷོད་མི་དེད་པ་གིས་ ཉིན་ {b} སྔོན་བཟུང་འབད་མི་ཚུགས་. བཀག་ཆ་བཏོན་ན་ མ་ལྷོད་མི་ཚུ་གུ་ཡངས་བཅོལ་འབདཝ་ཨིན་', 'ผู้ขับที่จองแล้วไม่มา {n} ครั้งใน {d} วัน จะจองไม่ได้ {b} วัน ปุ่มปลดล็อกจะยกโทษการไม่มาเหล่านั้น'],
+        'No limit for missed bookings (switched off in Settings).': ['མ་ལྷོད་པའི་སྔོན་བཟུང་ལུ་ཚད་མེད་ (སྒྲིག་སྟངས་ནང་ཁ་བསྡམས་ཡོད་)', 'ไม่จำกัดการจองแล้วไม่มา (ปิดไว้ในตั้งค่า)'],
+        'Missed': ['མ་ལྷོད་', 'ไม่มา'], 'Can book again': ['ལོག་སྟེ་སྔོན་བཟུང་འབད་ཚུགས་', 'จองได้อีกครั้ง'], 'now': ['ད་ལྟོ་', 'ตอนนี้'], 'Unblock': ['བཀག་ཆ་བཏོན་', 'ปลดล็อก'],
+        'Nobody has missed a booking': ['སྔོན་བཟུང་ལུ་མ་ལྷོད་མི་མེད་', 'ยังไม่มีใครจองแล้วไม่มา'],
+        'Booking cancelled': ['སྔོན་བཟུང་ཆ་མེད་བཏང་ཡི་', 'ยกเลิกการจองแล้ว'], 'Cancel booking {id}?': ['སྔོན་བཟུང་ {id} ཆ་མེད་གཏང་ག?', 'ยกเลิกการจอง {id}?'],
+        'Reason for the driver (optional)': ['དེད་པ་ལུ་རྒྱུ་མཚན་ (གདམ་ཁ་)', 'เหตุผลถึงผู้ขับ (ไม่บังคับ)'], 'Keep it': ['བཞག་', 'ไม่ยกเลิก'], '✖ Cancel booking': ['✖ སྔོན་བཟུང་ཆ་མེད་', '✖ ยกเลิกการจอง'], 'Forgive the missed bookings of this driver?': ['དེད་པ་འདི་གི་མ་ལྷོད་པའི་སྔོན་བཟུང་ཚུ་ཡངས་བཅོལ་འབད་ག?', 'ยกโทษการจองแล้วไม่มาของผู้ขับคนนี้?'],
+        'Unblocked': ['བཀག་ཆ་བཏོན་ཡི་', 'ปลดล็อกแล้ว'], 'No station can be booked (none accepted / allowed)': ['སྔོན་བཟུང་འབད་ཚུགས་པའི་ས་ཚིགས་མེད་', 'ไม่มีสถานีที่จองได้'],
+        'offline': ['མཐུད་མེད་', 'ออฟไลน์'], 'Connector': ['མཐུད་ཆས་', 'หัวชาร์จ'], 'Date (BTT)': ['ཚེས་གྲངས་ (BTT)', 'วันที่ (เวลาภูฏาน)'],
+        'Start (HH:MM, BTT)': ['འགོ་བཙུགས་ (HH:MM, BTT)', 'เริ่ม (HH:MM เวลาภูฏาน)'], 'Minutes': ['སྐར་མ་', 'นาที'],
+        'App account (mobile number or e-mail)': ['App རྩིས་ཁྲ་ (མོ་བཱའིལ་ཨང་ ཡང་ན་ གློག་འཕྲིན་)', 'บัญชีแอป (เบอร์มือถือหรืออีเมล)'], 'RFID card': ['RFID ཤོག་བྱང་', 'บัตร RFID'],
+        'Mobile number or e-mail of the app account': ['App རྩིས་ཁྲ་གི་མོ་བཱའིལ་ཨང་ ཡང་ན་ གློག་འཕྲིན་', 'เบอร์มือถือหรืออีเมลของบัญชีแอป'], 'RFID card id': ['RFID ཤོག་བྱང་ཨང་', 'เลขบัตร RFID'],
+        'Name (optional)': ['མིང་ (གདམ་ཁ་)', 'ชื่อ (ไม่บังคับ)'], 'Note (optional)': ['དྲན་ཐོ་ (གདམ་ཁ་)', 'หมายเหตุ (ไม่บังคับ)'],
+        'Console bookings skip the app limits (one booking per driver, how far ahead). The charger keeps the connector from {l} min before the start until {g} min after it.': ['console གི་སྔོན་བཟུང་ལུ་ app གི་ཚད་ (དེད་པ་རེ་ལུ་སྔོན་བཟུང་གཅིག་ ཧེ་མ་ག་དེ་ཅིག་) མི་འཕྲོད་. འགོ་བཙུགས་ཧེ་མ་སྐར་མ་ {l} ལས་ ཤུལ་མ་སྐར་མ་ {g} ཚུན་མཐུད་ཆས་བཞག་འོང་', 'การจองจากหน้าเจ้าหน้าที่ไม่ติดข้อจำกัดของแอป (คนละ 1 การจอง และจองล่วงหน้าได้นานเท่าไหร่) ตู้จะกันหัวตั้งแต่ {l} นาทีก่อนเวลาเริ่ม จนถึง {g} นาทีหลังเวลาเริ่ม'],
+        '➕ New booking': ['➕ སྔོན་བཟུང་གསརཔ་', '➕ จองใหม่'], '💾 Book': ['💾 སྔོན་བཟུང་', '💾 จอง'], 'Choose the date and time': ['ཚེས་གྲངས་དང་ཆུ་ཚོད་གདམ་', 'เลือกวันที่และเวลา'],
+        'Booked: {id}': ['སྔོན་བཟུང་འབད་ཡི་: {id}', 'จองแล้ว: {id}'], 'Booking is on': ['སྔོན་བཟུང་ཁ་ཕྱེ་', 'เปิดการจอง'],
+        'Drivers can book in the BPC EV app': ['དེད་པ་ཚུ་གིས་ BPC EV app ནང་སྔོན་བཟུང་འབད་ཚུགས་', 'ผู้ขับจองผ่านแอป BPC EV ได้'],
+        'Only these chargers (comma separated, empty = all)': ['གློག་བླུགས་ཆས་འདི་ཚུ་ཁོ་ར་ (བར་རྟགས་ , སྟོངམ་ = ཆ་མཉམ་)', 'เฉพาะตู้เหล่านี้ (คั่นด้วยจุลภาค ว่าง = ทุกตู้)'],
+        '"Reserve now" keeps the connector for (min)': ['"ད་ལྟོ་སྔོན་བཟུང་" གིས་མཐུད་ཆས་བཞག་ཡུན་ (སྐར་མ་)', '"จองทันที" กันหัวไว้นาน (นาที)'],
+        'Time slot lengths the driver can choose (min, comma separated)': ['དེད་པ་གིས་གདམ་ཚུགས་པའི་དུས་ཡུན་ (སྐར་མ་, བར་རྟགས་ ,)', 'ความยาวช่วงเวลาที่ผู้ขับเลือกได้ (นาที คั่นด้วยจุลภาค)'],
+        'Start times every (min)': ['འགོ་བཙུགས་ཆུ་ཚོད་ སྐར་མ་ … རེ་', 'เวลาเริ่มทุก ๆ (นาที)'], 'Book up to … days ahead': ['ཉིན་ … གི་ཧེ་མ་ཚུན་སྔོན་བཟུང་', 'จองล่วงหน้าได้ … วัน'],
+        'Book at least … min ahead (app)': ['ཉུང་མཐའ་སྐར་མ་ … ཧེ་མ་སྔོན་བཟུང་ (app)', 'ต้องจองล่วงหน้าอย่างน้อย … นาที (แอป)'],
+        'Keep the connector … min before the start': ['འགོ་བཙུགས་ཧེ་མ་སྐར་མ་ … ལས་མཐུད་ཆས་བཞག་', 'กันหัวก่อนเวลาเริ่ม … นาที'],
+        'The driver must start within … min of the start': ['དེད་པ་གིས་འགོ་བཙུགས་ཆུ་ཚོད་ལས་སྐར་མ་ … ནང་གློག་བླུགས་དགོ་', 'ผู้ขับต้องเริ่มชาร์จภายใน … นาทีหลังเวลาเริ่ม'],
+        'Bookings per driver at the same time (app)': ['དེད་པ་རེ་ལུ་ཆབས་ཅིག་སྔོན་བཟུང་ (app)', 'จำนวนการจองต่อผู้ขับในเวลาเดียวกัน (แอป)'],
+        'Missed bookings allowed (0 = no limit)': ['མ་ལྷོད་ཆོག་པའི་སྔོན་བཟུང་ (0 = ཚད་མེད་)', 'จำนวนครั้งที่ไม่มาได้ (0 = ไม่จำกัด)'], '… within (days)': ['… ཉིན་ནང་', '… ภายใน (วัน)'],
+        'Then no booking for (days)': ['དེ་ལས་ཉིན་ … སྔོན་བཟུང་མེད་', 'จากนั้นจองไม่ได้ (วัน)'], 'Keep finished bookings for (days)': ['མཇུག་བསྡུ་ཡོད་པའི་སྔོན་བཟུང་བཞག་ཡུན་ (ཉིན་)', 'เก็บการจองที่จบแล้ว (วัน)'],
+        'At the start of a booking the CSMS sends ReserveNow to the charger (OCPP 1.6 Reservation profile): the connector shows Reserved and only the booking\'s driver can start. A charger that cannot reserve is kept by the CSMS: other cards and app / QR starts are refused on that connector. Booking is free; drivers who miss bookings are paused.': ['སྔོན་བཟུང་འགོ་བཙུགས་པའི་སྐབས་ CSMS གིས་གློག་བླུགས་ཆས་ལུ་ ReserveNow གཏངམ་ཨིན་ (OCPP 1.6 Reservation): མཐུད་ཆས་ Reserved སྟོནམ་ཨིན་ དེ་ལས་སྔོན་བཟུང་གི་དེད་པ་ཁོ་ར་གིས་འགོ་བཙུགས་ཚུགས་. སྔོན་བཟུང་འབད་མི་ཚུགས་པའི་གློག་བླུགས་ཆས་ CSMS གིས་བཞགཔ་ཨིན་: མཐུད་ཆས་དེ་ནང་ཤོག་བྱང་གཞན་དང་ app / QR གི་འགོ་བཙུགས་ཚུ་ངོས་མི་ལེན་. སྔོན་བཟུང་རིན་མེད་ཨིན་; མ་ལྷོད་མི་དེད་པ་ཚུ་བར་བཀག་འབདཝ་ཨིན་', 'เมื่อถึงเวลาการจอง CSMS ส่ง ReserveNow ให้ตู้ (OCPP 1.6 Reservation) หัวชาร์จจะขึ้น Reserved และเฉพาะผู้ขับที่จองเริ่มชาร์จได้ ตู้ที่จองเองไม่ได้ CSMS จะกันหัวให้เอง: บัตรอื่นและการเริ่มชาร์จจากแอป / QR ของคนอื่นจะถูกปฏิเสธที่หัวนั้น การจองไม่มีค่าใช้จ่าย ผู้ขับที่จองแล้วไม่มาจะถูกระงับการจองชั่วคราว'],
+        '⚙️ Booking settings': ['⚙️ སྔོན་བཟུང་གི་སྒྲིག་སྟངས་', '⚙️ ตั้งค่าการจอง'], 'Saved': ['བསྲུང་ཡོད་', 'บันทึกแล้ว'], '⬇️ CSV': ['⬇️ CSV', '⬇️ CSV'],
+        '⚙️ Settings': ['⚙️ སྒྲིག་སྟངས་', '⚙️ ตั้งค่า'], '7 days': ['ཉིན་ ༧', '7 วัน'], '30 days': ['ཉིན་ ༣༠', '30 วัน'], 'Today': ['ད་རིས་', 'วันนี้']
+    });
 })();
 ''')
 
