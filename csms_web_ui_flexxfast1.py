@@ -11937,18 +11937,18 @@ async function switchCsmsVersion() {
                 
                 return `
                     <tr>
-                        <td style="font-family: monospace; font-weight: 600;">${card.id_tag}</td>
+                        <td style="font-family: monospace; font-weight: 600;">${esc(card.id_tag)}</td>
                         <td>
                             <span style="color: ${statusColors[card.status] || 'var(--text)'};">
-                                ${statusIcons[card.status] || ''} ${card.status}
+                                ${statusIcons[card.status] || ''} ${esc(card.status)}
                             </span>
                         </td>
-                        <td>${card.description || '-'}</td>
+                        <td>${esc(card.description || '-')}</td>
                         <td style="font-size: 0.8rem;">${expiry}</td>
                         <td style="font-size: 0.8rem;">${lastUsed}</td>
                         <td>
-                            <button onclick="editRfidCard('${card.id_tag}')" class="edit-btn" style="margin-right: 0.25rem;">✏️</button>
-                            <button onclick="deleteRfidCard('${card.id_tag}')" class="edit-btn" style="background: var(--error);">🗑️</button>
+                            <button data-tag="${esc(card.id_tag)}" onclick="editRfidCard(this.dataset.tag)" class="edit-btn" style="margin-right: 0.25rem;">✏️</button>
+                            <button data-tag="${esc(card.id_tag)}" onclick="deleteRfidCard(this.dataset.tag)" class="edit-btn" style="background: var(--error);">🗑️</button>
                         </td>
                     </tr>
                 `;
@@ -18598,7 +18598,7 @@ import re as _ops_re
 import csv as _ops_csv
 import io as _ops_io
 
-OPS_VERSION = '1.13.0'
+OPS_VERSION = '1.14.0'
 OPS_FEATURES: List[str] = ['users']
 OPS_DIR = str(APP_DIR / 'ops_data')
 OPS_TZ = timezone(timedelta(hours=6))           # Bhutan Time (BTT, UTC+06:00): ops views, monthly files, reports
@@ -19049,6 +19049,12 @@ def ops_audit_request(request, rec: dict, body, command: str, status: int):
         hide = OPS_AUDIT_SECRET_FIELDS.get(request.path)
         if hide:
             body = {k: ('***' if k in hide and v not in (None, '') else v) for k, v in body.items()}
+    try:
+        extra = request.get('ops_audit_detail')        # [OPS] v1.14 a summary added by the handler
+    except Exception:
+        extra = None
+    if isinstance(extra, dict):
+        body = dict(body if isinstance(body, dict) else {}, **extra)
     action = ('command ' + command) if command else request.path
     ops_audit(rec.get('username', '?'), action, role=rec.get('role', ''), ip=_client_ip(request), method=request.method,
               path=request.path, status=status, cp=cp, detail=body)
@@ -33955,6 +33961,1758 @@ OPS_JS_PARTS.append(r'''/* [OPS] 🆔 Charger IDs (v1.13): the CSMS issues the C
         'Charger address: ws://… or wss://… (for example wss://csms.example.bt/ocpp), or empty': ['གློག་བླུགས་འཕྲུལ་ཆས་ཀྱི་ཁ་བྱང་: ws://… ཡང་ན་ wss://… (དཔེར་ན་ wss://csms.example.bt/ocpp) ཡང་ན་ སྟོངམ་', 'ที่อยู่สำหรับตู้: ws://… หรือ wss://… (เช่น wss://csms.example.bt/ocpp) หรือเว้นว่าง'],
         'Each line: CODE = Dzongkhag name (3 letters), e.g. THM = Thimphu': ['ཐིག་རེ་རེ་: CODE = རྫོང་ཁག་གི་མིང་ (ཡིག་འབྲུ་ 3) དཔེར་ན་ THM = Thimphu', 'แต่ละบรรทัด: CODE = ชื่อซองคาก (ตัวอักษร 3 ตัว) เช่น THM = Thimphu'],
         'Give 1 - 60 dzongkhag codes': ['རྫོང་ཁག་གི་ཨང་རྟགས་ 1 - 60 བཀོད།', 'ใส่รหัสซองคาก 1 - 60 รายการ']
+    });
+})();
+''')
+
+
+# ---- [OPS] v1.14 RFID card owners: who holds each card (name, mobile number, e-mail, vehicle plate, organisation), card
+#      lists from CSV / Excel with a preview before anything changes and to CSV / Excel, and a safer card list: editing a
+#      card keeps its creation and last-used times, new card IDs and every card field are checked, a date alone as expiry
+#      means the end of that day (Bhutan Time), and the owner details are shown only to roles that manage cards (config)
+#      or see customers (view_customers). The owner fields are new fields of the same records (rfid_cards in MongoDB,
+#      rfid_cards.json without it), so backups, restores and the database switch carry them as before.
+#      Cards from before these rules keep what they have: a status in small letters ('blocked') is sent to the chargers
+#      as the OCPP status ('Blocked' - it was sent as it was and refused by the charger), and a change in the console
+#      sends only the fields that were changed. An import writes what its preview showed (or nothing: 409), and leaves
+#      out a card that someone else added, changed or deleted meanwhile.
+import concurrent.futures as _rfid_cf
+import contextvars as _rfid_cv
+import datetime as _rfid_dt
+import hashlib as _rfid_hash
+import itertools as _rfid_it
+
+OPS_FEATURES.append('rfid_owners')
+RFID_OWNER_FIELDS = ('owner_name', 'owner_phone', 'owner_email', 'vehicle_plate', 'organisation')
+RFID_EDIT_FIELDS = ('status', 'expiry_date', 'parent_id', 'description') + RFID_OWNER_FIELDS
+RFID_STATUSES = ('Accepted', 'Blocked', 'Expired', 'Invalid')
+RFID_ALL_STATUSES = RFID_STATUSES + ('ConcurrentTx',)
+_RFID_OCPP_STATUS = {s.lower(): s for s in RFID_ALL_STATUSES}
+RFID_STATUS_ALIASES = {'active': 'Accepted', 'valid': 'Accepted', 'enabled': 'Accepted', 'ok': 'Accepted',
+                       'blocked': 'Blocked', 'block': 'Blocked', 'disabled': 'Blocked', 'lost': 'Blocked', 'stolen': 'Blocked',
+                       'suspended': 'Blocked', 'expired': 'Expired', 'invalid': 'Invalid'}
+RFID_TAG_RE = _ops_re.compile(r'^[A-Z0-9][A-Z0-9._:#/+*-]{0,19}$')
+RFID_EMAIL_RE = _ops_re.compile(r'^[^@\s<>"\'`,;]{1,64}@[^@\s<>"\'`,;]{1,120}\.[A-Za-z]{2,24}$')
+RFID_PLATE_RE = _ops_re.compile(r'^[A-Z0-9]([A-Z0-9 -]{0,18}[A-Z0-9])?$')
+RFID_IMPORT_MAX_BYTES = 5 * 1024 * 1024          # one file
+RFID_IMPORT_MAX_ROWS = 20000                     # cards in one file
+RFID_IMPORT_MAX_UNZIPPED = 40 * 1024 * 1024      # an .xlsx unpacked (zip bomb guard)
+RFID_IMPORT_MAX_SST = 16 * 1024 * 1024           # its shared texts (openpyxl keeps them all in memory)
+RFID_IMPORT_MAX_SCAN = 100000                    # rows read from a sheet, empty ones included
+RFID_IMPORT_MAX_COLS = 200                       # columns (JSON: field names) looked at
+RFID_UPLOAD_MAX = 64 * 1024 * 1024               # a whole upload: beyond this the connection is not read further
+RFID_PREVIEW_ITEMS = 300                         # rows listed in the preview (the counts cover all of them)
+RFID_YEAR_MIN, RFID_YEAR_MAX = 2000, 9999        # expiry years (9999-12-31 is a common "never")
+RFID_ERR_DATE_ID = 'Card ID: Excel turned this cell into a date - format the Card ID column as Text and type the ID again'
+RFID_ERR_NUM_ID = 'Card ID: Excel keeps only 15 digits of a number - format the Card ID column as Text and type the ID again'
+for _p in ('/api/ops/rfid/save', '/api/ops/rfid/import'):
+    ops_perm_rule('POST', _p, 'config')
+OPS_AUDIT_SECRET_FIELDS['/api/ops/rfid/save'] = {'owner_phone', 'owner_email'}
+OPS_AUDIT_SECRET_FIELDS['/api/rfid/add'] = {'owner_phone', 'owner_email'}
+OPS_AUDIT_SECRET_FIELDS['/api/rfid/import'] = {'cards'}              # personal details of many people: only the counts
+
+# columns of the export, the template and the import (the import also knows other names for them, see RFID_HEADERS)
+RFID_COLUMNS = [('id_tag', 'Card ID'), ('status', 'Status'), ('expiry_date', 'Expiry (Bhutan Time)'), ('parent_id', 'Parent ID'),
+                ('description', 'Note'), ('owner_name', 'Owner name'), ('owner_phone', 'Mobile'), ('owner_email', 'E-mail'),
+                ('vehicle_plate', 'Vehicle plate'), ('organisation', 'Organisation'), ('created', 'Created (Bhutan Time)'),
+                ('updated', 'Updated (Bhutan Time)'), ('last_used', 'Last used (Bhutan Time)')]
+RFID_MASKED_COLUMNS = ('description', 'owner_name', 'owner_phone', 'owner_email', 'vehicle_plate')   # "(masked)" in a shortened export
+RFID_READONLY_COLUMNS = ('created', 'updated', 'last_used', 'lastused', 'createdat', 'updatedat', 'effective')
+RFID_HEADERS = {
+    'id_tag': ('cardid', 'idtag', 'tag', 'card', 'cardnumber', 'cardno', 'uid', 'rfid', 'rfidcard', 'rfidtag', 'rfidcardid',
+               'token', 'idtoken', 'cardidtag'),
+    'status': ('status', 'state', 'cardstatus'),
+    'expiry_date': ('expiry', 'expirydate', 'expires', 'expireson', 'validuntil', 'validto'),
+    'parent_id': ('parentid', 'parent', 'parentidtag'),
+    'description': ('note', 'notes', 'description', 'label', 'remark', 'remarks', 'comment', 'comments'),
+    'owner_name': ('ownername', 'owner', 'name', 'holder', 'cardholder', 'holdername', 'customer', 'customername', 'driver',
+                   'drivername', 'fullname'),
+    'owner_phone': ('mobile', 'phone', 'mobilenumber', 'mobileno', 'phonenumber', 'phoneno', 'ownerphone', 'ownermobile', 'tel',
+                    'telephone', 'contact', 'contactnumber', 'cell', 'cellphone'),
+    'owner_email': ('email', 'owneremail', 'mail', 'emailaddress'),
+    'vehicle_plate': ('vehicleplate', 'plate', 'numberplate', 'vehiclenumber', 'vehicleno', 'vehicleregistration',
+                      'registrationnumber', 'licenceplate', 'licenseplate', 'carplate', 'platenumber'),
+    'organisation': ('organisation', 'organization', 'company', 'fleet', 'department', 'agency', 'org', 'employer'),
+}
+_RFID_HEADER_MAP = {alias: field for field, names in RFID_HEADERS.items() for alias in names}
+_RFID_MASKED_RE = _ops_re.compile(r'\(\s*masked\s*\)', _ops_re.I)
+_RFID_SURR_RE = _ops_re.compile('[\ud800-\udfff]')
+_RFID_XL_BAD_RE = _ops_re.compile('[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')       # characters an Excel file cannot hold
+_RFID_DIGITS_RE = _ops_re.compile(r'\+?\d[\d \-]{5,}\d')
+
+
+# ---- text that can always be written (UTF-8, Excel) ---------------------------------------------------------------------
+def ops_text_safe(s):
+    """A lone UTF-16 surrogate (e.g. sent as JSON "\\ud800") is not a character and cannot be written as UTF-8 -> U+FFFD."""
+    return _RFID_SURR_RE.sub('�', s) if isinstance(s, str) and s else s
+
+
+def _ops_json_dumps(o) -> str:
+    return ops_text_safe(json.dumps(o, ensure_ascii=False, default=str))
+
+
+def ops_json(data, status: int = 200):
+    """[OPS] v1.14 a lone surrogate in stored text no longer turns a whole answer (card list, audit log...) into error 500."""
+    return web.json_response(data, status=status, dumps=_ops_json_dumps)
+
+
+_ops_audit_add_orig = OPS_AUDIT.add
+
+
+def _ops_audit_add_safe(ev: dict) -> dict:
+    """The audit log keeps only text that can be written and shown (a failed login with a broken name included)."""
+    if isinstance(ev, dict):
+        ev = {k: ops_text_safe(v) for k, v in ev.items()}
+    return _ops_audit_add_orig(ev)
+
+
+OPS_AUDIT.add = _ops_audit_add_safe
+
+
+# ---- field rules (one place for the console, the old card API and the import) ------------------------------------------
+def _rfid_txt(v, n: int) -> str:
+    """Text of a card field: no control characters (tabs / new lines become spaces), single spaces, at most n characters."""
+    s = '' if v is None else str(v)
+    s = ''.join(ch if ch >= ' ' and ch != '\x7f' else ' ' for ch in s)
+    return ' '.join(ops_text_safe(s).split())[:n]
+
+
+def _rfid_unquote(v):
+    """A text cell exported by the CSMS starts with ' when it looks like a formula (=, +, -, @): the mark is not data."""
+    if isinstance(v, str) and len(v) > 1 and v[0] == "'" and v[1] in '=+-@\t\r':
+        return v[1:]
+    return v
+
+
+def rfid_norm_tag(v, cards=None) -> str:
+    """A card ID as typed -> the stored form: capitals, no spaces. An ID that is registered as it is (also one from before
+    these rules, e.g. with a space) stays that ID."""
+    if isinstance(v, float) and v.is_integer():
+        v = int(v)
+    v = _rfid_unquote(v)
+    raw = ops_text_safe(str(v if v is not None else '').strip().upper())
+    if cards is not None and raw in cards:
+        return raw
+    return ''.join(_rfid_txt(raw, 64).split())
+
+
+def rfid_tag_error(tag: str):
+    if not tag:
+        return 'Card ID is required'
+    if len(tag) > 20:
+        return 'Card ID: at most 20 characters (OCPP idTag)'
+    if not RFID_TAG_RE.match(tag):
+        return 'Card ID: letters, digits and - _ . : # / + * only'
+    return None
+
+
+def rfid_status_ocpp(v) -> str:
+    """The status a charger is sent for a stored value: the OCPP name in any letter case ('blocked' -> 'Blocked'); an
+    empty or unknown one -> Invalid (the charger refuses the card instead of the whole answer)."""
+    raw = getattr(v, 'value', v)
+    s = str(raw if raw is not None else '').split('.')[-1].strip()
+    return _RFID_OCPP_STATUS.get(s.lower(), 'Invalid')
+
+
+def rfid_norm_status(v):
+    s = _rfid_txt(v, 20)
+    for st in RFID_ALL_STATUSES:
+        if s.lower() == st.lower():
+            return st, None
+    if s.lower() in RFID_STATUS_ALIASES:
+        return RFID_STATUS_ALIASES[s.lower()], None
+    return None, 'Status: Accepted, Blocked, Expired or Invalid'
+
+
+def rfid_norm_phone(v):
+    """-> (number, error): the BPC EV app's form - digits only, Bhutan numbers without +975 (17123456)."""
+    if isinstance(v, float) and v.is_integer():
+        v = int(v)
+    raw = _rfid_txt(_rfid_unquote(v), 40)
+    if not raw:
+        return '', None
+    try:
+        p = _app_norm_phone(raw)
+    except NameError:
+        p = ''.join(ch for ch in raw if ch.isdigit())
+    if not p.isdigit() or not 8 <= len(p) <= 15:
+        return '', 'Mobile number: 8 - 15 digits'
+    return p, None
+
+
+def rfid_norm_plate(v):
+    s = ' '.join(_rfid_txt(_rfid_unquote(v), 40).upper().replace('_', '-').split())
+    if not s:
+        return '', None
+    if len(s) > 20 or not RFID_PLATE_RE.match(s):
+        return '', 'Vehicle plate: letters, digits, spaces and - (at most 20)'
+    return s, None
+
+
+def rfid_norm_email(v):
+    s = _rfid_txt(v, 200).lower()
+    if not s:
+        return '', None
+    if len(s) > 120 or not RFID_EMAIL_RE.match(s):
+        return '', 'E-mail address not valid'
+    return s, None
+
+
+def _rfid_known_parents(cards: dict) -> dict:
+    """Parent IDs in use and the card IDs, by their capital-letter form -> as stored."""
+    out = {}
+    for k, c in list(cards.items()):
+        p = c.get('parent_id') if isinstance(c, dict) else None
+        if p:
+            out.setdefault(str(p).upper(), str(p))
+        out.setdefault(str(k).upper(), str(k))
+    return out
+
+
+def rfid_norm_parent(v, known: dict = None):
+    """A parent ID that is in use (known, any letter case) stays as it is stored - also one from before these rules
+    ('vip group'); a new one is written like a card ID."""
+    raw = ops_text_safe(str(_rfid_unquote(v) if v is not None else '').strip())
+    if known and raw and raw.upper() in known:
+        return known[raw.upper()], None
+    s = rfid_norm_tag(v)
+    if not s:
+        return None, None
+    if len(s) > 20 or not RFID_TAG_RE.match(s):
+        return None, 'Parent ID: at most 20 letters, digits and - _ . : # / + *'
+    return s, None
+
+
+def _rfid_end_of_day(y: int, m: int, d: int):
+    return _rfid_dt.datetime(y, m, d, 23, 59, 59)
+
+
+def rfid_norm_expiry(v):
+    """-> (stored value, error). Stored as the console stores it: Bhutan Time without a zone ('2026-12-31T23:59:59'). A date
+    alone (also an Excel date cell, 20261231, 2026-W53-4) means the end of that day; a time with a zone is turned into
+    Bhutan Time."""
+    if v is None:
+        return None, None
+    d = None
+    try:
+        if isinstance(v, _rfid_dt.datetime):
+            d = v
+            if d.tzinfo is not None:
+                d = d.astimezone(CSMS_TZ).replace(tzinfo=None)
+            elif (d.hour, d.minute, d.second, d.microsecond) == (0, 0, 0, 0):     # an Excel date cell
+                d = _rfid_end_of_day(d.year, d.month, d.day)
+        elif isinstance(v, _rfid_dt.date):
+            d = _rfid_end_of_day(v.year, v.month, v.day)
+        else:
+            s = _rfid_txt(_rfid_unquote(v), 40)
+            if not s:
+                return None, None
+            m = _ops_re.match(r'^(\d{4})-(\d{1,2})-(\d{1,2})$', s)
+            m2 = _ops_re.match(r'^(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})$', s)          # day / month / year, as written in Bhutan
+            m4 = _ops_re.match(r'^(\d{4})/(\d{1,2})/(\d{1,2})$', s)
+            m3 = _ops_re.match(r'^(\d{4})-(\d{2})-(\d{2})[T ](\d{1,2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?$', s)
+            if m:
+                d = _rfid_end_of_day(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            elif m2:
+                d = _rfid_end_of_day(int(m2.group(3)), int(m2.group(2)), int(m2.group(1)))
+            elif m4:
+                d = _rfid_end_of_day(int(m4.group(1)), int(m4.group(2)), int(m4.group(3)))
+            elif m3:
+                d = _rfid_dt.datetime(int(m3.group(1)), int(m3.group(2)), int(m3.group(3)), int(m3.group(4)), int(m3.group(5)),
+                                      int(m3.group(6) or 0))
+            elif not _ops_re.search(r'[T:]', s.upper()):                              # another way of writing a date alone
+                x = _rfid_dt.date.fromisoformat(s.rstrip('Zz'))
+                d = _rfid_end_of_day(x.year, x.month, x.day)
+            else:
+                d = _rfid_dt.datetime.fromisoformat(s.replace('Z', '+00:00').replace('z', '+00:00'))
+                if d.tzinfo is not None:
+                    d = d.astimezone(CSMS_TZ).replace(tzinfo=None)
+    except (ValueError, OverflowError, TypeError):
+        d = None
+    if d is None or not RFID_YEAR_MIN <= d.year <= RFID_YEAR_MAX:
+        return None, 'Expiry: a date as YYYY-MM-DD (or DD/MM/YYYY), Bhutan Time'
+    return d.strftime('%Y-%m-%dT%H:%M:%S'), None
+
+
+def rfid_clean(b: dict, fields=None, keep_empty: bool = True, known_parents: dict = None):
+    """Normalised card fields of b -> (values, errors). Only the fields present in b are looked at (fields limits them);
+    keep_empty=False leaves out empty values (an empty cell of an import keeps what the card has)."""
+    out, errs = {}, {}
+    for f in (fields or RFID_EDIT_FIELDS):
+        if f not in b:
+            continue
+        v = b[f]
+        empty = v is None or (isinstance(v, str) and not v.strip())
+        if empty and not keep_empty:
+            continue
+        if f == 'status':
+            if empty:
+                continue                                                   # a card always keeps a status
+            val, err = rfid_norm_status(v)
+        elif f == 'expiry_date':
+            val, err = rfid_norm_expiry(v)
+        elif f == 'parent_id':
+            val, err = rfid_norm_parent(v, known_parents)
+        elif f == 'description':
+            val, err = _rfid_txt(_rfid_unquote(v), 200), None
+        elif f == 'owner_name':
+            val, err = _rfid_txt(_rfid_unquote(v), 80), None
+        elif f == 'organisation':
+            val, err = _rfid_txt(_rfid_unquote(v), 80), None
+        elif f == 'owner_phone':
+            val, err = rfid_norm_phone(v)
+        elif f == 'owner_email':
+            val, err = rfid_norm_email(v)
+        elif f == 'vehicle_plate':
+            val, err = rfid_norm_plate(v)
+        else:
+            continue
+        if err:
+            errs[f] = err
+        else:
+            out[f] = val
+    return out, errs
+
+
+# ---- storing (editing keeps the creation and last-used times and every field it does not change) ----------------------
+def _rfid_put(tag: str, fields: dict, by: str = None) -> dict:
+    """Create or change the card record in memory (the caller saves the list)."""
+    old = app_state.rfid_cards.get(tag)
+    rec = dict(old) if isinstance(old, dict) else {}
+    now = datetime.now().isoformat()
+    if not rec:
+        rec = {'status': 'Accepted', 'expiry_date': None, 'parent_id': None, 'description': '', 'created_at': now, 'last_used': None}
+        if by:
+            rec['created_by'] = str(by)[:64]
+    else:
+        rec.setdefault('created_at', now)
+        rec.setdefault('last_used', None)
+        rec['updated_at'] = now
+        if by:
+            rec['updated_by'] = str(by)[:64]
+    for f, v in fields.items():
+        if f in RFID_EDIT_FIELDS:
+            rec[f] = v
+    app_state.rfid_cards[tag] = rec
+    return rec
+
+
+def _rfid_save_list():
+    app_state._save_rfid_cards()
+
+
+# free charging's "register this card in RFID Cards": the card gets the holder from the free-charging card list (not the
+# mobile number in its note, which every role would see)
+_RFID_FREE_REG = _rfid_cv.ContextVar('rfid_free_reg', default=None)
+
+
+def _ops_rfid_add_card(self, id_tag: str, status: str = 'Accepted', expiry_date: str = None, parent_id: str = None,
+                       description: str = '', **more) -> bool:
+    """AppState.add_rfid_card (also used by free charging): adds a card or changes it - the creation and last-used times and
+    the owner details stay (owner fields only change when they are given)."""
+    by = more.pop('by', None)
+    tag = ops_text_safe(str(id_tag or '').strip().upper())
+    reg = _RFID_FREE_REG.get()
+    if reg and reg.get('card') == tag and tag not in app_state.rfid_cards:
+        description = 'Free charging'
+        more = dict(more, **reg.get('owner') or {})
+    fields = {'status': status, 'expiry_date': expiry_date, 'parent_id': parent_id, 'description': _rfid_txt(description, 200)}
+    fields.update({k: v for k, v in more.items() if k in RFID_OWNER_FIELDS})
+    _rfid_put(tag, fields, by)
+    _rfid_save_list()
+    return True
+
+
+AppState.add_rfid_card = _ops_rfid_add_card
+
+# the chargers get the OCPP status of a card in any letter case ('blocked' from an old import was sent as it was: the
+# charger refused the whole answer), an unknown one as Invalid, and no parent ID longer than OCPP allows (20)
+_rfid_authorize_orig = AppState.authorize_rfid
+
+
+def _rfid_authorize(self, id_tag: str) -> dict:
+    info = _rfid_authorize_orig(self, id_tag)
+    try:
+        if isinstance(info, dict) and 'status' in info:
+            st = info.get('status')
+            fixed = rfid_status_ocpp(st)
+            if fixed != getattr(st, 'value', st):
+                logger.warning(f"RFID card {str(id_tag)[:24]}: stored status {str(getattr(st, 'value', st))[:20]!r} sent as {fixed}")
+                info = dict(info, status=fixed)
+            p = info.get('parentIdTag')
+            if p is not None and not (isinstance(p, str) and 0 < len(p) <= 20):
+                info = {k: v for k, v in info.items() if k != 'parentIdTag'}
+    except Exception as e:
+        logger.error(f"rfid: status check failed: {e}")
+    return info
+
+
+AppState.authorize_rfid = _rfid_authorize
+
+# rfid_expiry_utc: a date alone ('2026-12-31') is the end of that day, Bhutan Time (it was the start of it)
+_rfid_expiry_utc_orig = rfid_expiry_utc
+
+
+def rfid_expiry_utc(value):
+    s = str(value or '').strip()
+    if len(s) == 10 and s[4] == '-' and s[7] == '-':
+        try:
+            return _rfid_dt.datetime.strptime(s, '%Y-%m-%d').replace(hour=23, minute=59, second=59, tzinfo=CSMS_TZ).astimezone(timezone.utc)
+        except (ValueError, OverflowError):
+            return None
+    try:
+        return _rfid_expiry_utc_orig(value)
+    except (ValueError, OverflowError, OSError, TypeError):
+        return None
+
+
+def _rfid_btt_text(value) -> str:
+    """A stored time as Bhutan Time text 'YYYY-MM-DD HH:MM:SS' ('' when empty, the stored text when it cannot be read).
+    Plain date arithmetic, no system clock functions (they stop at the year 3000 on Windows)."""
+    if not value:
+        return ''
+    s = str(value).strip()
+    try:
+        if len(s) == 10:
+            d = _rfid_dt.datetime.strptime(s, '%Y-%m-%d').replace(hour=23, minute=59, second=59)
+        else:
+            d = _rfid_dt.datetime.fromisoformat(s.replace('Z', '+00:00'))
+            if d.tzinfo is not None:
+                d = d.astimezone(CSMS_TZ).replace(tzinfo=None)
+        return d.strftime('%Y-%m-%d %H:%M:%S')
+    except (ValueError, OverflowError, OSError, TypeError):
+        return _rfid_txt(s, 40)
+
+
+# ---- who may see the owner details ------------------------------------------------------------------------------------
+def _rfid_perms(request) -> set:
+    return ops_role_perms((ops_request_user(request) or {}).get('role') or 'viewer')
+
+
+def _rfid_can_owner(request) -> bool:
+    p = _rfid_perms(request)
+    return 'config' in p or 'view_customers' in p
+
+
+def _rfid_can_customers(request) -> bool:
+    """The BPC EV app account behind a mobile number is customer data: view_customers only (a technician could look up
+    any number by typing it as a card owner's)."""
+    return 'view_customers' in _rfid_perms(request)
+
+
+def _rfid_mask_text(v, keep: int) -> str:
+    s = str(v or '')
+    return ('•••' + s[-keep:]) if len(s) > keep else ('•••' if s else '')
+
+
+def _rfid_mask_digits(s) -> str:
+    """Mobile numbers written into a note ('Free charging 17554433') -> •••433; dates stay."""
+    def sub(m):
+        t = m.group(0)
+        if _ops_re.fullmatch(r'\d{4}-\d{1,2}-\d{1,2}|\d{1,2}-\d{1,2}-\d{4}', t):
+            return t
+        d = ''.join(ch for ch in t if ch.isdigit())
+        return '•••' + d[-3:] if len(d) >= 7 else t
+    return _RFID_DIGITS_RE.sub(sub, str(s or ''))
+
+
+def _rfid_mask(c: dict) -> dict:
+    """Owner details for roles that neither manage cards nor see customers: first name and initial, the last digits only."""
+    out = dict(c)
+    name = str(out.get('owner_name') or '').split()
+    out['owner_name'] = (name[0] + (' ' + name[-1][:1] + '.' if len(name) > 1 else '')) if name else ''
+    out['owner_phone'] = _rfid_mask_text(out.get('owner_phone'), 3)
+    out['owner_email'] = '•••' if out.get('owner_email') else ''
+    out['vehicle_plate'] = _rfid_mask_text(out.get('vehicle_plate'), 2)
+    if out.get('description'):
+        out['description'] = _rfid_mask_digits(out['description'])
+    out.pop('app', None)
+    out['masked'] = True
+    return out
+
+
+def _rfid_t(value):
+    """A stored time (Bhutan Time without a zone, or with a zone) -> epoch seconds, None when empty / unreadable."""
+    if not value:
+        return None
+    try:
+        d = _rfid_dt.datetime.fromisoformat(str(value).strip().replace('Z', '+00:00'))
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=CSMS_TZ)
+        return round(d.timestamp(), 1)
+    except (ValueError, OverflowError, OSError, TypeError):
+        return None
+
+
+def _rfid_app_index() -> dict:
+    """App accounts by mobile number (the same number form as the card owner's)."""
+    try:
+        return {c.get('phone'): c for c in list(customers.customers.values()) if isinstance(c, dict) and c.get('phone')}
+    except Exception:
+        return {}
+
+
+def _rfid_view(tag: str, c: dict, now_utc, apps: dict, owner: bool, cust: bool = False) -> dict:
+    st = rfid_status_ocpp(c.get('status'))
+    exp = rfid_expiry_utc(c.get('expiry_date'))
+    eff = 'Expired' if (st == 'Accepted' and exp is not None and exp < now_utc) else st
+    out = {'id_tag': tag, 'status': st, 'effective': eff, 'expiry_date': c.get('expiry_date'),
+           'expires_t': round(exp.timestamp(), 1) if exp is not None else None, 'parent_id': c.get('parent_id'),
+           'description': c.get('description') or '', 'created_at': c.get('created_at'), 'created_t': _rfid_t(c.get('created_at')),
+           'created_by': c.get('created_by') or '', 'updated_t': _rfid_t(c.get('updated_at')), 'updated_by': c.get('updated_by') or '',
+           'last_used': c.get('last_used'), 'last_used_t': _rfid_t(c.get('last_used'))}
+    for f in RFID_OWNER_FIELDS:
+        out[f] = c.get(f) or ''
+    out['has_owner'] = bool(out['owner_name'] or out['owner_phone'] or out['owner_email'] or out['vehicle_plate'])
+    if owner:
+        a = apps.get(out['owner_phone']) if (cust and out['owner_phone']) else None
+        if a:
+            out['app'] = {'name': a.get('name') or ''}
+        return out
+    return _rfid_mask(out)
+
+
+def _rfid_views(request) -> list:
+    owner, cust, now_utc = _rfid_can_owner(request), _rfid_can_customers(request), datetime.now(timezone.utc)
+    apps = _rfid_app_index() if cust else {}
+    return [_rfid_view(k, v, now_utc, apps, owner, cust) for k, v in sorted(list(app_state.rfid_cards.items())) if isinstance(v, dict)]
+
+
+def _rfid_user(request) -> str:
+    return str((ops_request_user(request) or {}).get('username') or '')[:64]
+
+
+# ---- the old card API (the console's first card form, scripts, tests): owner details, checks, masking ----------------
+async def handle_api_rfid_list(request):
+    """GET /api/rfid: the card list as before (id_tag + the stored fields), owner details masked for roles without them."""
+    owner, out = _rfid_can_owner(request), []
+    for tag, info in sorted(list(app_state.rfid_cards.items())):
+        if not isinstance(info, dict):
+            continue
+        row = {'id_tag': tag, **info}
+        out.append(row if owner else {k: v for k, v in _rfid_mask(row).items() if k != 'masked'})
+    return web.json_response(out)
+
+
+async def handle_api_rfid_add(request):
+    """POST /api/rfid/add: add a card or change it (all the base fields as sent; owner fields only when they are sent)."""
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({'error': 'JSON body expected'}, status=400)
+    if not isinstance(data, dict):
+        return web.json_response({'error': 'JSON body expected'}, status=400)
+    tag = rfid_norm_tag(data.get('id_tag'), app_state.rfid_cards)
+    if not tag:
+        return web.json_response({'error': 'id_tag is required'}, status=400)
+    old = app_state.rfid_cards.get(tag)
+    exists = old is not None
+    err = None if exists else rfid_tag_error(tag)
+    if err:
+        return web.json_response({'error': err}, status=400)
+    status = str(data.get('status') or 'Accepted')
+    if status not in RFID_ALL_STATUSES:
+        return web.json_response({'error': 'Invalid status'}, status=400)
+    body = {k: data.get(k) for k in ('expiry_date', 'parent_id', 'description')}
+    body.update({k: data[k] for k in RFID_OWNER_FIELDS if k in data})
+    vals, errs = rfid_clean(body, known_parents=_rfid_known_parents(app_state.rfid_cards))
+    if errs:
+        return web.json_response({'error': next(iter(errs.values())), 'errors': errs}, status=400)
+    vals['status'] = status
+    vals.setdefault('expiry_date', None)
+    vals.setdefault('parent_id', None)
+    vals.setdefault('description', '')
+    if exists and isinstance(old, dict) and rfid_status_ocpp(old.get('status')) != status:
+        request['ops_audit_detail'] = {'status_was': rfid_status_ocpp(old.get('status'))}
+    _rfid_put(tag, vals, _rfid_user(request))
+    _rfid_save_list()
+    logger.info(f"RFID card {'updated' if exists else 'added'}: {tag} ({status})")
+    return web.json_response({'success': True, 'id_tag': tag, 'status': status, 'created': not exists})
+
+
+async def handle_api_rfid_import(request):
+    """POST /api/rfid/import {cards: [...]}: as before (one save), invalid cards are left out and listed."""
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({'error': 'JSON body expected'}, status=400)
+    cards = (data or {}).get('cards') if isinstance(data, dict) else data
+    if not isinstance(cards, list):
+        return web.json_response({'error': 'cards: a list expected'}, status=400)
+    if len(cards) > RFID_IMPORT_MAX_ROWS:
+        return web.json_response({'error': f'At most {RFID_IMPORT_MAX_ROWS} cards at a time'}, status=400)
+    imported, errors, by = 0, [], _rfid_user(request)
+    known = _rfid_known_parents(app_state.rfid_cards)
+    tags, status_changes = [], []
+    for i, card in enumerate(cards):
+        if not isinstance(card, dict):
+            errors.append({'index': i, 'error': 'not a card'})
+            continue
+        tag = rfid_norm_tag(card.get('id_tag'), app_state.rfid_cards)
+        err = None if (tag and tag in app_state.rfid_cards) else rfid_tag_error(tag)
+        status, serr = rfid_norm_status(card.get('status') or 'Accepted')
+        vals, errs = rfid_clean({k: card[k] for k in RFID_EDIT_FIELDS if k in card and k != 'status'}, known_parents=known)
+        err = err or serr or (next(iter(errs.values())) if errs else None)
+        if err:
+            errors.append({'index': i, 'id_tag': tag, 'error': err})
+            continue
+        vals['status'] = status
+        for k, dflt in (('expiry_date', None), ('parent_id', None), ('description', '')):
+            vals.setdefault(k, dflt)
+        old = app_state.rfid_cards.get(tag)
+        if isinstance(old, dict) and rfid_status_ocpp(old.get('status')) != status:
+            status_changes.append(f"{tag}: {rfid_status_ocpp(old.get('status'))} → {status}")
+        _rfid_put(tag, vals, by)
+        tags.append(tag)
+        imported += 1
+    if imported:
+        app_state._save_rfid_cards()                      # one save for the whole list
+    request['ops_audit_detail'] = {'imported': imported, 'skipped': len(errors), 'status_changes': status_changes[:30],
+                                   'card_ids': tags[:30]}
+    logger.info(f"Imported {imported} RFID cards" + (f" ({len(errors)} left out)" if errors else ''))
+    return web.json_response({'success': True, 'imported': imported, 'skipped': len(errors), 'errors': errors[:50]})
+
+
+# ---- reading CSV / Excel / JSON files ----------------------------------------------------------------------------------
+def rfid_header_field(h):
+    """A column title -> card field ('' = not a card field, None = a column of the export that is not imported)."""
+    raw = str(h or '')
+    if _RFID_MASKED_RE.search(raw):
+        return None                               # shortened owner details of an export: never written back
+    s = _ops_re.sub(r'\(.*?\)', '', raw).strip().lower()
+    key = _ops_re.sub(r'[^a-z0-9]', '', s)
+    if not key:
+        return ''
+    if key in RFID_READONLY_COLUMNS:
+        return None
+    return _RFID_HEADER_MAP.get(key, '')
+
+
+def _rfid_decode(data: bytes):
+    """-> (text, encoding name, warning)."""
+    if data.startswith(b'\xef\xbb\xbf'):
+        return data[3:].decode('utf-8', errors='replace'), 'UTF-8', None
+    if data[:2] in (b'\xff\xfe', b'\xfe\xff'):
+        return data.decode('utf-16', errors='replace'), 'UTF-16', None
+    try:
+        return data.decode('utf-8'), 'UTF-8', None
+    except UnicodeDecodeError:
+        return (data.decode('cp1252', errors='replace'), 'Windows-1252',
+                'The file is not UTF-8: names with Dzongkha or Thai letters may be wrong - save it as "CSV UTF-8" or as an Excel file')
+
+
+def _rfid_delimiter(text: str) -> str:
+    first = ''
+    for line in text.splitlines():
+        if line.strip():
+            first = line
+            break
+    best, n = ',', -1
+    for d in (',', ';', '\t', '|'):
+        c = first.count(d)
+        if c > n:
+            best, n = d, c
+    return best if n > 0 else ','
+
+
+def _rfid_cell(v):
+    """An Excel / JSON value as text (dates are kept for the expiry column)."""
+    if v is None:
+        return ''
+    if isinstance(v, bool):
+        return 'yes' if v else 'no'
+    if isinstance(v, float) and v.is_integer() and abs(v) < 1e15:
+        return str(int(v))
+    if isinstance(v, (int, float)):
+        return str(v)
+    if isinstance(v, (_rfid_dt.datetime, _rfid_dt.date)):
+        return v
+    return str(v)
+
+
+def _rfid_blank(v) -> bool:
+    return v is None or (isinstance(v, str) and not v.strip())
+
+
+def _rfid_rows_from_table(table, out: dict):
+    """table = (row number, cells) pairs, read as they come; the column titles in the first non-empty row ->
+    out['rows'] / out['columns']. The Card ID keeps an Excel number / date as it is (checked by the plan)."""
+    cols, rows = None, []
+    for i, r in table:
+        if out.get('error'):
+            return out
+        r = list(r or ())[:RFID_IMPORT_MAX_COLS]
+        if cols is None:
+            if all(_rfid_blank(_rfid_cell(c)) for c in r):
+                continue
+            cols, used, ignored, masked = [], set(), [], False
+            for j, h in enumerate(r):
+                title = _rfid_txt(_rfid_cell(h), 60)
+                f = rfid_header_field(title)
+                if _RFID_MASKED_RE.search(title):
+                    masked = True
+                if f and f not in used:
+                    cols.append((j, f))
+                    used.add(f)
+                elif title and f is not None:
+                    ignored.append(title[:40])
+            out['columns'] = [f for _j, f in cols]
+            out['ignored'] = ignored[:20]
+            if masked:
+                out['warnings'].append('Owner details in this file are masked (an export for a role that sees them shortened) - they are not imported')
+            if 'id_tag' not in used:
+                out['error'] = 'No "Card ID" column found in the first row'
+                return out
+            continue
+        vals = {}
+        for j, f in cols:
+            v = r[j] if j < len(r) else None
+            if f == 'id_tag' and isinstance(v, (int, float, _rfid_dt.datetime, _rfid_dt.date)) and not isinstance(v, bool):
+                vals[f] = v
+            else:
+                vals[f] = _rfid_cell(v)
+        if all(_rfid_blank(v) for v in vals.values()):
+            continue
+        rows.append((i, vals))
+        if len(rows) > RFID_IMPORT_MAX_ROWS:
+            out['error'], out['vars'] = 'More than {n} cards in the file - split it', {'n': RFID_IMPORT_MAX_ROWS}
+            return out
+    if out.get('error'):
+        return out
+    if cols is None:
+        out['error'] = 'The file is empty'
+        return out
+    out['rows'] = rows
+    return out
+
+
+def _rfid_sheet_rows(ws, out: dict):
+    """The rows of an Excel sheet with values (at most RFID_IMPORT_MAX_COLS columns). Rows the sheet file does not have are
+    skipped at once (openpyxl fills a gap with one shared empty row; max_row bounds it to the rows Excel can have); at most
+    RFID_IMPORT_MAX_SCAN rows of the file are looked at."""
+    n, gap = 0, None
+    for pos, r in enumerate(ws.iter_rows(max_row=1048576, max_col=RFID_IMPORT_MAX_COLS, values_only=True), start=1):
+        if r is gap:
+            continue
+        n += 1
+        if n > RFID_IMPORT_MAX_SCAN:
+            out['error'], out['vars'] = 'The sheet has more than {n} rows (empty ones too) - copy the cards to a new sheet', {'n': RFID_IMPORT_MAX_SCAN}
+            return
+        if all(v is None for v in r):
+            gap = r
+            continue
+        yield pos, r
+
+
+def _rfid_sheet_has_ids(ws) -> bool:
+    """Is there a Card ID column in the first non-empty row of the sheet (looked for in the first 50 rows)?"""
+    for r in ws.iter_rows(max_row=50, max_col=RFID_IMPORT_MAX_COLS, values_only=True):
+        cells = [c for c in (r or ()) if not _rfid_blank(c)]
+        if cells:
+            return any(rfid_header_field(_rfid_txt(_rfid_cell(c), 60)) == 'id_tag' for c in cells)
+    return False
+
+
+def rfid_parse_file(name: str, data: bytes) -> dict:
+    """A CSV, Excel (.xlsx) or JSON card file -> {'format', 'rows': [(row number, {field: value})], 'columns', 'ignored',
+    'warnings', 'error'}. Runs in a worker thread."""
+    out = {'name': _rfid_txt(name, 120), 'format': '', 'rows': [], 'columns': [], 'ignored': [], 'warnings': [], 'error': None}
+    ext = os.path.splitext(out['name'].lower())[1]
+    if not data:
+        out['error'] = 'The file is empty'
+        return out
+    if len(data) > RFID_IMPORT_MAX_BYTES:
+        out['error'] = 'The file is larger than 5 MB - split it'
+        return out
+    if ext == '.xls' or data[:8] == b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1':
+        out['error'] = 'Old Excel file (.xls): save it as .xlsx or CSV'
+        return out
+    if data[:2] == b'PK' or ext in ('.xlsx', '.xlsm'):
+        out['format'] = 'Excel'
+        try:
+            z = _ops_zip.ZipFile(_ops_io.BytesIO(data))
+            infos = z.infolist()
+        except Exception:
+            out['error'] = 'Not an Excel (.xlsx) file'
+            return out
+        sst = sum(i.file_size for i in infos if i.filename.lower().endswith('sharedstrings.xml'))
+        if len(infos) > 5000 or sum(i.file_size for i in infos) > RFID_IMPORT_MAX_UNZIPPED or sst > RFID_IMPORT_MAX_SST:
+            out['error'] = 'The Excel file is too large when unpacked'
+            return out
+        try:
+            from openpyxl import load_workbook
+        except Exception:
+            out['error'] = 'Excel import needs the openpyxl package - save the sheet as CSV instead'
+            return out
+        try:
+            wb = load_workbook(_ops_io.BytesIO(data), read_only=True, data_only=True)
+            try:
+                sheets = list(wb.worksheets)
+                try:
+                    active = wb.active
+                except Exception:
+                    active = None
+                order = ([active] if active is not None and any(s is active for s in sheets) else []) + [s for s in sheets if s is not active]
+                with_ids = [s for s in order[:20] if _rfid_sheet_has_ids(s)]
+                ws = with_ids[0] if with_ids else (order[0] if order else None)
+                if ws is None:
+                    out['error'] = 'The file is empty'
+                    return out
+                out['sheet'] = _rfid_txt(ws.title, 40)
+                if len(with_ids) > 1:
+                    out['warnings'].append({'text': 'Only the sheet {s} was read - the workbook has more sheets with a Card ID column',
+                                            'vars': {'s': out['sheet']}})
+                _rfid_rows_from_table(_rfid_sheet_rows(ws, out), out)
+            finally:
+                wb.close()
+        except Exception as e:
+            out['error'] = 'The Excel file could not be read'
+            out['detail'] = type(e).__name__
+            out['rows'] = []
+        return out
+    text, enc, warn = _rfid_decode(data)
+    if ext == '.json' or text.lstrip()[:1] in ('{', '['):
+        out['format'] = 'JSON'
+        try:
+            js = json.loads(text)
+        except ValueError:
+            out['error'] = 'Not a JSON file'
+            return out
+        cards = js.get('cards') if isinstance(js, dict) else js
+        if not isinstance(cards, list):
+            out['error'] = 'JSON: a list of cards expected ({"cards": [...]})'
+            return out
+        cards = cards[:RFID_IMPORT_MAX_ROWS + 1]
+        keys = {}
+        for c in cards:
+            for k in (c if isinstance(c, dict) else ()):
+                if k not in keys:
+                    keys[k] = None
+                    if len(keys) > RFID_IMPORT_MAX_COLS:
+                        out['error'], out['vars'] = 'Too many columns in the file (at most {n})', {'n': RFID_IMPORT_MAX_COLS}
+                        return out
+        names = list(keys)
+        table = _rfid_it.chain([names], ([(c.get(k) if isinstance(c, dict) else None) for k in names] for c in cards))
+        return _rfid_rows_from_table(enumerate(table, start=1), out)
+    out['format'] = 'CSV'
+    out['encoding'] = enc
+    if warn:
+        out['warnings'].append(warn)
+    d = _rfid_delimiter(text)
+    out['delimiter'] = {'\t': 'tab'}.get(d, d)
+    try:
+        return _rfid_rows_from_table(enumerate(_ops_csv.reader(_ops_io.StringIO(text), delimiter=d), start=1), out)
+    except _ops_csv.Error as e:
+        out['error'] = 'The CSV file could not be read'
+        out['detail'] = _rfid_txt(e, 120)
+        out['rows'] = []
+        return out
+
+
+def _rfid_old_norm(field: str, old):
+    """A stored value in the form the import writes it (an old value written another way is not a change)."""
+    if old is None or old == '':
+        return None
+    if field == 'status':
+        return rfid_status_ocpp(old)
+    if field in ('description', 'owner_name', 'organisation'):
+        return _rfid_txt(old, 200 if field == 'description' else 80) or None
+    if field == 'owner_phone':
+        return rfid_norm_phone(old)[0] or str(old)
+    if field == 'owner_email':
+        return rfid_norm_email(old)[0] or str(old)
+    if field == 'vehicle_plate':
+        return rfid_norm_plate(old)[0] or str(old)
+    return old
+
+
+def _rfid_same(field: str, old, new) -> bool:
+    if field == 'expiry_date':
+        a, b = rfid_expiry_utc(old), rfid_expiry_utc(new)
+        if a is None or b is None:
+            return a is None and b is None
+        return int(a.timestamp()) == int(b.timestamp())       # the export keeps whole seconds
+    return (_rfid_old_norm(field, old) or None) == (new or None)
+
+
+def rfid_plan(parsed: dict, cards: dict, mode: str) -> dict:
+    """What an import would do with each row: new / update / unchanged / skipped / error (nothing is changed here). 'id'
+    names the plan: the same file and the same cards give the same id (the import checks it against the preview)."""
+    items, todo, seen = [], [], {}
+    counts = {'new': 0, 'update': 0, 'unchanged': 0, 'skipped': 0, 'error': 0}
+    known = _rfid_known_parents(cards)
+    xl = parsed.get('format') == 'Excel'
+    for rownum, raw in parsed.get('rows') or []:
+        rawtag = raw.get('id_tag')
+        err, evars = None, None
+        if isinstance(rawtag, (_rfid_dt.datetime, _rfid_dt.date)):
+            tag, err = _rfid_txt(rawtag, 24), RFID_ERR_DATE_ID
+        elif isinstance(rawtag, float) and not (rawtag.is_integer() and abs(rawtag) < 1e15):
+            tag, err = _rfid_txt(repr(rawtag), 24), RFID_ERR_NUM_ID
+        elif xl and isinstance(rawtag, int) and abs(rawtag) >= 10 ** 15:
+            tag, err = str(rawtag), RFID_ERR_NUM_ID
+        else:
+            tag = rfid_norm_tag(rawtag, cards)
+        it = {'row': rownum, 'tag': tag}
+        old = cards.get(tag) if (tag and err is None) else None
+        if err is None:
+            if not tag:
+                err = 'No card ID in this row'
+            elif tag in seen:
+                err, evars = 'Same card as row {n}', {'n': seen[tag]}
+            elif old is None:
+                err = rfid_tag_error(tag)
+        if tag and tag not in seen:
+            seen[tag] = rownum
+        if err is None and old is not None and mode == 'new_only':
+            it.update(action='skipped', why='already registered')
+            counts['skipped'] += 1
+            items.append(it)
+            continue
+        vals, errs = ({}, {}) if err else rfid_clean({k: v for k, v in raw.items() if k != 'id_tag'}, keep_empty=False, known_parents=known)
+        if err is None and errs:
+            f = next(iter(errs))
+            err, it['field'] = errs[f], f
+        if err:
+            it.update(action='error', error=err)
+            if evars:
+                it['vars'] = evars
+            counts['error'] += 1
+            items.append(it)
+            continue
+        if old is None:
+            vals.setdefault('status', 'Accepted')
+            it.update(action='new', changes=sorted(vals))
+            counts['new'] += 1
+        else:
+            changes = sorted(f for f, v in vals.items() if not _rfid_same(f, old.get(f), v))
+            if not changes:
+                it['action'] = 'unchanged'
+                counts['unchanged'] += 1
+                items.append(it)
+                continue
+            vals = {f: vals[f] for f in changes}
+            it.update(action='update', changes=changes)
+            counts['update'] += 1
+        it['name'] = vals.get('owner_name', (old or {}).get('owner_name') or '')
+        it['status'] = vals.get('status', rfid_status_ocpp((old or {}).get('status', 'Accepted')))
+        items.append(it)
+        todo.append((tag, vals, it['action']))
+    h = _rfid_hash.sha256(json.dumps([mode, counts], sort_keys=True).encode())
+    for t in todo:
+        h.update(json.dumps(t, sort_keys=True, default=str).encode())
+    return {'items': items, 'counts': counts, 'todo': todo, 'id': h.hexdigest()[:32]}
+
+
+def rfid_apply_plan(todo: list, snapshot: dict, by: str = None) -> dict:
+    """Write a plan made on snapshot (the cards as they were). Runs on the event loop without a pause, so nothing else
+    changes cards meanwhile; a card that someone added, changed or deleted after the snapshot is left out ('conflicts'):
+    a deleted card does not come back, a change made meanwhile is not overwritten."""
+    res = {'applied': [], 'new': [], 'changed': [], 'conflicts': [], 'status_changes': []}
+    for tag, vals, action in todo:
+        cur, before = app_state.rfid_cards.get(tag), snapshot.get(tag)
+        if action == 'new':
+            ok = cur is None
+        else:
+            ok = isinstance(cur, dict) and isinstance(before, dict) and all(cur.get(f) == before.get(f) for f in RFID_EDIT_FIELDS)
+        if not ok:
+            res['conflicts'].append(tag)
+            continue
+        was = rfid_status_ocpp(cur.get('status')) if isinstance(cur, dict) else None
+        rec = _rfid_put(tag, vals, by)
+        now = rfid_status_ocpp(rec.get('status'))
+        if was is not None and was != now:
+            res['status_changes'].append(f'{tag}: {was} → {now}')
+        res['new' if action == 'new' else 'changed'].append(tag)
+        res['applied'].append(tag)
+    if res['applied']:
+        app_state._save_rfid_cards()
+    return res
+
+
+class _RfidTooBig(Exception):
+    pass
+
+
+async def _rfid_read_part(part, limit: int, seen: list):
+    """One form field -> its bytes; None when it is longer than limit (it is read to its end, nothing is kept). More than
+    RFID_UPLOAD_MAX in the whole upload: _RfidTooBig."""
+    buf, over = bytearray(), False
+    while True:
+        chunk = await part.read_chunk(1 << 16)
+        if not chunk:
+            break
+        seen[0] += len(chunk)
+        if seen[0] > RFID_UPLOAD_MAX:
+            raise _RfidTooBig()
+        if over:
+            continue
+        if len(buf) + len(chunk) > limit:
+            over, buf = True, bytearray()
+        else:
+            buf += chunk
+    return None if over else bytes(buf)
+
+
+_RFID_POOL = _rfid_cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix='rfid-file')   # files are read one at a time
+_RFID_BUSY = {'n': 0}
+
+
+async def ops_api_rfid_import(request):
+    """POST multipart: file + mode (merge | new_only) + apply (0 = preview only, 1 = import) + plan (the id of the preview:
+    the import is refused with 409 and a new preview when the file or the cards give another plan)."""
+    if not (request.content_type or '').lower().startswith('multipart/'):
+        return ops_err('Send the file as the form field "file" (multipart/form-data)')
+    name, data, form, too_big, bad, seen = '', None, {}, False, False, [0]
+    try:
+        reader = await request.multipart()
+        while True:
+            part = await reader.next()
+            if part is None:
+                break
+            if part.name == 'file' and data is None and not too_big:
+                fn = str(part.filename or 'cards').replace('\\', '/').split('/')[-1]
+                name = _rfid_txt(fn, 120) or 'cards'
+                got = await _rfid_read_part(part, RFID_IMPORT_MAX_BYTES, seen)
+                if got is None:
+                    too_big = True
+                else:
+                    data = got
+            elif part.name in ('mode', 'apply', 'plan') and part.name not in form:
+                got = await _rfid_read_part(part, 200, seen)
+                if got is None:
+                    bad = True
+                else:
+                    form[part.name] = got.decode('utf-8', 'replace').strip()[:80]
+            else:
+                await _rfid_read_part(part, 0, seen)               # anything else: read past it, keep nothing
+    except _RfidTooBig:
+        return ops_err('The file is larger than 5 MB - split it', 413)
+    except Exception as e:
+        logger.warning(f"rfid import: unreadable upload ({type(e).__name__})")
+        return ops_err('Send the file as the form field "file" (multipart/form-data)')
+    if too_big:
+        return ops_err('The file is larger than 5 MB - split it', 413)
+    if data is None or bad:
+        return ops_err('Send the file as the form field "file" (multipart/form-data)')
+    mode = 'new_only' if form.get('mode') == 'new_only' else 'merge'
+    apply = form.get('apply') in ('1', 'true', 'yes')
+    if _RFID_BUSY['n']:
+        return ops_err('Another card file is being read - try again in a moment', 429)
+    _RFID_BUSY['n'] = 1
+    try:
+        loop = asyncio.get_running_loop()
+        parsed = await loop.run_in_executor(_RFID_POOL, rfid_parse_file, name, data)
+        info = {k: parsed.get(k) for k in ('name', 'format', 'encoding', 'delimiter', 'sheet', 'columns', 'ignored', 'warnings')}
+        if parsed.get('error'):
+            request['ops_audit_detail'] = {'file': info['name'], 'error': parsed['error']}
+            return ops_err(parsed['error'], 400, file=info, vars=parsed.get('vars') or {})
+        snapshot = {k: dict(v) for k, v in list(app_state.rfid_cards.items()) if isinstance(v, dict)}
+        plan = await loop.run_in_executor(_RFID_POOL, rfid_plan, parsed, snapshot, mode)
+    finally:
+        _RFID_BUSY['n'] = 0
+    counts = plan['counts']
+    res = {'ok': True, 'file': info, 'mode': mode, 'rows': len(parsed['rows']), 'counts': counts, 'applied': False, 'plan': plan['id'],
+           'items': [i for i in plan['items'] if i['action'] != 'unchanged'][:RFID_PREVIEW_ITEMS]}
+    audit = {'file': info['name'], 'format': info['format'], 'mode': mode, 'apply': bool(apply), 'new': counts['new'],
+             'updated': counts['update'], 'unchanged': counts['unchanged'], 'skipped': counts['skipped'], 'errors': counts['error']}
+    if apply and form.get('plan') and form['plan'] != plan['id']:
+        res.update(ok=False, error='The cards or the file changed since the preview - check the new preview and press Import again')
+        request['ops_audit_detail'] = dict(audit, apply=False, refused='the plan changed since the preview')
+        return ops_json(res, status=409)
+    if apply and plan['todo']:
+        done = rfid_apply_plan(plan['todo'], snapshot, _rfid_user(request))
+        res.update(applied=True, imported=len(done['applied']), conflicts=len(done['conflicts']), conflict_cards=done['conflicts'][:20])
+        audit.update(written=len(done['applied']), conflicts=len(done['conflicts']), status_changes=done['status_changes'][:30],
+                     new_cards=done['new'][:30], changed_cards=done['changed'][:30])
+        logger.info(f"RFID cards imported from file {info['name']!r}: {len(done['new'])} new, {len(done['changed'])} changed, "
+                    f"{counts['error']} rows with errors" + (f", {len(done['conflicts'])} left out (changed meanwhile)" if done['conflicts'] else ''))
+    request['ops_audit_detail'] = audit
+    return ops_json(res)
+
+
+# ---- the 🎴 RFID Cards tab: list, one card, export, template ------------------------------------------------------------
+async def ops_api_rfid(request):
+    cards = _rfid_views(request)
+    perms = _rfid_perms(request)
+    counts = {'all': len(cards), 'ok': sum(1 for c in cards if c['effective'] == 'Accepted'),
+              'blocked': sum(1 for c in cards if c['effective'] in ('Blocked', 'Invalid')),
+              'expired': sum(1 for c in cards if c['effective'] == 'Expired'),
+              'no_owner': sum(1 for c in cards if not c['has_owner'])}
+    return ops_json({'cards': cards, 'counts': counts, 'can': {'edit': 'config' in perms, 'owner': _rfid_can_owner(request)},
+                     'statuses': list(RFID_STATUSES), 'max_rows': RFID_IMPORT_MAX_ROWS, 'max_mb': RFID_IMPORT_MAX_BYTES // (1024 * 1024),
+                     'columns': [label for _k, label in RFID_COLUMNS[:10]]})
+
+
+async def ops_api_rfid_save(request):
+    """POST {id_tag, create, status, expiry_date, parent_id, description, owner_*...}: create a card (create=true, the ID must
+    be new) or change one (fields left out keep their value, an empty one is cleared)."""
+    b = await ops_body(request)
+    tag = rfid_norm_tag(b.get('id_tag'), app_state.rfid_cards)
+    create = bool(b.get('create'))
+    old = app_state.rfid_cards.get(tag) if tag else None
+    if create:
+        if old is not None:
+            return ops_err('Card {tag} is already registered - edit it instead', 409, vars={'tag': tag})
+        err = rfid_tag_error(tag)
+        if err:
+            return ops_err(err, 400, field='id_tag')
+    elif old is None:
+        return ops_err('No such card', 404)
+    vals, errs = rfid_clean(b, known_parents=_rfid_known_parents(app_state.rfid_cards))
+    if errs:
+        f = next(iter(errs))
+        return ops_err(errs[f], 400, field=f, errors=errs)
+    if create:
+        vals.setdefault('status', 'Accepted')
+    elif 'status' in vals and isinstance(old, dict) and rfid_status_ocpp(old.get('status')) != vals['status']:
+        request['ops_audit_detail'] = {'status_was': rfid_status_ocpp(old.get('status'))}
+    rec = _rfid_put(tag, vals, _rfid_user(request))
+    _rfid_save_list()
+    logger.info(f"RFID card {'added' if create else 'changed'}: {tag} ({rec.get('status')})")
+    cust = _rfid_can_customers(request)
+    return ops_json({'ok': True, 'card': _rfid_view(tag, rec, datetime.now(timezone.utc), _rfid_app_index() if cust else {},
+                                                    _rfid_can_owner(request), cust)})
+
+
+def _rfid_export_rows(request) -> list:
+    owner = _rfid_can_owner(request)
+    rows = []
+    for tag, c in sorted(list(app_state.rfid_cards.items())):
+        if not isinstance(c, dict):
+            continue
+        r = {'id_tag': tag, 'status': rfid_status_ocpp(c.get('status')), 'expiry_date': _rfid_btt_text(c.get('expiry_date')),
+             'parent_id': c.get('parent_id') or '', 'description': c.get('description') or '',
+             'created': _rfid_btt_text(c.get('created_at')), 'updated': _rfid_btt_text(c.get('updated_at')),
+             'last_used': _rfid_btt_text(c.get('last_used'))}
+        for f in RFID_OWNER_FIELDS:
+            r[f] = c.get(f) or ''
+        rows.append(r if owner else _rfid_mask(r))
+    return rows
+
+
+def _rfid_export_labels(request) -> list:
+    """Column titles; in an export with shortened owner details those columns say "(masked)" and are never imported."""
+    owner = _rfid_can_owner(request)
+    return [label + ('' if owner or k not in RFID_MASKED_COLUMNS else ' (masked)') for k, label in RFID_COLUMNS]
+
+
+def _rfid_out_text(v):
+    """Text as an export writes it: control characters (an Excel file cannot hold them) -> spaces, no lone surrogates."""
+    return _RFID_XL_BAD_RE.sub(' ', ops_text_safe(v)) if isinstance(v, str) else v
+
+
+def _rfid_fname(ext: str) -> str:
+    return 'rfid_cards_%s.%s' % (ops_dt().strftime('%Y%m%d_%H%M'), ext)
+
+
+async def ops_api_rfid_csv(request):
+    buf = _ops_io.StringIO()
+    w = _ops_csv.writer(buf)
+    w.writerow(_rfid_export_labels(request))
+    for r in _rfid_export_rows(request):
+        w.writerow([ops_csv_safe(_rfid_out_text(r.get(k, ''))) for k, _l in RFID_COLUMNS])
+    return web.Response(body=('﻿' + buf.getvalue()).encode('utf-8'), content_type='text/csv',
+                        headers={'Content-Disposition': 'attachment; filename="%s"' % _rfid_fname('csv')})
+
+
+async def ops_api_rfid_xlsx(request):
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill
+    except Exception:
+        return ops_err('Excel export needs the openpyxl package (pip install openpyxl) - use CSV instead', 501)
+    rows = _rfid_export_rows(request)
+    labels = _rfid_export_labels(request)
+
+    def build():
+        wb = Workbook()
+        ws = wb.active
+        ws.title = 'RFID cards'
+        ws.append(labels)
+        head_font, head_fill = Font(bold=True, color='FFFFFF'), PatternFill('solid', fgColor='0A7A3C')
+        for cell in ws[1]:
+            cell.font, cell.fill = head_font, head_fill
+        for i, r in enumerate(rows, start=2):
+            for j, (k, _l) in enumerate(RFID_COLUMNS, start=1):
+                v = _rfid_out_text(r.get(k, ''))
+                cell = ws.cell(row=i, column=j, value=v)
+                if isinstance(v, str):
+                    cell.data_type = 's'                 # text stays text: a value starting with = is never a formula
+        for j, label in enumerate(labels, start=1):
+            ws.column_dimensions[ws.cell(row=1, column=j).column_letter].width = max(12, min(30, len(label) + 4))
+        ws.freeze_panes = 'A2'
+        buf = _ops_io.BytesIO()
+        wb.save(buf)
+        return buf.getvalue()
+    data = await asyncio.to_thread(build)
+    return web.Response(body=data, content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                        headers={'Content-Disposition': 'attachment; filename="%s"' % _rfid_fname('xlsx')})
+
+
+async def ops_api_rfid_template(request):
+    buf = _ops_io.StringIO()
+    w = _ops_csv.writer(buf)
+    w.writerow([label for _k, label in RFID_COLUMNS[:10]])
+    w.writerow(['04A2B3C4D5E6F7', 'Accepted', '2027-12-31', '', 'Fleet card 1', 'Pema Wangmo', '17123456', 'pema@example.bt',
+                'BP-1-A1234', 'Bhutan Post'])
+    w.writerow(['CARD0002', 'Blocked', '', '', 'Reported lost', 'Karma Dorji', '77123456', '', 'BP-2-B5678', ''])
+    return web.Response(body=('﻿' + buf.getvalue()).encode('utf-8'), content_type='text/csv',
+                        headers={'Content-Disposition': 'attachment; filename="rfid_cards_template.csv"'})
+
+
+# ---- free charging: a card past its expiry date is not free (free charging only looked at the status, so an expired
+#      Accepted card charged for free); its own card list stays where its vehicle plate / mobile number come from
+try:
+    _rfid_free_meta_orig = _ops_free_card_meta
+except NameError:
+    _rfid_free_meta_orig = None
+
+if _rfid_free_meta_orig is not None:
+    def _ops_free_card_meta(key: str):
+        card, ckey, meta = _rfid_free_meta_orig(key)
+        if isinstance(card, dict):
+            exp = rfid_expiry_utc(card.get('expiry_date'))
+            if exp is not None and exp < datetime.now(timezone.utc):
+                card = dict(card, status='Expired')         # free charging leaves it to the normal card check (Expired)
+        return card, ckey, meta
+
+
+async def _rfid_free_card_save(request):
+    """Free charging's card list, "register in RFID Cards" ticked: a new card ID follows the RFID card rules, and the new
+    card gets the holder (name, mobile, plate) as its owner details instead of a note with the mobile number."""
+    b = await ops_body(request)
+    card = str(b.get('card') or '').strip().upper()
+    if b.get('register') and card and len(card) <= 20 and app_state.get_rfid_card(card) is None:
+        err = rfid_tag_error(card)
+        if err:
+            return ops_err(err, 400, field='card')
+        owner, _errs = rfid_clean({'owner_name': b.get('name'), 'owner_phone': b.get('phone'), 'vehicle_plate': b.get('plate')},
+                                  keep_empty=False)
+        tok = _RFID_FREE_REG.set({'card': card, 'owner': owner})
+        try:
+            return await _rfid_free_card_save_orig(request)
+        finally:
+            _RFID_FREE_REG.reset(tok)
+    return await _rfid_free_card_save_orig(request)
+
+
+_rfid_free_card_save_orig = None
+for _i, _r in enumerate(OPS_ROUTES):
+    if _r[0] == 'POST' and _r[1] == '/api/ops/free/cards/save':
+        _rfid_free_card_save_orig = _r[2]
+        OPS_ROUTES[_i] = ('POST', '/api/ops/free/cards/save', _rfid_free_card_save) + tuple(_r[3:])
+        break
+
+OPS_ROUTES += [
+    ('GET', '/api/ops/rfid', ops_api_rfid), ('POST', '/api/ops/rfid/save', ops_api_rfid_save),
+    ('POST', '/api/ops/rfid/import', ops_api_rfid_import), ('GET', '/api/ops/rfid/export.csv', ops_api_rfid_csv),
+    ('GET', '/api/ops/rfid/export.xlsx', ops_api_rfid_xlsx), ('GET', '/api/ops/rfid/template.csv', ops_api_rfid_template),
+]
+
+OPS_CSS_PARTS.append(r'''/* [OPS] v1.14 🎴 RFID cards (owners, import / export) */
+#rfPanel { margin-bottom: 1rem; }
+.ops-rf-filters { display: flex; gap: 0.4rem; flex-wrap: wrap; align-items: center; margin: 0.2rem 0 0.5rem; }
+.ops-rf-filters input[type=search] { width: 280px; max-width: 100%; }
+.ops-rf-tag, .ops-rf-mono input { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.ops-rf-tag { font-weight: 700; white-space: nowrap; }
+.ops-rf-nw { white-space: nowrap; }
+.ops-rf-mono input[readonly] { background: var(--bg-hover); color: var(--text-dim); cursor: default; }
+#rfTable tr.ops-rf-off td { opacity: 0.75; }
+.ops-rf-app { display: inline-block; margin-top: 0.15rem; padding: 0.05rem 0.45rem; border-radius: 50px; font-size: 0.68rem; font-weight: 700;
+    background: #dbeafe; color: #1d4ed8; }
+.ops-rf-h { margin: 0.4rem 0 0; font-size: 0.85rem; }
+.ops-rf-info { font-size: 0.75rem; margin: 0.5rem 0 0; }
+.ops-rf-until { display: block; font-size: 0.72rem; margin-top: 0.15rem; font-weight: normal; }
+.ops-rf-sum { font-size: 0.82rem; margin: 0.7rem 0 0.4rem; word-break: break-word; }
+.ops-rf-chips { display: flex; flex-wrap: wrap; gap: 0.35rem; margin: 0 0 0.5rem; }
+.ops-rf-chip { padding: 0.15rem 0.6rem; border-radius: 50px; font-size: 0.75rem; background: var(--bg-hover); border: 1px solid var(--border); }
+.ops-rf-chip.ops-rf-new { background: #d1fae5; color: #047857; border-color: #a7f3d0; }
+.ops-rf-chip.ops-rf-update { background: #dbeafe; color: #1d4ed8; border-color: #bfdbfe; }
+.ops-rf-chip.ops-rf-error { background: #fee2e2; color: #b91c1c; border-color: #fecaca; }
+.ops-rf-chip.ops-rf-skipped { background: #fef3c7; color: #92400e; border-color: #fde68a; }
+.ops-rf-err { border-radius: 8px; padding: 0.45rem 0.7rem; margin: 0.4rem 0; font-size: 0.8rem; border: 1px solid rgba(239, 68, 68, 0.4);
+    background: rgba(239, 68, 68, 0.07); }
+.ops-rf-prevwrap { max-height: 320px; overflow: auto; }
+.ops-rf-prev { width: 100%; border-collapse: collapse; font-size: 0.76rem; }
+.ops-rf-prev th { position: sticky; top: 0; background: var(--bg-card, var(--bg-input)); text-align: left; }
+.ops-rf-prev td, .ops-rf-prev th { border-bottom: 1px solid var(--border); padding: 0.28rem 0.4rem; vertical-align: top; }
+.ops-rf-prev tr.ops-rf-error td { background: rgba(239, 68, 68, 0.06); }
+@media (max-width: 700px) {
+    .ops-rf-filters input[type=search] { width: 100%; }
+    #rfPanel table.ops-cards .ops-btns { white-space: normal; display: flex; flex-wrap: wrap; gap: 0.25rem; }
+    #rfPanel table.ops-cards .ops-btns .tb-btn.ops-mini { margin: 0; }
+}
+''')
+OPS_JS_PARTS.append(r'''/* [OPS] 🎴 RFID cards (v1.14): who holds each card, search, CSV / Excel import with a preview, CSV / Excel export - the 🎴 RFID Cards tab */
+(function () {
+    'use strict';
+    const OPS = window.OPS;
+    if (!OPS) return;
+    const R = {data: null, busy: false, q: '', st: '', max: 500};
+    const esc = OPS.esc;
+    const td = (l, h, c) => OPS.td(l, h, c);
+    Object.assign(OPS.actionLabels, {'/api/ops/rfid/save': 'RFID card saved', '/api/ops/rfid/import': 'RFID cards imported (CSV / Excel)'});
+    const STATUS = {Accepted: '✅ Accepted', Blocked: '🚫 Blocked', Expired: '⏰ Expired', Invalid: '❌ Invalid', ConcurrentTx: '⏸️ ConcurrentTx'};
+    const STCLS = {Accepted: 'ops-ok', Blocked: 'ops-bad', Expired: 'ops-warn', Invalid: 'ops-bad', ConcurrentTx: 'ops-warn'};
+    const FILTERS = {'': 'All cards', ok: 'Can charge', blocked: 'Blocked / invalid', expired: 'Expired', noowner: 'No owner on file', owner: 'With owner'};
+    const FIELD = {status: 'Status', expiry_date: 'Expiry', parent_id: 'Parent ID', description: 'Note', owner_name: 'Owner name',
+        owner_phone: 'Mobile number', owner_email: 'E-mail', vehicle_plate: 'Vehicle number plate', organisation: 'Organisation / fleet'};
+    const ACTION = {new: '🆕 New', update: '✏️ Changed', unchanged: '= Unchanged', skipped: '⏭️ Skipped', error: '⚠️ Error'};
+    const fail = e => OPS.toast(OPS.tx((e && e.message) || 'Error', e && e.data && e.data.vars), 'error');
+    const val = (box, sel) => { const el = box.querySelector(sel); return el ? el.value.trim() : ''; };
+
+    function build(view) {
+        const base = view.firstElementChild;
+        if (base && !base.id) { base.dataset.rfBase = '1'; base.style.display = 'none'; }   // the first card form: replaced, kept as fallback
+        const edit = !!(R.data && R.data.can && R.data.can.edit) || OPS.can('config');
+        const box = document.createElement('section');
+        box.className = 'pay-panel ops-panel';
+        box.id = 'rfPanel';
+        box.innerHTML = '<div class="ops-head"><h3>' + OPS.t('🎴 RFID cards') + '</h3><div class="ops-actions">' +
+            (edit ? '<button class="tb-btn primary" id="rfAdd">' + OPS.t('➕ Add card') + '</button>' +
+                '<button class="tb-btn" id="rfImport">' + OPS.t('⬆️ Import CSV / Excel') + '</button>' : '') +
+            '<a class="tb-btn" id="rfCsv" href="/api/ops/rfid/export.csv">' + OPS.t('⬇️ CSV') + '</a>' +
+            '<a class="tb-btn" id="rfXlsx" href="/api/ops/rfid/export.xlsx">' + OPS.t('⬇️ Excel') + '</a>' +
+            (edit ? '<button class="tb-btn" id="rfSample">' + OPS.t('🎲 Add Sample Cards') + '</button>' : '') +
+            '<button class="tb-btn" id="rfReload">' + OPS.t('🔄 Refresh') + '</button></div></div>' +
+            '<section class="kpis ops-kpis">' + OPS.kpi('info', 'Cards', 'rfKAll', 'registered') + OPS.kpi('good', 'Can charge', 'rfKOk', 'Accepted, not expired') +
+            OPS.kpi('bad', 'Blocked / invalid', 'rfKBad', 'cannot charge') + OPS.kpi('warn', 'Expired', 'rfKExp', 'past the expiry date') +
+            OPS.kpi('info', 'No owner on file', 'rfKNo', 'cards without owner details') + '</section>' +
+            '<div class="ops-rf-filters"><input type="search" class="tb-inp" id="rfQ" autocomplete="off" placeholder="' + esc(OPS.tx('Card, owner, mobile, plate, organisation…')) + '">' +
+            '<select class="tb-sel" id="rfSt">' + Object.keys(FILTERS).map(k => OPS.opt(k, FILTERS[k])).join('') + '</select>' +
+            '<span class="muted" id="rfCnt"></span></div>' +
+            '<div class="ops-table-wrap"><table class="fleet-table ops-table ops-cards" id="rfTable"></table></div>' +
+            '<div class="pay-help">' + OPS.t('Every card the chargers may accept is listed here. Accepted = can charge; Blocked, Expired or Invalid = refused, and a card past its expiry date is refused as Expired. The owner details (name, mobile number, e-mail, vehicle plate) are shown to roles that manage cards or see customers; other roles see them shortened.') + '</div>';
+        view.insertBefore(box, view.firstChild);
+        OPS.$('rfQ').value = R.q;
+        OPS.$('rfSt').value = R.st;
+        OPS.$('rfQ').oninput = e => { R.q = e.target.value; renderTable(); };
+        OPS.$('rfSt').onchange = e => { R.st = e.target.value; renderTable(); };
+        OPS.$('rfReload').onclick = () => load();
+        if (OPS.$('rfAdd')) OPS.$('rfAdd').onclick = () => editDialog(null);
+        if (OPS.$('rfImport')) OPS.$('rfImport').onclick = importDialog;
+        if (OPS.$('rfSample')) OPS.$('rfSample').onclick = sampleCards;
+        OPS.$('rfTable').addEventListener('click', onTable);
+    }
+
+    async function load() {
+        if (R.busy || !OPS.$('rfPanel')) return;
+        R.busy = true;
+        try { R.data = await OPS.api('/api/ops/rfid'); } catch (e) { R.busy = false; return OPS.fail(e); }
+        R.busy = false;
+        render();
+    }
+
+    function render() {
+        const d = R.data;
+        if (!d || !OPS.$('rfPanel')) return;
+        const c = d.counts || {};
+        OPS.$('rfKAll').textContent = c.all;
+        OPS.$('rfKOk').textContent = c.ok;
+        OPS.$('rfKBad').textContent = c.blocked;
+        OPS.$('rfKExp').textContent = c.expired;
+        OPS.$('rfKNo').textContent = c.no_owner;
+        renderTable();
+    }
+
+    function match(c) {
+        const f = R.st;
+        if (f === 'ok' && c.effective !== 'Accepted') return false;
+        if (f === 'blocked' && !(c.effective === 'Blocked' || c.effective === 'Invalid')) return false;
+        if (f === 'expired' && c.effective !== 'Expired') return false;
+        if (f === 'noowner' && c.has_owner) return false;
+        if (f === 'owner' && !c.has_owner) return false;
+        const q = R.q.trim().toLowerCase();
+        if (!q) return true;
+        return [c.id_tag, c.owner_name, c.owner_phone, c.owner_email, c.vehicle_plate, c.organisation, c.description, c.parent_id]
+            .some(v => String(v || '').toLowerCase().includes(q));
+    }
+
+    function statusHtml(c) {
+        let h = '<span class="' + (STCLS[c.effective] || '') + '">' + OPS.t(STATUS[c.effective] || c.effective) + '</span>';
+        if (c.effective !== c.status) h += '<br><span class="muted">' + OPS.t('(set as {s})', {s: OPS.tx(c.status)}) + '</span>';
+        return h;
+    }
+
+    function ownerHtml(c) {
+        let h = c.owner_name ? '<b>' + esc(c.owner_name) + '</b>' : '<span class="muted">—</span>';
+        if (c.organisation) h += '<br><span class="muted">' + esc(c.organisation) + '</span>';
+        if (c.app) h += '<br><span class="ops-rf-app" title="' + esc(OPS.tx('BPC EV app account with this mobile number: {name}', {name: c.app.name})) + '">' + OPS.t('📱 app account') + '</span>';
+        return h;
+    }
+
+    function row(c) {
+        const can = R.data.can || {};
+        const contact = [c.owner_phone ? esc(c.owner_phone) : '', c.owner_email ? esc(c.owner_email) : ''].filter(Boolean).join('<br>') || '<span class="muted">—</span>';
+        const last = c.last_used_t ? OPS.fmt(c.last_used_t) + '<br><span class="muted">' + OPS.t('{d} ago', {d: OPS.ago(c.last_used_t)}) + '</span>' : '<span class="muted">' + OPS.t('Never') + '</span>';
+        return '<tr data-tag="' + esc(c.id_tag) + '"' + (c.effective === 'Accepted' ? '' : ' class="ops-rf-off"') + '>' +
+            td('Card', '<b class="ops-rf-tag">' + esc(c.id_tag) + '</b>' + (c.parent_id ? '<br><span class="muted">' + OPS.t('Parent ID') + ': ' + esc(c.parent_id) + '</span>' : '')) +
+            td('Status', statusHtml(c)) + td('Owner', ownerHtml(c)) + td('Mobile / e-mail', contact) +
+            td('Vehicle', c.vehicle_plate ? '<span class="ops-rf-nw">' + esc(c.vehicle_plate) + '</span>' : '<span class="muted">—</span>') +
+            td('Expiry', c.expires_t ? OPS.fmt(c.expires_t) : '<span class="muted">—</span>') + td('Last used', last) +
+            td('Note', c.description ? esc(c.description) : '<span class="muted">—</span>') +
+            (can.edit ? td('', '<div class="ops-btns"><button class="tb-btn ops-mini" data-act="edit">' + OPS.t('✏️ Edit') + '</button>' +
+                '<button class="tb-btn ops-mini" data-act="del">' + OPS.t('🗑️ Delete') + '</button></div>') : '') + '</tr>';
+    }
+
+    function renderTable() {
+        const d = R.data;
+        if (!d || !OPS.$('rfTable')) return;
+        const all = d.cards || [];
+        const rows = all.filter(match);
+        const shown = rows.slice(0, R.max);
+        OPS.$('rfCnt').innerHTML = (rows.length === all.length ? '' : OPS.t('{n} of {m}', {n: rows.length, m: all.length})) +
+            (rows.length > shown.length ? ' · ' + OPS.t('Showing the first {n} - refine the search', {n: shown.length}) : '') +
+            (d.can && !d.can.owner ? ' · ' + OPS.t('🔒 owner details shortened for your role') : '');
+        const cols = (d.can && d.can.edit) ? 9 : 8;
+        OPS.$('rfTable').innerHTML = '<thead><tr><th>' + OPS.t('Card') + '</th><th>' + OPS.t('Status') + '</th><th>' + OPS.t('Owner') + '</th><th>' +
+            OPS.t('Mobile / e-mail') + '</th><th>' + OPS.t('Vehicle') + '</th><th>' + OPS.t('Expiry') + '</th><th>' + OPS.t('Last used') + '</th><th>' +
+            OPS.t('Note') + '</th>' + (cols === 9 ? '<th></th>' : '') + '</tr></thead><tbody>' +
+            (shown.map(row).join('') || '<tr><td colspan="' + cols + '" class="muted">' +
+                OPS.t(all.length ? 'Nothing found' : 'No RFID cards yet - "➕ Add card" or "⬆️ Import CSV / Excel" registers the first ones.') + '</td></tr>') + '</tbody>';
+    }
+
+    function onTable(e) {
+        const b = e.target.closest('button[data-act]');
+        if (!b) return;
+        const tr = b.closest('tr');
+        const tag = tr ? tr.dataset.tag : '';
+        const card = ((R.data && R.data.cards) || []).find(c => c.id_tag === tag);
+        if (!card) return;
+        if (b.dataset.act === 'edit') editDialog(card);
+        else if (b.dataset.act === 'del') del(card);
+    }
+
+    async function del(card) {
+        if (!OPS.confirm('Delete card {tag}?', {tag: card.id_tag})) return;
+        try {
+            await OPS.post('/api/rfid/delete', {id_tag: card.id_tag});
+            OPS.toast(OPS.tx('Card {tag} deleted', {tag: card.id_tag}), 'success');
+            load();
+        } catch (e) { fail(e); }
+    }
+
+    const expiryDate = c => (c && c.expires_t ? OPS.fmt(c.expires_t).slice(0, 10) : '');
+    const FIELDS = {status: '#rfSt2', expiry_date: '#rfExp', parent_id: '#rfPar', description: '#rfDesc', owner_name: '#rfName',
+        owner_phone: '#rfPhone', owner_email: '#rfMail', vehicle_plate: '#rfPlate', organisation: '#rfOrg'};
+    const formValues = box => { const o = {}; Object.keys(FIELDS).forEach(k => { o[k] = val(box, FIELDS[k]); }); return o; };
+    const inp = (id, label, v, extra, cls) => '<label' + (cls ? ' class="' + cls + '"' : '') + '>' + OPS.t(label) +
+        '<input class="tb-inp" id="' + id + '" value="' + esc(v == null ? '' : v) + '" ' + (extra || '') + '></label>';
+
+    function editDialog(card) {
+        const isNew = !card;
+        const c = card || {status: 'Accepted'};
+        const sts = Object.keys(STATUS).filter(k => k !== 'ConcurrentTx' || c.status === 'ConcurrentTx');
+        let info = '';
+        if (!isNew) {
+            const by = (t, u, k1, k2) => (t ? OPS.t(u ? k1 : k2, {t: OPS.fmt(t), u: u}) : '');
+            info = '<div class="muted ops-rf-info">' + [by(c.created_t, c.created_by, 'Created {t} by {u}', 'Created {t}'),
+                by(c.updated_t, c.updated_by, 'Changed {t} by {u}', 'Changed {t}'),
+                c.last_used_t ? OPS.t('Last used {t}', {t: OPS.fmt(c.last_used_t)}) : OPS.t('Never used')].filter(Boolean).join(' · ') + '</div>';
+        }
+        const body = '<div class="ops-form">' +
+            inp('rfTag', 'Card ID', c.id_tag, 'maxlength="20" autocomplete="off" placeholder="04A2B3C4D5E6F7"' + (isNew ? '' : ' readonly'), 'ops-rf-mono') +
+            '<label>' + OPS.t('Status') + '<select class="tb-sel" id="rfSt2">' + sts.map(k => OPS.opt(k, STATUS[k], k === c.status)).join('') + '</select></label>' +
+            '<label>' + OPS.t('Expiry (Bhutan Time)') + '<input class="tb-inp" type="date" id="rfExp" min="2000-01-01" max="9999-12-31" value="' + esc(expiryDate(card)) + '">' +
+            (c.expires_t ? '<span class="muted ops-rf-until">' + OPS.t('Valid until {t} (Bhutan Time)', {t: OPS.fmt(c.expires_t, true)}) + '</span>' : '') + '</label>' +
+            inp('rfPar', 'Parent ID', c.parent_id, 'maxlength="20" autocomplete="off"', 'ops-rf-mono') +
+            inp('rfDesc', 'Note', c.description, 'maxlength="200"', 'wide') +
+            '<h4 class="wide ops-rf-h">' + OPS.t('👤 Owner') + '</h4>' +
+            inp('rfName', 'Owner name', c.owner_name, 'maxlength="80" autocomplete="off"') +
+            inp('rfPhone', 'Mobile number', c.owner_phone, 'maxlength="20" inputmode="tel" autocomplete="off"') +
+            inp('rfMail', 'E-mail', c.owner_email, 'maxlength="120" type="email" autocomplete="off"') +
+            inp('rfPlate', 'Vehicle number plate', c.vehicle_plate, 'maxlength="20" autocomplete="off"') +
+            inp('rfOrg', 'Organisation / fleet', c.organisation, 'maxlength="80" autocomplete="off"', 'wide') + '</div>' + info +
+            '<div class="pay-help">' + OPS.t('Card ID: up to 20 letters / digits, as the charger reads the card (e.g. 04A2B3C4D5E6F7). The card works until the end of its expiry date (Bhutan Time) - leave it empty for a card that does not expire. Only the fields you change are saved. A mobile number that belongs to a BPC EV app account is shown with 📱 to roles that see customers.') + '</div>';
+        let init = null;
+        const wrap = OPS.modal(isNew ? '➕ Add card' : 'Edit card {tag}', body, [{label: 'Cancel'}, {label: 'Save', cls: 'primary', run: async box => {
+            const ex = box.querySelector('#rfExp');
+            if (ex && ex.validity && ex.validity.badInput) {          // a date typed only in part: refused, not taken as "no expiry"
+                OPS.toast(OPS.tx('Expiry: a date as YYYY-MM-DD (or DD/MM/YYYY), Bhutan Time'), 'error');
+                ex.focus();
+                return false;
+            }
+            const tag = val(box, '#rfTag').toUpperCase();
+            const now = formValues(box);
+            const b = {id_tag: tag, create: isNew};
+            Object.keys(FIELDS).forEach(k => { if (isNew ? now[k] !== '' : now[k] !== init[k]) b[k] = now[k]; });   // only what was changed
+            if (!isNew && Object.keys(b).length === 2) { OPS.toast(OPS.tx('Nothing changed'), 'info'); return true; }
+            try {
+                await OPS.post('/api/ops/rfid/save', b);
+            } catch (e) {
+                fail(e);
+                const f = e && e.data && e.data.field;
+                const el = f && box.querySelector({id_tag: '#rfTag', status: '#rfSt2', expiry_date: '#rfExp', parent_id: '#rfPar', description: '#rfDesc',
+                    owner_name: '#rfName', owner_phone: '#rfPhone', owner_email: '#rfMail', vehicle_plate: '#rfPlate', organisation: '#rfOrg'}[f]);
+                if (el) el.focus();
+                return false;
+            }
+            OPS.toast(OPS.tx('Card {tag} saved', {tag: tag}), 'success');
+            load();
+            return true;
+        }}], {wide: true, vars: {tag: c.id_tag || ''}});
+        init = formValues(wrap);
+    }
+
+    // ---- the import endpoint (also the sample cards): busy with another file -> asked again a few times
+    async function upload(fd) {
+        for (let i = 0; ; i++) {
+            const r = await fetch('/api/ops/rfid/import', {method: 'POST', body: fd, credentials: 'same-origin'});
+            if (r.status === 429 && i < 8) { await new Promise(res => setTimeout(res, 800)); continue; }
+            let j = null;
+            try { j = await r.json(); } catch (e) { j = null; }
+            if (!r.ok) {
+                const err = new Error((j && j.error) || ('HTTP ' + r.status));
+                err.status = r.status; err.data = j;
+                throw err;
+            }
+            return j;
+        }
+    }
+
+    function importDialog() {
+        const d = R.data || {};
+        const body = '<div class="ops-form">' +
+            '<label class="wide">' + OPS.t('CSV or Excel file') + '<input type="file" class="tb-inp" id="rfFile" accept=".csv,.txt,.xlsx,.json"></label>' +
+            '<label class="wide">' + OPS.t('Cards already registered') + '<select class="tb-sel" id="rfMode">' +
+            OPS.opt('merge', 'Update them with the values in the file') + OPS.opt('new_only', 'Leave them as they are (add new cards only)') + '</select></label></div>' +
+            '<div class="pay-help">' + OPS.t('First row: the column titles - Card ID (needed), Status, Expiry, Parent ID, Note, Owner name, Mobile, E-mail, Vehicle plate, Organisation (other names such as UID or Phone work too). An empty cell keeps what the card has. Expiry: YYYY-MM-DD or DD/MM/YYYY, valid to the end of that day (Bhutan Time). In Excel, format the Card ID column as text so leading zeros stay. Up to {n} cards and {mb} MB per file. Nothing changes before you press Import.', {n: (d.max_rows || 20000).toLocaleString('en-US'), mb: d.max_mb || 5}) +
+            ' <a href="/api/ops/rfid/template.csv">' + OPS.t('📄 Download the template') + '</a></div><div id="rfPrev"></div>';
+        let file = null, bytes = null, ready = 0, plan = '', seq = 0;
+        const wrap = OPS.modal('⬆️ Import RFID cards', body, [{label: 'Cancel'}, {label: 'Import', cls: 'primary', run: async box => {
+            if (!file || !bytes || !ready) { OPS.toast(OPS.tx('Nothing to import'), 'error'); return false; }
+            let j;
+            try { j = await send(box, true); } catch (e) {
+                if (e && e.status === 409 && e.data && e.data.counts) {     // the cards or the file changed: the new preview, nothing written
+                    show(e.data);
+                    wrap.querySelector('#rfPrev').insertAdjacentHTML('afterbegin', '<div class="ops-rf-err">⚠️ ' +
+                        OPS.t('The cards or the file changed since the preview - check the new preview and press Import again') + '</div>');
+                    return false;
+                }
+                fail(e);
+                return false;
+            }
+            let msg = OPS.tx('{n} cards imported', {n: j.imported || 0});
+            if (j.counts.error) msg += ' · ' + OPS.tx('{n} rows with errors left out', {n: j.counts.error});
+            if (j.conflicts) msg += ' · ' + OPS.tx('{n} cards were changed by someone else meanwhile and were left out - import the file again to check them', {n: j.conflicts});
+            OPS.toast(msg, (j.counts.error || j.conflicts) ? 'info' : 'success');
+            load();
+            return true;
+        }}], {wide: true});
+        const btn = wrap.querySelector('.ops-modal-foot .primary');
+        btn.disabled = true;
+        const show = j => {
+            ready = (j.counts.new || 0) + (j.counts.update || 0);
+            plan = j.plan || '';
+            btn.disabled = !ready;
+            btn.innerHTML = ready ? OPS.t('⬆️ Import {n} cards', {n: ready}) : OPS.t('Import');
+            wrap.querySelector('#rfPrev').innerHTML = previewHtml(j);
+        };
+        const preview = async () => {
+            const my = ++seq;
+            ready = 0;
+            plan = '';
+            btn.disabled = true;
+            if (!file) return;
+            const p = wrap.querySelector('#rfPrev');
+            if (file.size > (d.max_mb || 5) * 1024 * 1024) {
+                p.innerHTML = '<div class="ops-rf-err">' + OPS.t('The file is larger than 5 MB - split it') + '</div>';
+                return;
+            }
+            if (!bytes) {
+                p.innerHTML = '<div class="ops-rf-err">' + OPS.t('The file could not be read') + '</div>';
+                return;
+            }
+            p.innerHTML = '<div class="muted">' + OPS.t('Reading the file…') + '</div>';
+            let j;
+            try { j = await send(wrap, false); } catch (e) {
+                if (my === seq) p.innerHTML = '<div class="ops-rf-err">' + OPS.t((e && e.message) || 'Error', e && e.data && e.data.vars) + '</div>';
+                return;
+            }
+            if (my === seq) show(j);                                      // an older answer never replaces a newer one
+        };
+        wrap.querySelector('#rfFile').onchange = async e => {
+            const f = e.target.files[0] || null;
+            file = f;
+            bytes = null;
+            let buf = null;
+            if (f && f.size <= (d.max_mb || 5) * 1024 * 1024) {
+                try { buf = await f.arrayBuffer(); } catch (err) { buf = null; }   // read once: the import sends what the preview showed
+            }
+            if (file !== f) return;                                       // another file was chosen meanwhile
+            bytes = buf;
+            preview();
+        };
+        wrap.querySelector('#rfMode').onchange = preview;
+
+        function send(box, apply) {
+            const fd = new FormData();
+            fd.append('mode', box.querySelector('#rfMode').value);
+            fd.append('apply', apply ? '1' : '0');
+            if (apply && plan) fd.append('plan', plan);
+            fd.append('file', new Blob([bytes], {type: file.type || 'application/octet-stream'}), file.name);
+            return upload(fd);
+        }
+    }
+
+    function previewHtml(j) {
+        const f = j.file || {}, c = j.counts || {};
+        let fmt = esc(f.format || '');
+        if (f.sheet) fmt += ' · ' + OPS.t('sheet {s}', {s: f.sheet});
+        if (f.encoding) fmt += ' · ' + esc(f.encoding);
+        if (f.delimiter) fmt += ' · ' + OPS.t('delimiter {d}', {d: f.delimiter});
+        let h = '<div class="ops-rf-sum"><b>' + esc(f.name || '') + '</b> · ' + OPS.t('{rows} rows', {rows: j.rows}) + ' · ' + fmt + '</div>' +
+            '<div class="ops-rf-chips">' + ['new', 'update', 'unchanged', 'skipped', 'error'].map(k =>
+                '<span class="ops-rf-chip ops-rf-' + k + '">' + OPS.t(ACTION[k]) + ' <b>' + (c[k] || 0) + '</b></span>').join('') + '</div>';
+        (f.warnings || []).forEach(w => { h += '<div class="ops-rf-err">⚠️ ' + (typeof w === 'string' ? OPS.t(w) : OPS.t(w.text, w.vars)) + '</div>'; });
+        if ((f.ignored || []).length) h += '<div class="muted">' + OPS.t('Columns not used: {c}', {c: f.ignored.join(', ')}) + '</div>';
+        const items = j.items || [];
+        if (items.length) {
+            h += '<div class="ops-table-wrap ops-rf-prevwrap"><table class="ops-rf-prev"><thead><tr><th>' + OPS.t('Row') + '</th><th>' + OPS.t('Card') + '</th><th>' +
+                OPS.t('Result') + '</th><th>' + OPS.t('Owner') + '</th><th>' + OPS.t('Details') + '</th></tr></thead><tbody>' +
+                items.map(i => {
+                    let det = '';
+                    if (i.action === 'error') det = '<span class="ops-bad">' + OPS.t(i.error, i.vars) + '</span>' + (i.field ? ' <span class="muted">(' + OPS.t(FIELD[i.field] || i.field) + ')</span>' : '');
+                    else if (i.action === 'skipped') det = '<span class="muted">' + OPS.t(i.why || '') + '</span>';
+                    else det = (i.changes || []).map(k => OPS.t(FIELD[k] || k)).join(', ');
+                    return '<tr class="ops-rf-' + esc(i.action) + '"><td>' + esc(i.row) + '</td><td class="ops-rf-tag">' + esc(i.tag || '—') + '</td><td>' +
+                        OPS.t(ACTION[i.action] || i.action) + (i.status && i.action !== 'error' ? '<br><span class="muted">' + OPS.t(STATUS[i.status] || i.status) + '</span>' : '') +
+                        '</td><td>' + esc(i.name || '') + '</td><td>' + det + '</td></tr>';
+                }).join('') + '</tbody></table></div>';
+            if (items.length >= 300) h += '<div class="muted">' + OPS.t('Only the first {n} rows are listed.', {n: items.length}) + '</div>';
+        }
+        if (c.error) h += '<div class="pay-help">' + OPS.t('Rows with errors are left out - fix them in the file and import it again.') + '</div>';
+        return h;
+    }
+
+    async function sampleCards() {
+        const rows = [['CARD001', 'Accepted', '', '', 'Test Card 1 (Accepted)'], ['CARD002', 'Accepted', '', '', 'Test Card 2 (Accepted)'],
+            ['CARD003', 'Blocked', '', '', 'Blocked Card'], ['CARD004', 'Expired', '2020-01-01', '', 'Expired Card'],
+            ['CARD005', 'Invalid', '', '', 'Invalid Card'], ['VIP001', 'Accepted', '', 'VIP_GROUP', 'VIP Member']];
+        const fd = new FormData();
+        fd.append('mode', 'new_only');                                    // a card already registered with one of these IDs stays as it is
+        fd.append('apply', '1');
+        fd.append('file', new Blob(['Card ID,Status,Expiry,Parent ID,Note\r\n' + rows.map(r => r.join(',')).join('\r\n') + '\r\n'], {type: 'text/csv'}),
+            'sample_cards.csv');
+        try {
+            const j = await upload(fd);
+            const skipped = (j.counts && j.counts.skipped) || 0;
+            OPS.toast(OPS.tx('Added {n} sample cards', {n: j.imported || 0}) + (skipped ? ' · ' + OPS.tx('{n} already registered - left as they are', {n: skipped}) : ''), 'success');
+            load();
+        } catch (e) { fail(e); }
+    }
+
+    // ---- the 🎴 RFID Cards tab (all roles see it; changing cards needs the config permission)
+    OPS.register({tab: 'rfid', perm: 'view', every: 30,
+        show: function () {
+            const v = OPS.$('view-rfid');
+            if (!v) return;
+            if (!OPS.$('rfPanel')) build(v);
+            load();
+        },
+        refresh: () => load(),
+        relang: function () {
+            const p = OPS.$('rfPanel');
+            if (p) p.remove();
+            const v = OPS.$('view-rfid');
+            if (v) { build(v); render(); }
+        }
+    });
+
+    OPS.addI18n({
+        '🎴 RFID cards': ['🎴 RFID ཤོག་བྱང་ཚུ་', '🎴 บัตร RFID'], '➕ Add card': ['➕ ཤོག་བྱང་ཁ་སྐོང་', '➕ เพิ่มบัตร'],
+        '⬆️ Import CSV / Excel': ['⬆️ CSV / Excel ནང་འདྲེན་', '⬆️ นำเข้า CSV / Excel'], '⬇️ CSV': ['⬇️ CSV', '⬇️ CSV'], '⬇️ Excel': ['⬇️ Excel', '⬇️ Excel'],
+        '🎲 Add Sample Cards': ['🎲 དཔེ་ཤོག་བྱང་ཁ་སྐོང་', '🎲 เพิ่มบัตรตัวอย่าง'], '🔄 Refresh': ['🔄 གསར་བསྐྲུན་', '🔄 รีเฟรช'],
+        'Cards': ['ཤོག་བྱང་', 'บัตร'], 'registered': ['ཐོ་བཀོད་འབད་ཡོད་', 'ลงทะเบียนแล้ว'], 'Can charge': ['གློག་བླུགས་ཚུགས་', 'ชาร์จได้'],
+        'Accepted, not expired': ['Accepted དུས་མ་ཡོལ་བ་', 'Accepted และยังไม่หมดอายุ'], 'Blocked / invalid': ['བཀག་ཆ་ / ནུས་མེད་', 'ระงับ / ใช้ไม่ได้'],
+        'cannot charge': ['གློག་བླུགས་མི་ཚུགས་', 'ชาร์จไม่ได้'], 'Expired': ['དུས་ཡོལ་', 'หมดอายุ'], 'past the expiry date': ['དུས་ཡོལ་ཚེས་གྲངས་ལས་ བརྒལ་ཡོད་', 'เลยวันหมดอายุแล้ว'],
+        'No owner on file': ['བདག་པོ་ཐོ་བཀོད་མེད་', 'ยังไม่มีข้อมูลเจ้าของ'], 'cards without owner details': ['བདག་པོའི་ཁ་གསལ་མེད་པའི་ཤོག་བྱང་', 'บัตรที่ยังไม่มีข้อมูลเจ้าของ'],
+        'All cards': ['ཤོག་བྱང་ཆ་མཉམ་', 'บัตรทั้งหมด'], 'With owner': ['བདག་པོ་ཡོད་མི་', 'มีข้อมูลเจ้าของ'],
+        'Card, owner, mobile, plate, organisation…': ['ཤོག་བྱང་, བདག་པོ་, མོ་བཱའིལ་, ཨང་བྱང་, ལས་སྡེ་…', 'บัตร, เจ้าของ, เบอร์มือถือ, ทะเบียนรถ, หน่วยงาน…'],
+        '{n} of {m}': ['{m} ལས་ {n}', '{n} จาก {m}'], 'Card': ['ཤོག་བྱང་', 'บัตร'], 'Status': ['གནས་ཚད་', 'สถานะ'], 'Owner': ['བདག་པོ་', 'เจ้าของ'],
+        'Mobile / e-mail': ['མོ་བཱའིལ་ / གློག་འཕྲིན་', 'มือถือ / อีเมล'], 'Vehicle': ['སྣུམ་འཁོར་', 'รถ'], 'Expiry': ['དུས་ཡོལ་', 'หมดอายุ'],
+        'Last used': ['མཐའ་མཇུག་ལག་ལེན་', 'ใช้ล่าสุด'], 'Note': ['དྲན་ཐོ་', 'หมายเหตุ'], 'Never': ['ནམ་ཡང་མེད་', 'ไม่เคย'],
+        '✅ Accepted': ['✅ ངོས་ལེན་ (Accepted)', '✅ ใช้ได้ (Accepted)'], '🚫 Blocked': ['🚫 བཀག་ཆ་ (Blocked)', '🚫 ระงับ (Blocked)'],
+        '⏰ Expired': ['⏰ དུས་ཡོལ་ (Expired)', '⏰ หมดอายุ (Expired)'], '❌ Invalid': ['❌ ནུས་མེད་ (Invalid)', '❌ ใช้ไม่ได้ (Invalid)'],
+        '⏸️ ConcurrentTx': ['⏸️ ConcurrentTx', '⏸️ ConcurrentTx'], '(set as {s})': ['({s} སྦེ་ གཞི་སྒྲིག་ཡོད་)', '(ตั้งไว้เป็น {s})'],
+        'Accepted': ['Accepted', 'Accepted'], 'Blocked': ['Blocked', 'Blocked'], 'Invalid': ['Invalid', 'Invalid'],
+        'BPC EV app account with this mobile number: {name}': ['མོ་བཱའིལ་ཨང་འདི་ཅན་གྱི་ BPC EV app རྩིས་ཁྲ་: {name}', 'บัญชีแอป BPC EV ที่ใช้เบอร์นี้: {name}'],
+        '📱 app account': ['📱 app རྩིས་ཁྲ་', '📱 มีบัญชีแอป'], 'Parent ID': ['Parent ID', 'Parent ID'], '{d} ago': ['{d} ཧེ་མ་', '{d} ที่แล้ว'],
+        '✏️ Edit': ['✏️ ཞུན་དག་', '✏️ แก้ไข'], '🗑️ Delete': ['🗑️ བཏོན་གཏང་', '🗑️ ลบ'],
+        'Showing the first {n} - refine the search': ['དང་པ་ {n} སྟོན་དོ་ - འཚོལ་ཞིབ་ ཁ་གསལ་བཟོ་', 'แสดง {n} รายการแรก - ค้นหาให้แคบลง'],
+        '🔒 owner details shortened for your role': ['🔒 ཁྱོད་ཀྱི་འགན་ཁུར་ལུ་ བདག་པོའི་ཁ་གསལ་ ཐུང་བཟོ་ཡོད་', '🔒 ข้อมูลเจ้าของแสดงแบบย่อสำหรับบทบาทของคุณ'],
+        'Nothing found': ['ག་ནི་ཡང་མ་འཐོབ་', 'ไม่พบ'],
+        'No RFID cards yet - "➕ Add card" or "⬆️ Import CSV / Excel" registers the first ones.': ['RFID ཤོག་བྱང་ ད་ཚུན་མེད་ - "➕ ཤོག་བྱང་ཁ་སྐོང་" ཡང་ན་ "⬆️ CSV / Excel ནང་འདྲེན་" གིས་ ཤོག་བྱང་དང་པ་ཚུ་ ཐོ་བཀོད་འབདཝ་ཨིན།', 'ยังไม่มีบัตร RFID - กด "➕ เพิ่มบัตร" หรือ "⬆️ นำเข้า CSV / Excel" เพื่อลงทะเบียนบัตรแรก'],
+        'Every card the chargers may accept is listed here. Accepted = can charge; Blocked, Expired or Invalid = refused, and a card past its expiry date is refused as Expired. The owner details (name, mobile number, e-mail, vehicle plate) are shown to roles that manage cards or see customers; other roles see them shortened.': [
+            'གློག་བླུགས་འཕྲུལ་ཆས་ཚུ་གིས་ ངོས་ལེན་འབད་ཚུགས་པའི་ ཤོག་བྱང་ཆ་མཉམ་ ནཱ་ལུ་ཐོ་བཀོད་ཡོད། Accepted = གློག་བླུགས་ཚུགས། Blocked, Expired ཡང་ན་ Invalid = ངོས་ལེན་མེད། དུས་ཡོལ་ཚེས་གྲངས་ལས་བརྒལ་བའི་ཤོག་བྱང་ཡང་ Expired སྦེ་ ངོས་ལེན་མི་འབད། བདག་པོའི་ཁ་གསལ་ (མིང་, མོ་བཱའིལ་ཨང་, གློག་འཕྲིན་, སྣུམ་འཁོར་ཨང་བྱང་) འདི་ ཤོག་བྱང་འཛིན་སྐྱོང་འབད་མི་ ཡང་ན་ ཚོང་མགྲོན་བལྟ་ཚུགས་པའི་ འགན་ཁུར་ཚུ་ལུ་ སྟོནམ་ཨིན། འགན་ཁུར་གཞན་ཚུ་གིས་ ཐུང་བཟོ་སྟེ་ མཐོངམ་ཨིན།',
+            'บัตรทุกใบที่ตู้ชาร์จอาจยอมรับอยู่ในรายการนี้ Accepted = ชาร์จได้; Blocked, Expired หรือ Invalid = ถูกปฏิเสธ และบัตรที่เลยวันหมดอายุจะถูกปฏิเสธเป็น Expired ข้อมูลเจ้าของ (ชื่อ เบอร์มือถือ อีเมล ทะเบียนรถ) แสดงให้บทบาทที่จัดการบัตรหรือดูข้อมูลลูกค้าได้ บทบาทอื่นจะเห็นแบบย่อ'],
+        'Delete card {tag}?': ['ཤོག་བྱང་ {tag} བཏོན་གཏང་ནི་ཨིན་ན?', 'ลบบัตร {tag}?'], 'Card {tag} deleted': ['ཤོག་བྱང་ {tag} བཏོན་གཏང་ཡོད།', 'ลบบัตร {tag} แล้ว'],
+        'Created {t} by {u}': ['{t} ལུ་ {u} གིས་ བཟོ་ཡོད་', 'สร้างเมื่อ {t} โดย {u}'], 'Created {t}': ['{t} ལུ་ བཟོ་ཡོད་', 'สร้างเมื่อ {t}'],
+        'Changed {t} by {u}': ['{t} ལུ་ {u} གིས་ བསྒྱུར་ཡོད་', 'แก้ไขเมื่อ {t} โดย {u}'], 'Changed {t}': ['{t} ལུ་ བསྒྱུར་ཡོད་', 'แก้ไขเมื่อ {t}'],
+        'Last used {t}': ['མཐའ་མཇུག་ལག་ལེན་ {t}', 'ใช้ล่าสุด {t}'], 'Never used': ['ནམ་ཡང་ ལག་ལེན་མ་འཐབ་', 'ยังไม่เคยใช้'],
+        'Card ID': ['ཤོག་བྱང་ ID', 'หมายเลขบัตร (Card ID)'], 'Expiry (Bhutan Time)': ['དུས་ཡོལ་ (འབྲུག་གི་ཆུ་ཚོད་)', 'วันหมดอายุ (เวลาภูฏาน)'],
+        '👤 Owner': ['👤 བདག་པོ་', '👤 เจ้าของบัตร'], 'Owner name': ['བདག་པོའི་མིང་', 'ชื่อเจ้าของ'], 'Mobile number': ['མོ་བཱའིལ་ཨང་', 'เบอร์มือถือ'],
+        'E-mail': ['གློག་འཕྲིན་', 'อีเมล'], 'Vehicle number plate': ['སྣུམ་འཁོར་ཨང་བྱང་', 'ทะเบียนรถ'], 'Organisation / fleet': ['ལས་སྡེ་ / སྣུམ་འཁོར་ཚོགས་', 'หน่วยงาน / กลุ่มรถ'],
+        'Card ID: up to 20 letters / digits, as the charger reads the card (e.g. 04A2B3C4D5E6F7). The card works until the end of its expiry date (Bhutan Time) - leave it empty for a card that does not expire. Only the fields you change are saved. A mobile number that belongs to a BPC EV app account is shown with 📱 to roles that see customers.': [
+            'ཤོག་བྱང་ ID: གློག་བླུགས་འཕྲུལ་ཆས་ཀྱིས་ ཤོག་བྱང་ལྷག་མི་བཟུམ་ ཡིག་འབྲུ་ / ཨང་ 20 ཚུན་ (དཔེར་ན་ 04A2B3C4D5E6F7)། ཤོག་བྱང་འདི་ དུས་ཡོལ་ཚེས་གྲངས་ཀྱི་ ཉིན་མཇུག་ཚུན་ (འབྲུག་གི་ཆུ་ཚོད་) ལག་ལེན་འཐབ་ཚུགས། དུས་མི་ཡོལ་བའི་ཤོག་བྱང་གི་དོན་ལུ་ སྟོངམ་བཞག ཁྱོད་ཀྱིས་ བསྒྱུར་མི་ས་སྒོ་ཚུ་ རྐྱངམ་ཅིག་ སྲུང་འོང་། BPC EV app རྩིས་ཁྲ་ཅིག་གི་ མོ་བཱའིལ་ཨང་ཨིན་པ་ཅིན་ ཚོང་མགྲོན་བལྟ་ཚུགས་པའི་ འགན་ཁུར་ཚུ་ལུ་ 📱 དང་གཅིག་ཁར་ སྟོནམ་ཨིན།',
+            'หมายเลขบัตร: ตัวอักษร / ตัวเลขไม่เกิน 20 ตัว ตามที่ตู้อ่านได้จากบัตร (เช่น 04A2B3C4D5E6F7) บัตรใช้ได้ถึงสิ้นวันหมดอายุ (เวลาภูฏาน) - เว้นว่างไว้ถ้าบัตรไม่หมดอายุ ระบบบันทึกเฉพาะช่องที่คุณแก้ไข เบอร์มือถือที่เป็นของบัญชีแอป BPC EV จะแสดงพร้อม 📱 ให้บทบาทที่ดูข้อมูลลูกค้าได้'],
+        'Edit card {tag}': ['ཤོག་བྱང་ {tag} ཞུན་དག་', 'แก้ไขบัตร {tag}'], 'Cancel': ['ཆ་མེད་', 'ยกเลิก'], 'Save': ['སྲུང་', 'บันทึก'],
+        'Card {tag} saved': ['ཤོག་བྱང་ {tag} སྲུང་ཡོད་', 'บันทึกบัตร {tag} แล้ว'],
+        '⬆️ Import RFID cards': ['⬆️ RFID ཤོག་བྱང་ནང་འདྲེན་', '⬆️ นำเข้าบัตร RFID'], 'CSV or Excel file': ['CSV ཡང་ན་ Excel ཡིག་སྣོད་', 'ไฟล์ CSV หรือ Excel'],
+        'Cards already registered': ['ཧེ་མ་ལས་ ཐོ་བཀོད་ཡོད་པའི་ཤོག་བྱང་', 'บัตรที่ลงทะเบียนอยู่แล้ว'],
+        'Update them with the values in the file': ['ཡིག་སྣོད་ནང་གི་ གནས་གོང་ཚུ་གིས་ དུས་མཐུན་བཟོ་', 'อัปเดตด้วยค่าในไฟล์'],
+        'Leave them as they are (add new cards only)': ['ཨ་རྟག་བཟུམ་ བཞག་ (ཤོག་བྱང་གསརཔ་ རྐྱངམ་ཅིག་ ཁ་སྐོང་)', 'ไม่เปลี่ยน (เพิ่มเฉพาะบัตรใหม่)'],
+        'First row: the column titles - Card ID (needed), Status, Expiry, Parent ID, Note, Owner name, Mobile, E-mail, Vehicle plate, Organisation (other names such as UID or Phone work too). An empty cell keeps what the card has. Expiry: YYYY-MM-DD or DD/MM/YYYY, valid to the end of that day (Bhutan Time). In Excel, format the Card ID column as text so leading zeros stay. Up to {n} cards and {mb} MB per file. Nothing changes before you press Import.': [
+            'གྲལ་ཐིག་དང་པ་: ཀ་ཐིག་གི་མགོ་མིང་ - Card ID (དགོ་), Status, Expiry, Parent ID, Note, Owner name, Mobile, E-mail, Vehicle plate, Organisation (UID ཡང་ན་ Phone བཟུམ་ མིང་གཞན་ཡང་ འཐུས་)། ཤོག་སྒྲོམ་སྟོངམ་ཅིག་གིས་ ཤོག་བྱང་ལུ་ཡོད་མི་ ཨ་རྟག་བཟུམ་ བཞགཔ་ཨིན། Expiry: YYYY-MM-DD ཡང་ན་ DD/MM/YYYY ཉིན་དེའི་མཇུག་ཚུན་ (འབྲུག་གི་ཆུ་ཚོད་)། Excel ནང་ ཨང་ཀླད་ཀོར་ མ་བརླག་ནིའི་དོན་ལུ་ Card ID ཀ་ཐིག་འདི་ ཡིག་འབྲུ་ (text) སྦེ་ བཟོ། ཡིག་སྣོད་རེ་ལུ་ ཤོག་བྱང་ {n} དང་ {mb} MB ཚུན། Import མ་ཨེབ་ཚུན་ ག་ནི་ཡང་ མི་འགྱུར།',
+            'แถวแรก: ชื่อคอลัมน์ - Card ID (ต้องมี), Status, Expiry, Parent ID, Note, Owner name, Mobile, E-mail, Vehicle plate, Organisation (ชื่ออื่นเช่น UID หรือ Phone ก็ได้) ช่องที่ว่างจะคงค่าเดิมของบัตรไว้ Expiry: YYYY-MM-DD หรือ DD/MM/YYYY ใช้ได้ถึงสิ้นวันนั้น (เวลาภูฏาน) ใน Excel ให้ตั้งคอลัมน์ Card ID เป็นข้อความเพื่อไม่ให้เลข 0 นำหน้าหาย ไม่เกิน {n} บัตรและ {mb} MB ต่อไฟล์ ยังไม่มีอะไรเปลี่ยนจนกว่าจะกด Import'],
+        '📄 Download the template': ['📄 དཔེ་གཞི་ ཕབ་ལེན་', '📄 ดาวน์โหลดแม่แบบ'], 'Import': ['ནང་འདྲེན་', 'นำเข้า (Import)'],
+        'Nothing to import': ['ནང་འདྲེན་འབད་ནི་ ག་ནི་ཡང་མེད་', 'ไม่มีอะไรให้นำเข้า'], '{n} cards imported': ['ཤོག་བྱང་ {n} ནང་འདྲེན་འབད་ཡོད་', 'นำเข้า {n} บัตรแล้ว'],
+        '{n} rows with errors left out': ['འཛོལ་བ་ཡོད་པའི་ གྲལ་ཐིག་ {n} བཤོལ་ཡོད་', 'ข้าม {n} แถวที่ผิดพลาด'], 'Reading the file…': ['ཡིག་སྣོད་ ལྷག་དོ་…', 'กำลังอ่านไฟล์…'],
+        '⬆️ Import {n} cards': ['⬆️ ཤོག་བྱང་ {n} ནང་འདྲེན་', '⬆️ นำเข้า {n} บัตร'], 'sheet {s}': ['ཤོག་ལེབ་ {s}', 'ชีต {s}'], 'delimiter {d}': ['དབྱེ་རྟགས་ {d}', 'ตัวคั่น {d}'],
+        '{rows} rows': ['གྲལ་ཐིག་ {rows}', '{rows} แถว'], '🆕 New': ['🆕 གསརཔ་', '🆕 ใหม่'], '✏️ Changed': ['✏️ བསྒྱུར་ཡོད་', '✏️ เปลี่ยน'],
+        '= Unchanged': ['= མ་བསྒྱུར་', '= ไม่เปลี่ยน'], '⏭️ Skipped': ['⏭️ བཤོལ་ཡོད་', '⏭️ ข้าม'], '⚠️ Error': ['⚠️ འཛོལ་བ་', '⚠️ ผิดพลาด'],
+        'Columns not used: {c}': ['ལག་ལེན་མ་འཐབ་པའི་ ཀ་ཐིག་: {c}', 'คอลัมน์ที่ไม่ได้ใช้: {c}'], 'Row': ['གྲལ་ཐིག་', 'แถว'], 'Result': ['གྲུབ་འབྲས་', 'ผล'],
+        'Details': ['ཁ་གསལ་', 'รายละเอียด'], 'Only the first {n} rows are listed.': ['གྲལ་ཐིག་ དང་པ་ {n} རྐྱངམ་ཅིག་ ཐོ་བཀོད་ཡོད།', 'แสดงเฉพาะ {n} แถวแรก'],
+        'Rows with errors are left out - fix them in the file and import it again.': ['འཛོལ་བ་ཡོད་པའི་ གྲལ་ཐིག་ཚུ་ བཤོལ་ཡོད་ - ཡིག་སྣོད་ནང་ ནོར་བཅོས་འབད་ཞིནམ་ལས་ ལོག་ནང་འདྲེན་འབད།', 'แถวที่ผิดพลาดจะถูกข้าม - แก้ในไฟล์แล้วนำเข้าอีกครั้ง'],
+        'already registered': ['ཧེ་མ་ལས་ ཐོ་བཀོད་ཡོད་', 'ลงทะเบียนอยู่แล้ว'], 'Added {n} sample cards': ['དཔེ་ཤོག་བྱང་ {n} ཁ་སྐོང་འབད་ཡོད།', 'เพิ่มบัตรตัวอย่าง {n} ใบแล้ว'],
+        'RFID card saved': ['RFID ཤོག་བྱང་ སྲུང་ཡོད་', 'บันทึกบัตร RFID'], 'RFID cards imported (CSV / Excel)': ['RFID ཤོག་བྱང་ ནང་འདྲེན་འབད་ཡོད་ (CSV / Excel)', 'นำเข้าบัตร RFID (CSV / Excel)'],
+        'Nothing changed': ['ག་ནི་ཡང་ མ་བསྒྱུར་', 'ไม่มีอะไรเปลี่ยน'], 'Valid until {t} (Bhutan Time)': ['{t} ཚུན་ ལག་ལེན་འཐབ་ཚུགས་ (འབྲུག་གི་ཆུ་ཚོད་)', 'ใช้ได้ถึง {t} (เวลาภูฏาน)'],
+        'The file could not be read': ['ཡིག་སྣོད་ ལྷག་མ་ཚུགས་', 'อ่านไฟล์ไม่ได้'],
+        '{n} cards were changed by someone else meanwhile and were left out - import the file again to check them': ['ཤོག་བྱང་ {n} བར་ན་ མི་གཞན་གྱིས་ བསྒྱུར་ཡོདཔ་ལས་ བཤོལ་ཡོད་ - ཞིབ་དཔྱད་འབད་ནིའི་དོན་ལུ་ ཡིག་སྣོད་ ལོག་ནང་འདྲེན་འབད།', 'มี {n} บัตรที่ผู้อื่นแก้ไขระหว่างนั้นจึงถูกข้าม - นำเข้าไฟล์อีกครั้งเพื่อตรวจสอบ'],
+        '{n} already registered - left as they are': ['{n} ཧེ་མ་ལས་ ཐོ་བཀོད་ཡོད་ - ཨ་རྟག་བཟུམ་ བཞག་ཡོད་', 'ลงทะเบียนอยู่แล้ว {n} ใบ - ไม่เปลี่ยน'],
+        // messages written by the CSMS
+        'The cards or the file changed since the preview - check the new preview and press Import again': ['སྔོན་ལྟ་ལས་ཚུར་ ཤོག་བྱང་ ཡང་ན་ ཡིག་སྣོད་ བསྒྱུར་ཡོད་ - སྔོན་ལྟ་གསརཔ་ ཞིབ་དཔྱད་འབད་ཞིནམ་ལས་ Import ལོག་ཨེབ།', 'บัตรหรือไฟล์เปลี่ยนไปหลังจากดูตัวอย่าง - ตรวจตัวอย่างใหม่แล้วกด Import อีกครั้ง'],
+        'Another card file is being read - try again in a moment': ['ཤོག་བྱང་ཡིག་སྣོད་གཞན་ཅིག་ ལྷག་དོ་ - སྐར་མ་ཅིག་གི་ཤུལ་ལས་ ལོག་འབད།', 'กำลังอ่านไฟล์บัตรอื่นอยู่ - ลองใหม่อีกสักครู่'],
+        'Owner details in this file are masked (an export for a role that sees them shortened) - they are not imported': ['ཡིག་སྣོད་འདི་ནང་ བདག་པོའི་ཁ་གསལ་ ཐུང་བཟོ་ཡོད་ (ཐུང་བཟོ་སྟེ་མཐོང་མི་ འགན་ཁུར་གྱི་ ཕྱིར་འདྲེན་) - དེ་ཚུ་ ནང་འདྲེན་མི་འབད།', 'ข้อมูลเจ้าของในไฟล์นี้ถูกย่อ (ไฟล์ส่งออกของบทบาทที่เห็นแบบย่อ) - จะไม่ถูกนำเข้า'],
+        'Only the sheet {s} was read - the workbook has more sheets with a Card ID column': ['ཤོག་ལེབ་ {s} རྐྱངམ་ཅིག་ ལྷག་ཡོད་ - Excel ཡིག་སྣོད་ནང་ Card ID ཀ་ཐིག་ཡོད་པའི་ ཤོག་ལེབ་གཞན་ཡང་ཡོད།', 'อ่านเฉพาะชีต {s} - ไฟล์มีชีตอื่นที่มีคอลัมน์ Card ID ด้วย'],
+        'The sheet has more than {n} rows (empty ones too) - copy the cards to a new sheet': ['ཤོག་ལེབ་ནང་ གྲལ་ཐིག་ {n} ལས་ མང་ (སྟོངམ་ཚུ་ཡང་) - ཤོག་བྱང་ཚུ་ ཤོག་ལེབ་གསརཔ་ཅིག་ནང་ འདྲ་བཤུས་རྐྱབ།', 'ชีตมีมากกว่า {n} แถว (รวมแถวว่าง) - คัดลอกบัตรไปยังชีตใหม่'],
+        'Card ID: Excel turned this cell into a date - format the Card ID column as Text and type the ID again': ['ཤོག་བྱང་ ID: Excel གིས་ ཤོག་སྒྲོམ་འདི་ ཚེས་གྲངས་སུ་ བསྒྱུར་ཡོད་ - Card ID ཀ་ཐིག་འདི་ Text སྦེ་ བཟོ་ཞིནམ་ལས་ ID ལོག་བཙུགས།', 'หมายเลขบัตร: Excel เปลี่ยนช่องนี้เป็นวันที่ - ตั้งคอลัมน์ Card ID เป็น Text แล้วพิมพ์หมายเลขใหม่'],
+        'Card ID: Excel keeps only 15 digits of a number - format the Card ID column as Text and type the ID again': ['ཤོག་བྱང་ ID: Excel གིས་ ཨང་གྲངས་ཀྱི་ ཨང་ 15 རྐྱངམ་ཅིག་ བཞགཔ་ཨིན་ - Card ID ཀ་ཐིག་འདི་ Text སྦེ་ བཟོ་ཞིནམ་ལས་ ID ལོག་བཙུགས།', 'หมายเลขบัตร: Excel เก็บตัวเลขได้แค่ 15 หลัก - ตั้งคอลัมน์ Card ID เป็น Text แล้วพิมพ์หมายเลขใหม่'],
+        'Too many columns in the file (at most {n})': ['ཡིག་སྣོད་ནང་ ཀ་ཐིག་ མང་དྲགས་ ({n} ཚུན་)', 'ไฟล์มีคอลัมน์มากเกินไป (ไม่เกิน {n})'],
+        'Card ID is required': ['ཤོག་བྱང་ ID དགོ་', 'ต้องใส่หมายเลขบัตร'], 'Card ID: at most 20 characters (OCPP idTag)': ['ཤོག་བྱང་ ID: ཡིག་འབྲུ་ 20 ཚུན་ (OCPP idTag)', 'หมายเลขบัตร: ไม่เกิน 20 ตัว (OCPP idTag)'],
+        'Card ID: letters, digits and - _ . : # / + * only': ['ཤོག་བྱང་ ID: ཡིག་འབྲུ་, ཨང་ དང་ - _ . : # / + * རྐྱངམ་ཅིག་', 'หมายเลขบัตร: ใช้ได้เฉพาะตัวอักษร ตัวเลข และ - _ . : # / + *'],
+        'Status: Accepted, Blocked, Expired or Invalid': ['གནས་ཚད་: Accepted, Blocked, Expired ཡང་ན་ Invalid', 'สถานะ: Accepted, Blocked, Expired หรือ Invalid'],
+        'Mobile number: 8 - 15 digits': ['མོ་བཱའིལ་ཨང་: ཨང་ 8 - 15', 'เบอร์มือถือ: ตัวเลข 8 - 15 หลัก'],
+        'Vehicle plate: letters, digits, spaces and - (at most 20)': ['སྣུམ་འཁོར་ཨང་བྱང་: ཡིག་འབྲུ་, ཨང་, བར་སྟོང་ དང་ - (20 ཚུན་)', 'ทะเบียนรถ: ตัวอักษร ตัวเลข ช่องว่าง และ - (ไม่เกิน 20)'],
+        'E-mail address not valid': ['གློག་འཕྲིན་ཁ་བྱང་ ཏག་ཏག་མེན་', 'ที่อยู่อีเมลไม่ถูกต้อง'],
+        'Parent ID: at most 20 letters, digits and - _ . : # / + *': ['Parent ID: ཡིག་འབྲུ་, ཨང་ དང་ - _ . : # / + * 20 ཚུན་', 'Parent ID: ตัวอักษร ตัวเลข และ - _ . : # / + * ไม่เกิน 20 ตัว'],
+        'Expiry: a date as YYYY-MM-DD (or DD/MM/YYYY), Bhutan Time': ['དུས་ཡོལ་: ཚེས་གྲངས་ YYYY-MM-DD (ཡང་ན་ DD/MM/YYYY) འབྲུག་གི་ཆུ་ཚོད་', 'วันหมดอายุ: วันที่แบบ YYYY-MM-DD (หรือ DD/MM/YYYY) เวลาภูฏาน'],
+        'Card {tag} is already registered - edit it instead': ['ཤོག་བྱང་ {tag} ཧེ་མ་ལས་ ཐོ་བཀོད་ཡོད་ - དེ་འབདཝ་ལས་ ཞུན་དག་འབད།', 'บัตร {tag} ลงทะเบียนอยู่แล้ว - ให้แก้ไขแทน'],
+        'No such card': ['ཤོག་བྱང་ འདི་བཟུམ་ མེད་', 'ไม่มีบัตรนี้'], 'No card ID in this row': ['གྲལ་ཐིག་འདི་ནང་ ཤོག་བྱང་ ID མེད་', 'แถวนี้ไม่มีหมายเลขบัตร'],
+        'Same card as row {n}': ['གྲལ་ཐིག་ {n} དང་ ཤོག་བྱང་ གཅིག་ཨིན་', 'บัตรเดียวกับแถว {n}'], 'The file is empty': ['ཡིག་སྣོད་ སྟོངམ་ཨིན་', 'ไฟล์ว่างเปล่า'],
+        'The file is larger than 5 MB - split it': ['ཡིག་སྣོད་ 5 MB ལས་ ཆེ་ - བགོ་', 'ไฟล์ใหญ่กว่า 5 MB - แบ่งไฟล์'],
+        'Old Excel file (.xls): save it as .xlsx or CSV': ['Excel ཡིག་སྣོད་རྙིངམ་ (.xls): .xlsx ཡང་ན་ CSV སྦེ་ སྲུང་', 'ไฟล์ Excel แบบเก่า (.xls): บันทึกเป็น .xlsx หรือ CSV'],
+        'Not an Excel (.xlsx) file': ['Excel (.xlsx) ཡིག་སྣོད་ མེན་', 'ไม่ใช่ไฟล์ Excel (.xlsx)'], 'The Excel file is too large when unpacked': ['Excel ཡིག་སྣོད་ ཁ་ཕྱེ་བའི་སྐབས་ ཆེ་དྲགས་', 'ไฟล์ Excel ใหญ่เกินไปเมื่อแตกไฟล์'],
+        'Excel import needs the openpyxl package - save the sheet as CSV instead': ['Excel ནང་འདྲེན་ལུ་ openpyxl ཐུམ་སྒྲིལ་དགོ་ - དེ་འབདཝ་ལས་ CSV སྦེ་ སྲུང་', 'การนำเข้า Excel ต้องใช้แพ็กเกจ openpyxl - บันทึกเป็น CSV แทน'],
+        'The Excel file could not be read': ['Excel ཡིག་སྣོད་ ལྷག་མ་ཚུགས་', 'อ่านไฟล์ Excel ไม่ได้'], 'Not a JSON file': ['JSON ཡིག་སྣོད་ མེན་', 'ไม่ใช่ไฟล์ JSON'],
+        'JSON: a list of cards expected ({"cards": [...]})': ['JSON: ཤོག་བྱང་གི་ཐོ་ཡིག་ དགོ་ ({"cards": [...]})', 'JSON: ต้องเป็นรายการบัตร ({"cards": [...]})'],
+        'The CSV file could not be read': ['CSV ཡིག་སྣོད་ ལྷག་མ་ཚུགས་', 'อ่านไฟล์ CSV ไม่ได้'],
+        'No "Card ID" column found in the first row': ['གྲལ་ཐིག་དང་པ་ནང་ "Card ID" ཀ་ཐིག་ མ་འཐོབ་', 'ไม่พบคอลัมน์ "Card ID" ในแถวแรก'],
+        'More than {n} cards in the file - split it': ['ཡིག་སྣོད་ནང་ ཤོག་བྱང་ {n} ལས་ མང་ - བགོ་', 'ไฟล์มีบัตรเกิน {n} ใบ - แบ่งไฟล์'],
+        'The file is not UTF-8: names with Dzongkha or Thai letters may be wrong - save it as "CSV UTF-8" or as an Excel file': ['ཡིག་སྣོད་ UTF-8 མེན་: རྫོང་ཁ་ ཡང་ན་ ཐཱའི་ཡིག་འབྲུ་ཅན་གྱི་ མིང་ཚུ་ ནོར་འོང་ - "CSV UTF-8" ཡང་ན་ Excel ཡིག་སྣོད་ སྦེ་ སྲུང་', 'ไฟล์ไม่ใช่ UTF-8: ชื่อที่เป็นภาษาซองคาหรือภาษาไทยอาจผิด - บันทึกเป็น "CSV UTF-8" หรือไฟล์ Excel'],
+        'Send the file as the form field "file" (multipart/form-data)': ['ཡིག་སྣོད་འདི་ form field "file" (multipart/form-data) སྦེ་ གཏང་', 'ส่งไฟล์เป็นฟิลด์ฟอร์ม "file" (multipart/form-data)'],
+        'Excel export needs the openpyxl package (pip install openpyxl) - use CSV instead': ['Excel ཕྱིར་འདྲེན་ལུ་ openpyxl ཐུམ་སྒྲིལ་དགོ་ (pip install openpyxl) - དེ་འབདཝ་ལས་ CSV ལག་ལེན་འཐབ་', 'การส่งออก Excel ต้องใช้แพ็กเกจ openpyxl (pip install openpyxl) - ใช้ CSV แทน']
     });
 })();
 ''')
