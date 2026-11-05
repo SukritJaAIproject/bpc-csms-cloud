@@ -6071,6 +6071,7 @@ HTML_TEMPLATE = '''
         <button class="tab" data-tab="alerts" onclick="showTab('alerts')"><span data-i18n="🔔 Alerts">🔔 Alerts</span><span class="tab-badge warn" id="alertsBadge"></span></button>
         <button class="tab" data-tab="maint" onclick="showTab('maint')"><span data-i18n="🛠️ Maintenance">🛠️ Maintenance</span><span class="tab-badge" id="maintBadge"></span></button>
         <button class="tab" data-tab="kpi" onclick="showTab('kpi')"><span data-i18n="📈 KPIs & reports">📈 KPIs &amp; reports</span></button>
+        <button class="tab" data-tab="usage" onclick="showTab('usage')"><span data-i18n="📜 Charging history">📜 Charging history</span></button>
         <button class="tab" data-tab="lm" onclick="showTab('lm')"><span data-i18n="⚡ Load management">⚡ Load management</span></button>
         <button class="tab" data-tab="map" onclick="showTab('map')"><span data-i18n="📍 Map">📍 Map</span></button>
         <button class="tab" data-tab="log" onclick="showTab('log')"><span data-i18n="📋 Message Log">📋 Message Log</span><span class="tab-badge" id="logBadge"></span></button>
@@ -6532,6 +6533,7 @@ HTML_TEMPLATE = '''
     <main class="view" id="view-fwdiag"></main>
     <main class="view" id="view-server"></main>
     <main class="view" id="view-booking"></main>
+    <main class="view" id="view-usage"></main>
     <main class="view" id="view-users"></main>
 
     <main class="view" id="view-db">
@@ -6753,6 +6755,7 @@ HTML_TEMPLATE = '''
                 <span class="tb-spacer"></span>
                 <label class="ov-idtag"><span data-i18n="ID tag for Remote Start">ID tag for Remote Start</span> <input type="text" id="ovIdTag" value="TEST001" maxlength="20"></label>
                 <button class="drawer-sticker" onclick="openStickers(selectedCpId)" data-i18n="🖨️ QR sticker">🖨️ QR sticker</button>
+                <button class="drawer-sticker" onclick="window.OPS && OPS.usageStation && OPS.usageStation(selectedCpId)" data-i18n="📜 Charging history">📜 Charging history</button>
                 <button class="drawer-wide" id="drawerWideBtn" onclick="toggleDrawerWide()" data-i18n="⛶ Expand">⛶ Expand</button>
             </div>
         </div>
@@ -9509,6 +9512,7 @@ HTML_TEMPLATE = '''
                     <button class="mini-btn" onclick="event.stopPropagation(); cuAction('${esc(c.id)}', 'notify')">${trh('💬 Message')}</button>
                     <button class="mini-btn" onclick="event.stopPropagation(); cuAction('${esc(c.id)}', 'reset_password')">${trh('🔑 Password')}</button>
                     <button class="mini-btn" onclick="event.stopPropagation(); cuAction('${esc(c.id)}', '${c.blocked ? 'unblock' : 'block'}')">${c.blocked ? trh('✅ Unblock') : trh('🚫 Block')}</button>
+                    <button class="mini-btn" title="${esc(tr('📜 Charging history'))}" onclick="event.stopPropagation(); window.OPS && OPS.usageCustomer && OPS.usageCustomer({cid: '${esc(c.id)}'})">📜</button>
                     <button class="mini-btn" onclick="event.stopPropagation(); cuAction('${esc(c.id)}', 'delete')">🗑️</button>
                 </td>
             </tr>` + (cuExpanded === c.id ? cuDetailsHtml(c) : '');
@@ -18598,7 +18602,7 @@ import re as _ops_re
 import csv as _ops_csv
 import io as _ops_io
 
-OPS_VERSION = '1.14.0'
+OPS_VERSION = '1.15.0'
 OPS_FEATURES: List[str] = ['users']
 OPS_DIR = str(APP_DIR / 'ops_data')
 OPS_TZ = timezone(timedelta(hours=6))           # Bhutan Time (BTT, UTC+06:00): ops views, monthly files, reports
@@ -21351,8 +21355,11 @@ def _ops_fname(res, ext):
 async def ops_api_report_csv(request):
     res, sessions = await _ops_report_data(request)
     level = request.query.get('level') or 'chargers'
-    cols, rows = {'connectors': (_OPS_CONN_COLS, res['connectors']), 'sessions': (_OPS_SESSION_COLS, sessions),
-                  'daily': (_OPS_DAILY_COLS, res['daily'])}.get(level, (_OPS_CHARGER_COLS, res['chargers']))
+    if level == 'daily_cp':                                   # [OPS] v1.15 one row per day and charger
+        cols, rows = USAGE_DAILY_CP_COLS, usage_daily_by_charger(sessions)
+    else:
+        cols, rows = {'connectors': (_OPS_CONN_COLS, res['connectors']), 'sessions': (_OPS_SESSION_COLS, sessions),
+                      'daily': (_OPS_DAILY_COLS, res['daily'])}.get(level, (_OPS_CHARGER_COLS, res['chargers']))
     buf = _ops_io.StringIO()
     w = _ops_csv.writer(buf)
     w.writerow([label for _k, label in cols])
@@ -21383,7 +21390,9 @@ async def ops_api_report_xlsx(request):
         ws.column_dimensions['A'].width = 34
         ws.column_dimensions['B'].width = 26
         for title, cols, rows in (('Chargers', _OPS_CHARGER_COLS, res['chargers']), ('Connectors', _OPS_CONN_COLS, res['connectors']),
-                                  ('Daily', _OPS_DAILY_COLS, res['daily']), ('Sessions', _OPS_SESSION_COLS, sessions)):
+                                  ('Daily', _OPS_DAILY_COLS, res['daily']),
+                                  ('Daily by charger', USAGE_DAILY_CP_COLS, usage_daily_by_charger(sessions)),   # [OPS] v1.15
+                                  ('Sessions', _OPS_SESSION_COLS, sessions)):
             sh = wb.create_sheet(title)
             sh.append([label for _k, label in cols])
             for cell in sh[1]:
@@ -35350,7 +35359,7 @@ OPS_JS_PARTS.append(r'''/* [OPS] 🎴 RFID cards (v1.14): who holds each card, s
             td('Card', '<b class="ops-rf-tag">' + esc(c.id_tag) + '</b>' + (c.parent_id ? '<br><span class="muted">' + OPS.t('Parent ID') + ': ' + esc(c.parent_id) + '</span>' : '')) +
             td('Status', statusHtml(c)) + td('Owner', ownerHtml(c)) + td('Mobile / e-mail', contact) +
             td('Vehicle', c.vehicle_plate ? '<span class="ops-rf-nw">' + esc(c.vehicle_plate) + '</span>' : '<span class="muted">—</span>') +
-            td('Expiry', c.expires_t ? OPS.fmt(c.expires_t) : '<span class="muted">—</span>') + td('Last used', last) +
+            td('Expiry', c.expires_t ? OPS.fmt(c.expires_t) : '<span class="muted">—</span>') + td('Last used', last + '<br><button class="tb-btn ops-mini" data-act="usage">' + OPS.t('📜 History') + '</button>') +
             td('Note', c.description ? esc(c.description) : '<span class="muted">—</span>') +
             (can.edit ? td('', '<div class="ops-btns"><button class="tb-btn ops-mini" data-act="edit">' + OPS.t('✏️ Edit') + '</button>' +
                 '<button class="tb-btn ops-mini" data-act="del">' + OPS.t('🗑️ Delete') + '</button></div>') : '') + '</tr>';
@@ -35382,6 +35391,7 @@ OPS_JS_PARTS.append(r'''/* [OPS] 🎴 RFID cards (v1.14): who holds each card, s
         if (!card) return;
         if (b.dataset.act === 'edit') editDialog(card);
         else if (b.dataset.act === 'del') del(card);
+        else if (b.dataset.act === 'usage' && OPS.usageCustomer) OPS.usageCustomer({card: card.id_tag});   // [OPS] v1.15
     }
 
     async function del(card) {
@@ -35713,6 +35723,1906 @@ OPS_JS_PARTS.append(r'''/* [OPS] 🎴 RFID cards (v1.14): who holds each card, s
         'The file is not UTF-8: names with Dzongkha or Thai letters may be wrong - save it as "CSV UTF-8" or as an Excel file': ['ཡིག་སྣོད་ UTF-8 མེན་: རྫོང་ཁ་ ཡང་ན་ ཐཱའི་ཡིག་འབྲུ་ཅན་གྱི་ མིང་ཚུ་ ནོར་འོང་ - "CSV UTF-8" ཡང་ན་ Excel ཡིག་སྣོད་ སྦེ་ སྲུང་', 'ไฟล์ไม่ใช่ UTF-8: ชื่อที่เป็นภาษาซองคาหรือภาษาไทยอาจผิด - บันทึกเป็น "CSV UTF-8" หรือไฟล์ Excel'],
         'Send the file as the form field "file" (multipart/form-data)': ['ཡིག་སྣོད་འདི་ form field "file" (multipart/form-data) སྦེ་ གཏང་', 'ส่งไฟล์เป็นฟิลด์ฟอร์ม "file" (multipart/form-data)'],
         'Excel export needs the openpyxl package (pip install openpyxl) - use CSV instead': ['Excel ཕྱིར་འདྲེན་ལུ་ openpyxl ཐུམ་སྒྲིལ་དགོ་ (pip install openpyxl) - དེ་འབདཝ་ལས་ CSV ལག་ལེན་འཐབ་', 'การส่งออก Excel ต้องใช้แพ็กเกจ openpyxl (pip install openpyxl) - ใช้ CSV แทน']
+    });
+})();
+''')
+
+
+# ---- [OPS] v1.15 Charging history per customer and per station (ops/patch_usage.py) ---------------------------------
+# Every finished session now keeps who charged (the app account, the payer of a QR / cash payment, the free-charging driver,
+# the RFID card): the payment ledger keeps its newest 3000 records and free sessions move out of memory, the session
+# records stay. The 📜 Charging history tab shows
+# - customers: for roles that see customers (view_customers) one row per person - the app account together with the RFID
+#   cards whose owner has its mobile number, free charging and QR / cash payments with that number; for the other roles
+#   the RFID card holders one by one (as the RFID Cards tab shows them) and the app / QR / free-charging customers added up
+#   in one row each - a payment or a free session is customer data, and a card a technician registers with any mobile
+#   number must not open that number's history; totals, months, stations, cards and every session;
+# - stations: sessions, kWh and kWh per session per station and day (the day a session ended, Bhutan Time - as in the KPI
+#   report) and every session of a day.
+# Card owners in full for config / view_customers (v1.14), shortened for the others; amounts only for view_payments; a
+# search only finds what the role can see. CSV / Excel exports; the KPI report gets a "Daily by charger" sheet; the KPI
+# tab's session list is open to every role like the Excel report (an older rule meant for the console's sign-in sessions
+# made it admin-only), without who charged.
+# Load: long periods are read as a stream, the work (also building, searching and sorting the rows) runs in one worker
+# thread of its own that lets the event loop in regularly; at most 2 jobs per user and 8 in all (429 beyond); lists and
+# station views are kept 30 s (an ended period 10 min) within about 30 MB; at most 20 000 customers per answer.
+import hmac as _usage_hmac
+import hashlib as _usage_hashlib
+import collections as _usage_coll
+import concurrent.futures as _usage_cf
+import contextvars as _usage_cv
+import time as _usage_time
+
+OPS_FEATURES.append('usage')
+OPS_TAB_PERMS['usage'] = 'view'
+ops_perm_rule('GET', '/api/ops/sessions', 'view')
+
+USAGE_LIST_MAX = 1000            # customer rows sent to the console (sorted, searched first; the export has them all)
+USAGE_DETAIL_MAX = 3000          # sessions listed in one customer / station view (the newest; the export has them all)
+USAGE_EXPORT_MAX = 100000        # rows in one export
+USAGE_MATRIX_DAYS = 92           # days in the station day-by-day table (the export has every day)
+USAGE_DAILY_MAX = 3700           # daily rows of one station
+USAGE_SCAN_MAX = 5000000         # sessions read for one answer
+USAGE_GROUPS_MAX = 20000         # customers in one answer (more: one row "other customers")
+USAGE_SESSIONS_LIMIT = 5000      # rows of the plain session list (GET /api/ops/sessions)
+USAGE_TAGS_MAX = 1000            # distinct cards / payers counted per station (overview) and per day (more: "1000+")
+USAGE_TAGS_TOTAL = 5000          # ... for one station's whole period
+USAGE_PRIVATE = ('cid', 'ph', 'pl', 'nm', 'amt', 'cur')    # who charged: never in the plain session list
+USAGE_CHANNELS = ('app', 'qr', 'card', 'free', 'auto', 'other', 'none')
+USAGE_COUNTED = ('app', 'person', 'card', 'vehicle')      # kinds counted as customers
+_USAGE_SALT = secrets.token_bytes(16)
+_USAGE_CACHE = _usage_coll.OrderedDict()   # (kind, key) -> (made, result, weight, ttl), least recently used first
+_USAGE_CACHE_W = {'w': 0}
+USAGE_CACHE_WEIGHT = 30000       # what the cache keeps, about 1 KB each: a customer, a listed session, ten station days
+USAGE_CACHE_ENTRIES = 32
+_USAGE_INFLIGHT = {}
+_USAGE_FIRST = {'t': None, 'at': 0.0}
+# one worker thread of its own (the KPI report, backups, imports keep theirs); a job waits in a short queue, at most 2
+# per user - beyond it the console gets 429 "busy" instead of piling up work
+_USAGE_POOL = _usage_cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix='usage')
+_USAGE_BUSY = {'n': 0}
+_USAGE_USERS = {}
+USAGE_QUEUE_MAX = 8
+USAGE_USER_MAX = 2
+USAGE_BUSY_MSG = 'The charging history is busy - try again in a moment'
+_USAGE_WHO = _usage_cv.ContextVar('usage_who', default='')
+
+
+class _UsageBusy(Exception):
+    pass
+
+
+async def _usage_run(fn, *args):
+    who = _USAGE_WHO.get()
+    if _USAGE_BUSY['n'] >= USAGE_QUEUE_MAX or (who and _USAGE_USERS.get(who, 0) >= USAGE_USER_MAX):
+        raise _UsageBusy()
+    _USAGE_BUSY['n'] += 1
+    if who:
+        _USAGE_USERS[who] = _USAGE_USERS.get(who, 0) + 1
+    try:
+        return await asyncio.get_running_loop().run_in_executor(_USAGE_POOL, lambda: fn(*args))
+    finally:
+        _USAGE_BUSY['n'] -= 1
+        if who:
+            left = _USAGE_USERS.get(who, 1) - 1
+            if left > 0:
+                _USAGE_USERS[who] = left
+            else:
+                _USAGE_USERS.pop(who, None)
+
+
+def _usage_guard(handler):
+    async def run(request):
+        tok = _USAGE_WHO.set(str((ops_request_user(request) or {}).get('username') or '?')[:64])
+        try:
+            return await handler(request)
+        except _UsageBusy:
+            return ops_err(USAGE_BUSY_MSG, 429)
+        finally:
+            _USAGE_WHO.reset(tok)
+    run.__name__ = handler.__name__
+    return run
+
+
+_USAGE_TICK = {'n': 0}
+
+
+def _usage_yield():
+    """A long scan lets the event loop in now and then (the OCPP messages of every charger run there)."""
+    _USAGE_TICK['n'] += 1
+    if _USAGE_TICK['n'] % 2000 == 0:
+        _usage_time.sleep(0)
+
+
+# ---- who charged, kept in the session record ---------------------------------------------------------------------------
+def _usage_phone(v) -> str:
+    try:
+        p = _app_norm_phone(v)
+    except Exception:
+        p = ''.join(ch for ch in str(v or '') if ch.isdigit())
+    return p[:15] if len(p) >= 6 else ''
+
+
+def _usage_plate(v) -> str:
+    """A vehicle plate as shown (capitals, single spaces)."""
+    return ' '.join(str(v or '').upper().split())[:20]
+
+
+def _usage_plate_key(v) -> str:
+    return ''.join(ch for ch in str(v or '').upper() if ch.isalnum())[:20]
+
+
+def _usage_money(v):
+    try:
+        return round(float(v), 2)
+    except (TypeError, ValueError):
+        return None
+
+
+def _usage_prefix(attr: str, default: str) -> str:
+    try:
+        v = getattr(app_state, attr, None)
+    except Exception:
+        v = None
+    if not v and attr == 'payment_prefix':
+        v = globals().get('PAYMENT_IDTAG_PREFIX')
+    return str(v or default).strip().upper() or default
+
+
+def _usage_card_key(tag: str, cards) -> str:
+    key = str(tag or '').strip().upper()
+    if not key:
+        return ''
+    if key in cards:
+        return key
+    try:
+        rev = reverse_hex_bytes(key)
+    except Exception:
+        rev = key
+    return rev if rev != key and rev in cards else ''
+
+
+def usage_snapshot(rec: dict) -> dict:
+    """Who charged, for the session record (at StopTransaction: the payment is settled, a free session still open)."""
+    tag = str(rec.get('tag') or '').strip()
+    up = tag.upper()
+    fs = None
+    try:
+        fs = _ops_free_find(rec.get('cp'), txn=rec.get('tx'))
+    except Exception:
+        fs = None
+    if isinstance(fs, dict):
+        out = {'src': 'free'}
+        for k, v in (('cid', str(fs.get('customer') or '')[:40]), ('ph', _usage_phone(fs.get('phone'))),
+                     ('pl', _usage_plate(fs.get('plate'))), ('card', str(fs.get('card') or '').strip().upper()[:40]),
+                     ('nm', str(fs.get('name') or '').strip()[:60])):
+            if v:
+                out[k] = v
+        return out
+    if up.startswith(_usage_prefix('payment_prefix', 'PAY-')):
+        out = {'src': 'pay'}
+        r = pay_ledger.records.get(tag) or pay_ledger.records.get(up)
+        if isinstance(r, dict):
+            cu = r.get('customer') if isinstance(r.get('customer'), dict) else {}
+            for k, v in (('cid', str(r.get('customer_id') or '')[:40]), ('ph', _usage_phone(cu.get('phone'))),
+                         ('pl', _usage_plate(cu.get('plate')))):
+                if v:
+                    out[k] = v
+            amt = _usage_money(r.get('used_amount'))
+            if amt is not None:
+                out['amt'] = amt
+                out['cur'] = str(r.get('symbol') or r.get('currency') or '')[:8]
+        return out
+    if up.startswith(_usage_prefix('autocharge_prefix', 'AUTO-')):
+        return {'src': 'auto'}
+    card = _usage_card_key(up, app_state.rfid_cards)
+    if card:
+        return {'src': 'card', 'card': card}
+    return {'src': 'other' if up else 'none'}
+
+
+_usage_sessions_add_orig = OPS_SESSIONS_LOG.add
+
+
+def _usage_sessions_add(ev: dict) -> dict:
+    try:
+        if isinstance(ev, dict) and 'src' not in ev:
+            ev = dict(ev, **usage_snapshot(ev))
+    except Exception as e:
+        logger.error(f"usage: who charged not kept for a session: {e}")
+    return _usage_sessions_add_orig(ev)
+
+
+OPS_SESSIONS_LOG.add = _usage_sessions_add
+
+
+# ---- reading the sessions of a period without holding a long period in memory -------------------------------------------
+def _usage_stored(t0: float, t1: float, cp: str = None):
+    """Stored sessions with t0 <= t < t1, oldest first: the database, or the monthly files."""
+    log = OPS_SESSIONS_LOG
+    db = _db()
+    if db is not None:
+        n = 0
+        try:
+            flt = {'t': {'$gte': t0, '$lt': t1}}
+            if cp:
+                flt['cp'] = cp
+            for e in db.db[log.coll].find(flt, {'_id': 0}).sort('t', 1):
+                n += 1
+                _usage_yield()
+                yield e
+            return
+        except Exception as e:
+            logger.error(f"usage: reading {log.coll} from the database failed ({e})" + (' - using the files' if not n else ''))
+            if n:
+                return
+    for ym in log._months(t0, t1):
+        p = log._path(ym)
+        if not os.path.exists(p):
+            continue
+        try:
+            with open(p, 'r', encoding='utf-8') as f:
+                for line in f:
+                    try:
+                        ev = json.loads(line)
+                    except ValueError:
+                        continue
+                    if not isinstance(ev, dict):
+                        continue
+                    try:
+                        t = float(ev.get('t') or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    _usage_yield()
+                    if t0 <= t < t1 and (not cp or ev.get('cp') == cp):
+                        yield ev
+        except OSError as e:
+            logger.error(f"usage: reading {p} failed: {e}")
+
+
+def _usage_iter(t0: float, t1: float, cp: str = None, mem: list = None):
+    """Sessions of the period, oldest first: what memory holds (everything from its oldest record on) from memory, the
+    part before it from the database / files. mem = a copy of OPS_SESSIONS_LOG.recent taken on the event loop."""
+    split = float('inf')
+    if mem:
+        try:
+            split = float(mem[0].get('t') or 0)
+        except (TypeError, ValueError):
+            split = float('inf')
+    if t0 < min(t1, split):
+        yield from _usage_stored(t0, min(t1, split), cp)
+    if mem and t1 > split:
+        lo = max(t0, split)
+        for e in mem:
+            try:
+                t = float(e.get('t') or 0)
+            except (TypeError, ValueError):
+                continue
+            _usage_yield()
+            if lo <= t < t1 and (not cp or e.get('cp') == cp):
+                yield e
+
+
+def _usage_mem() -> list:
+    log = OPS_SESSIONS_LOG
+    if not log.loaded:
+        return []
+    with log._lock:
+        return list(log.recent)
+
+
+def _usage_first_t(mem: list) -> float:
+    """The time of the first stored session (all time = from there on); blocking: call in a thread."""
+    now = ops_now()
+    if _USAGE_FIRST['t'] is not None and now - _USAGE_FIRST['at'] < 600:
+        return _USAGE_FIRST['t']
+    best = None
+    db = _db()
+    if db is not None:
+        try:
+            doc = db.db[OPS_SESSIONS_LOG.coll].find_one({}, {'_id': 0, 't': 1}, sort=[('t', 1)])
+            if doc and doc.get('t'):
+                best = float(doc['t'])
+        except Exception as e:
+            logger.error(f"usage: first session in the database: {e}")
+    if best is None:
+        try:
+            pre = OPS_SESSIONS_LOG.name + '_'
+            months = sorted(n[len(pre):len(pre) + 7] for n in os.listdir(OPS_DIR)
+                            if n.startswith(pre) and n.endswith('.jsonl') and _ops_re.fullmatch(r'\d{4}-\d{2}', n[len(pre):len(pre) + 7]))
+            if months:
+                best = datetime.strptime(months[0] + '-01', '%Y-%m-%d').replace(tzinfo=OPS_TZ).timestamp()
+        except (OSError, ValueError):
+            pass
+    if mem:
+        try:
+            m0 = float(mem[0].get('t') or 0)
+            best = m0 if best is None else min(best, m0)
+        except (TypeError, ValueError):
+            pass
+    if best is None:
+        best = now - 86400
+    best = max(best, now - 240 * 31 * 86400)           # the monthly reader looks at most 240 months back
+    _USAGE_FIRST.update(t=best, at=now)
+    return best
+
+
+def _usage_period(q, default: str = 'all', mem: list = None) -> dict:
+    """{'t0', 't1', 'label', 'all'}: ?all=1 | ?days=N | ?month=YYYY-MM | ?from=&to= (Bhutan Time); no period = default."""
+    has = any(q.get(k) for k in ('days', 'month', 'from', 'to'))
+    if q.get('all') or (default == 'all' and not has):
+        return {'t0': None, 't1': ops_now() + 1, 'label': 'all time', 'all': True}
+    if not has and default.startswith('days:'):
+        q = {'days': default[5:]}
+    t0, t1, label = ops_period(q)
+    if t1 - t0 > 3700 * 86400:
+        t0 = t1 - 3700 * 86400
+    return {'t0': t0, 't1': t1, 'label': label, 'all': False}
+
+
+# ---- live stores -> plain data (copied on the event loop; the work runs in a thread) ---------------------------------------
+def _usage_ctx() -> dict:
+    cards = {}
+    for k, c in list(app_state.rfid_cards.items()):
+        if isinstance(c, dict):
+            cards[str(k)] = (_usage_phone(c.get('owner_phone')), str(c.get('owner_name') or '').strip()[:60],
+                             str(c.get('organisation') or '').strip()[:80], _usage_plate(c.get('vehicle_plate')))
+    rev = {}
+    for k in cards:
+        try:
+            r = reverse_hex_bytes(k)
+        except Exception:
+            r = k
+        if r != k:
+            rev.setdefault(r, k)
+    apps, by_phone = {}, {}
+    for c in list(customers.customers.values()):
+        if isinstance(c, dict) and c.get('id'):
+            ph = _usage_phone(c.get('phone'))
+            apps[str(c['id'])] = (ph, str(c.get('name') or '').strip()[:60], _usage_plate(c.get('plate')))
+            if ph:
+                by_phone.setdefault(ph, str(c['id']))
+    ledger = {}
+    for ref, r in list(pay_ledger.records.items()):
+        if isinstance(r, dict) and r.get('kind') != 'topup':
+            cu = r.get('customer') if isinstance(r.get('customer'), dict) else {}
+            ledger[str(ref).upper()] = (str(r.get('customer_id') or ''), _usage_phone(cu.get('phone')), _usage_plate(cu.get('plate')),
+                                        _usage_money(r.get('used_amount')), str(r.get('symbol') or r.get('currency') or '')[:8])
+    names = {}
+    try:
+        for cp, info in list(station_info.data.items()):
+            if isinstance(info, dict) and info.get('name'):
+                names[str(cp)] = str(info['name'])[:80]
+    except Exception:
+        pass
+    try:
+        sym = str(pay_settings.data.get('currency_symbol') or 'Nu.')[:8]
+    except Exception:
+        sym = 'Nu.'
+    try:
+        known = list(ops_known_chargers())
+    except Exception:
+        known = []
+    return {'cards': cards, 'rev': rev, 'apps': apps, 'by_phone': by_phone, 'ledger': ledger, 'names': names, 'sym': sym,
+            'known': known, 'pay': _usage_prefix('payment_prefix', 'PAY-'), 'auto': _usage_prefix('autocharge_prefix', 'AUTO-'),
+            'mem': _usage_mem(), 'free_mem': _usage_free_mem()}
+
+
+def _usage_free_mem() -> list:
+    try:
+        log = OPS_FREE_LOG
+        if not log.loaded:
+            return []
+        with log._lock:
+            return list(log.recent)
+    except Exception:
+        return []
+
+
+class _UsageFreeIndex:
+    """Free sessions by charger + transaction, for session records from before v1.15 (built the first time it is needed)."""
+
+    def __init__(self, t0: float, t1: float, mem: list):
+        self.t0, self.t1, self.mem, self.idx = t0, t1, mem, None
+
+    def get(self, cp, tx):
+        if self.idx is None:
+            self.idx = {}
+            try:
+                log = OPS_FREE_LOG
+                split = float(self.mem[0].get('t') or 0) if self.mem else float('inf')
+                evs = list(log.read(self.t0 - 86400, min(self.t1 + 86400, split))) if self.t0 - 86400 < split else []
+                evs += [e for e in self.mem if self.t0 - 86400 <= float(e.get('t') or 0) < self.t1 + 86400]
+                for e in evs:
+                    if isinstance(e, dict) and e.get('txn') is not None and e.get('cp'):
+                        self.idx[(str(e['cp']), str(e['txn']))] = e
+            except Exception as e:
+                logger.error(f"usage: free sessions for older records: {e}")
+        return self.idx.get((str(cp or ''), str(tx)))
+
+
+def _usage_facts(s: dict, ctx: dict, free_idx) -> dict:
+    """Who charged one session: the kept record (v1.15), else what the payments / free sessions / cards still tell."""
+    up = str(s.get('tag') or '').strip().upper()
+    src = s.get('src')
+    if src:
+        return {'src': str(src), 'cid': str(s.get('cid') or ''), 'ph': str(s.get('ph') or ''), 'pl': str(s.get('pl') or ''),
+                'card': str(s.get('card') or ''), 'nm': str(s.get('nm') or ''), 'amt': _usage_money(s.get('amt')) if 'amt' in s else None,
+                'cur': str(s.get('cur') or ''), 'tag': up}
+    f = {'src': 'other' if up else 'none', 'cid': '', 'ph': '', 'pl': '', 'card': '', 'nm': '', 'amt': None, 'cur': '', 'tag': up}
+    if up.startswith(ctx['pay']):
+        f['src'] = 'pay'
+        r = ctx['ledger'].get(up)
+        if r:
+            f['cid'], f['ph'], f['pl'], f['amt'], f['cur'] = r
+        return f
+    fe = free_idx.get(s.get('cp'), s.get('tx')) if free_idx is not None else None
+    if fe is not None:
+        f.update(src='free', cid=str(fe.get('customer') or ''), ph=_usage_phone(fe.get('phone')), pl=_usage_plate(fe.get('plate')),
+                 card=str(fe.get('card') or '').strip().upper(), nm=str(fe.get('name') or '').strip()[:60])
+        return f
+    if up.startswith(ctx['auto']):
+        f['src'] = 'auto'
+        return f
+    card = up if up in ctx['cards'] else ctx['rev'].get(up, '')
+    if card:
+        f.update(src='card', card=card)
+    return f
+
+
+def _usage_channel(f: dict) -> str:
+    if f['src'] == 'pay':
+        return 'app' if f['cid'] else 'qr'
+    return f['src'] if f['src'] in USAGE_CHANNELS else 'other'
+
+
+def _usage_key(f: dict, ctx: dict, merge: bool) -> tuple:
+    """(kind, id) of the customer a session belongs to.
+    merge (roles that see customers): the app account takes the cards / free sessions / QR payments of its mobile number;
+    a mobile number, else the card, else the plate; payments / free sessions without contact details are walk-in rows.
+    Not merged (the other roles): only an RFID card says who it is (its owner's mobile, else the card); app, QR / cash,
+    free and autocharge sessions are added up in one row each - their details are customer data, and a card registered
+    with any mobile number must never open that number's payments."""
+    card = f['card']
+    ci = ctx['cards'].get(card) if card else None
+    if not merge:
+        if card:
+            return ('person', ci[0]) if ci and ci[0] else ('card', card)
+        ch = _usage_channel(f)
+        if ch == 'other' and f['tag']:
+            return ('tag', f['tag'][:40])
+        return ('walkin', 'r_' + ch)
+    if f['cid']:
+        return ('app', f['cid'])
+    ph = (ci[0] if ci and ci[0] else '') or f['ph']
+    if ph:
+        cid = ctx['by_phone'].get(ph)
+        return ('app', cid) if cid else ('person', ph)
+    if card:
+        return ('card', card)
+    pl = _usage_plate_key(f['pl'] or (ci[3] if ci else ''))
+    if pl:
+        return ('vehicle', pl)
+    if f['src'] in ('pay', 'free'):
+        return ('walkin', f['src'])
+    if f['tag']:
+        return ('tag', f['tag'][:40])
+    return ('walkin', 'none')
+
+
+def _usage_okey(key: tuple) -> str:
+    """The id the console uses for a customer: never the mobile number or plate itself."""
+    return _usage_hmac.new(_USAGE_SALT, ('%s:%s' % key).encode('utf-8', 'replace'), _usage_hashlib.sha256).hexdigest()[:20]
+
+
+def _usage_day(t: float) -> int:
+    return int((float(t) + 21600) // 86400)                 # Bhutan day number (UTC+06:00)
+
+
+_USAGE_DAY_TXT = {}
+
+
+def _usage_day_txt(dn: int) -> str:
+    s = _USAGE_DAY_TXT.get(dn)
+    if s is None:
+        s = datetime.fromtimestamp(dn * 86400 - 21600, OPS_TZ).strftime('%Y-%m-%d')
+        if len(_USAGE_DAY_TXT) < 20000:
+            _USAGE_DAY_TXT[dn] = s
+    return s
+
+
+def _usage_num(s: dict, k: str) -> float:
+    try:
+        v = float(s.get(k) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return v if v == v and abs(v) < 1e12 else 0.0
+
+
+# ---- customers -------------------------------------------------------------------------------------------------------------
+def _usage_new_group(key: tuple) -> dict:
+    """The sets (cards, names, plates, organisations) are made when first needed: a long list stays small."""
+    return {'kind': key[0], 'raw': key[1], 'n': 0, 'kwh': 0.0, 'dur': 0.0, 'amt': 0.0, 'has_amt': False, 'cur': '',
+            'first': None, 'last': None, 'last_cp': '', 'cps': set(), 'ch': {}, 'from_card': False, 'other': False}
+
+
+def _usage_add(g: dict, s: dict, f: dict, ctx: dict, restricted: bool = False):
+    kwh, dur = _usage_num(s, 'kwh'), _usage_num(s, 'dur')
+    t = _usage_num(s, 'stop') or _usage_num(s, 't')
+    g['n'] += 1
+    g['kwh'] += kwh
+    g['dur'] += dur
+    if f['amt'] is not None:
+        g['amt'] += f['amt']
+        g['has_amt'] = True
+        g['cur'] = g['cur'] or f['cur']
+    if g['first'] is None or t < g['first']:
+        g['first'] = t
+    if g['last'] is None or t >= g['last']:
+        g['last'], g['last_cp'] = t, str(s.get('cp') or '')
+    if len(g['cps']) < 2000:
+        g['cps'].add(str(s.get('cp') or ''))
+    ch = _usage_channel(f)
+    g['ch'][ch] = g['ch'].get(ch, 0) + 1
+    _usage_note(g, f, ctx, restricted)
+
+
+def _usage_put(g: dict, name: str, v, cap: int):
+    if v:
+        st = g.get(name)
+        if st is None:
+            st = g[name] = set()
+        if len(st) < cap:
+            st.add(v)
+
+
+def _usage_note(g: dict, f: dict, ctx: dict, restricted: bool = False):
+    """What a session tells about who the customer is: the card owner; for roles that see customers also the payer's /
+    free driver's name and plate."""
+    if f['card']:
+        _usage_put(g, 'cards', f['card'], 1000)
+        ci = ctx['cards'].get(f['card'])
+        if ci:
+            g['from_card'] = True
+            _usage_put(g, 'names', ci[1], 50)
+            _usage_put(g, 'orgs', ci[2], 20)
+            _usage_put(g, 'plates', ci[3], 50)
+    if restricted:
+        return
+    if f['src'] != 'card':
+        g['other'] = True                                   # contact details from a payment / free session too
+    _usage_put(g, 'names', f['nm'], 50)
+    _usage_put(g, 'plates', f['pl'], 50)
+
+
+def _usage_keyer(ctx: dict, merge: bool):
+    """session facts -> customer key; beyond USAGE_GROUPS_MAX customers the rest is "other customers" (the same way in the
+    list, the detail and the exports: the order of the sessions decides)."""
+    seen = set()
+    over = ('walkin', 'overflow')
+
+    def key_of(f: dict) -> tuple:
+        k = _usage_key(f, ctx, merge)
+        if k in seen:
+            return k
+        if len(seen) >= USAGE_GROUPS_MAX:
+            return over
+        seen.add(k)
+        return k
+    return key_of
+
+
+def _usage_customers_compute(t0: float, t1: float, ctx: dict, merge: bool) -> dict:
+    groups, tot = {}, {'n': 0, 'kwh': 0.0, 'dur': 0.0, 'known': 0}
+    free_idx = _UsageFreeIndex(t0, t1, ctx['free_mem'])
+    key_of = _usage_keyer(ctx, merge)
+    scanned, partial = 0, False
+    for s in _usage_iter(t0, t1, mem=ctx['mem']):
+        scanned += 1
+        if scanned > USAGE_SCAN_MAX:
+            partial = True
+            break
+        f = _usage_facts(s, ctx, free_idx)
+        key = key_of(f)
+        g = groups.get(key)
+        if g is None:
+            g = groups[key] = _usage_new_group(key)
+        _usage_add(g, s, f, ctx, not merge)
+        tot['n'] += 1
+        tot['kwh'] += _usage_num(s, 'kwh')
+        tot['dur'] += _usage_num(s, 'dur')
+        if key[0] in USAGE_COUNTED:
+            tot['known'] += 1
+    by_okey = {}
+    for k, g in groups.items():
+        _usage_yield()
+        g['okey'] = _usage_okey(k)
+        by_okey[g['okey']] = k
+    return {'groups': groups, 'by_okey': by_okey, 'tot': tot, 'scanned': scanned, 'partial': partial, 'merge': merge,
+            'at': ops_now(), 'overflow': ('walkin', 'overflow') in groups}
+
+
+# ---- who may see what -------------------------------------------------------------------------------------------------------
+def _usage_rights(request) -> dict:
+    p = ops_role_perms((ops_request_user(request) or {}).get('role') or 'viewer')
+    return {'cust': 'view_customers' in p, 'owner': 'config' in p or 'view_customers' in p, 'pay': 'view_payments' in p}
+
+
+def _usage_rkey(rights: dict) -> tuple:
+    return (rights['cust'], rights['owner'], rights['pay'])
+
+
+def _usage_short(name: str) -> str:
+    parts = str(name or '').split()
+    return (parts[0] + (' ' + parts[-1][:1] + '.' if len(parts) > 1 else '')) if parts else ''
+
+
+def _usage_mask(v, keep: int) -> str:
+    s = str(v or '')
+    return ('•••' + s[-keep:]) if len(s) > keep else ('•••' if s else '')
+
+
+def _usage_who(key: tuple, g: dict, ctx: dict, rights: dict) -> dict:
+    """How a customer is shown to this role."""
+    kind, raw = key
+    names, plates, orgs = set(g.get('names') or ()), set(g.get('plates') or ()), set(g.get('orgs') or ())
+    phone, deleted = '', False
+    if kind == 'app':
+        a = ctx['apps'].get(raw)
+        if a:
+            phone = a[0]
+            names = {a[1]} if a[1] else names
+            if a[2]:
+                plates.add(a[2])
+        else:
+            deleted = True
+        full = rights['cust']
+    elif kind in ('person', 'card'):
+        phone = raw if kind == 'person' else ''
+        # card owners: in full also for config (v1.14); a payer's / free driver's details are customer data
+        full = rights['owner'] if (g.get('from_card') and not g.get('other')) else rights['cust']
+    else:
+        full = rights['cust']
+    nl = sorted(n for n in names if n)
+    more = ' +%d' % (len(nl) - 2) if len(nl) > 2 else ''
+    plates = sorted(p for p in plates if p)
+    if full:
+        name = ' / '.join(nl[:2]) + more
+    else:
+        name = ' / '.join(_usage_short(n) for n in nl[:2]) + more
+        phone = _usage_mask(phone, 3)
+        plates = sorted({_usage_mask(p, 2) for p in plates})
+    out = {'key': g.get('okey') or _usage_okey(key), 'kind': kind, 'name': name, 'phone': phone, 'plates': plates[:5],
+           'orgs': sorted(orgs)[:3], 'masked': not full}
+    if kind == 'card':
+        out['card'] = raw
+    elif kind == 'tag':
+        out['tag'] = raw
+    elif kind == 'walkin':
+        out['walkin'] = raw
+    if deleted:
+        out['deleted'] = True
+    return out
+
+
+def _usage_row(key: tuple, g: dict, ctx: dict, rights: dict) -> dict:
+    r = _usage_who(key, g, ctx, rights)
+    n = g['n']
+    cards = g.get('cards') or ()
+    r.update(sessions=n, kwh=round(g['kwh'], 3), avg=round(g['kwh'] / n, 2) if n else None, hours=round(g['dur'] / 3600.0, 2),
+             stations=len(g['cps'] - {''}), first=g['first'], last=g['last'], last_cp=g['last_cp'],
+             last_name=ctx['names'].get(g['last_cp'], ''), channels=dict(g['ch']), cards=sorted(cards)[:10], n_cards=len(cards))
+    if rights['pay'] and g['has_amt']:
+        r['amt'], r['cur'] = round(g['amt'], 2), g['cur'] or ctx['sym']
+    return r
+
+
+def _usage_match(row: dict, q: str) -> bool:
+    """A search finds what the role sees: a shortened mobile number / plate is not searched at all (its last digits would
+    still tell people apart)."""
+    if not q:
+        return True
+    parts = [row.get('name') or '', ' '.join(row.get('orgs') or []), ' '.join(row.get('cards') or []), row.get('card') or '',
+             row.get('tag') or '']
+    if not row.get('masked'):
+        phone = row.get('phone') or ''
+        parts += [phone, ' '.join(row.get('plates') or [])]
+        digits = ''.join(ch for ch in q if ch.isdigit())
+        if len(digits) >= 4 and digits in ''.join(ch for ch in phone if ch.isdigit()):
+            return True
+    hay = ' '.join(parts).lower()
+    return all(w in hay for w in q.lower().split())
+
+
+_USAGE_GSORTS = {'kwh': lambda g: (g['kwh'], g['n']), 'sessions': lambda g: (g['n'], g['kwh']), 'last': lambda g: g['last'] or 0,
+                 'hours': lambda g: g['dur'], 'amt': lambda g: g['amt'] if g['has_amt'] else -1.0}
+
+
+def _usage_render_customers(res: dict, ctx: dict, rights: dict, text: str, srt: str, limit: int) -> dict:
+    """Rows for the console / an export (worker thread): search, sort, then rows for the first `limit` only."""
+    groups = res['groups']
+    if srt == 'amt' and not rights['pay']:
+        srt = 'kwh'
+    if text or srt == 'name':
+        rows = []
+        for k, g in groups.items():
+            _usage_yield()
+            r = _usage_row(k, g, ctx, rights)
+            if _usage_match(r, text):
+                rows.append(r)
+        if srt == 'name':
+            rows.sort(key=lambda r: (r.get('name') or r.get('card') or r.get('tag') or r.get('walkin') or '').lower())
+        else:
+            keyf = {'kwh': lambda r: (r['kwh'], r['sessions']), 'sessions': lambda r: (r['sessions'], r['kwh']),
+                    'last': lambda r: r['last'] or 0, 'hours': lambda r: r['hours'],
+                    'amt': lambda r: r.get('amt', -1.0)}.get(srt, lambda r: (r['kwh'], r['sessions']))
+            rows.sort(key=keyf, reverse=True)
+        total = len(rows)
+        rows = rows[:limit]
+    else:
+        keyf = _USAGE_GSORTS.get(srt, _USAGE_GSORTS['kwh'])
+        items = sorted(groups.items(), key=lambda kv: keyf(kv[1]), reverse=True)
+        total = len(items)
+        rows = [_usage_row(k, g, ctx, rights) for k, g in items[:limit]]
+    n_people = sum(1 for k in groups if k[0] in USAGE_COUNTED)
+    return {'rows': rows, 'total_rows': total, 'n_people': n_people}
+
+
+def _usage_weight(res) -> int:
+    """About 1 KB each: a customer, a listed row / session, ten station days."""
+    if not isinstance(res, dict):
+        return 1
+    if 'groups' in res:
+        return 1 + len(res['groups'])
+    n = 1 + len(res.get('rows') or ()) + len(res.get('sessions') or ()) + len(res.get('days') or ()) // 10
+    if isinstance(res.get('st'), dict):
+        n += sum(len(a['days']) for a in res['st'].values()) // 10
+    return n
+
+
+def _usage_cache_drop(ck):
+    ent = _USAGE_CACHE.pop(ck, None)
+    if ent is not None:
+        _USAGE_CACHE_W['w'] -= ent[2]
+
+
+def _usage_cache_get(ck):
+    ent = _USAGE_CACHE.get(ck)
+    if ent is None:
+        return None
+    if ops_now() - ent[0] >= ent[3]:
+        _usage_cache_drop(ck)
+        return None
+    _USAGE_CACHE.move_to_end(ck)
+    return ent
+
+
+def _usage_cache_put(ck, res, ttl: float):
+    _usage_cache_drop(ck)
+    now = ops_now()
+    for k in [k for k, e in _USAGE_CACHE.items() if now - e[0] >= e[3]]:
+        _usage_cache_drop(k)
+    w = _usage_weight(res)
+    _USAGE_CACHE[ck] = (now, res, w, ttl)
+    _USAGE_CACHE_W['w'] += w
+    while len(_USAGE_CACHE) > 1 and (_USAGE_CACHE_W['w'] > USAGE_CACHE_WEIGHT or len(_USAGE_CACHE) > USAGE_CACHE_ENTRIES):
+        _usage_cache_drop(next(iter(_USAGE_CACHE)))
+
+
+def _usage_ttl(per: dict) -> float:
+    """Kept 30 s; a period that ended more than an hour ago 10 min."""
+    return 600.0 if not per['all'] and per['t1'] <= ops_now() - 3600 else 30.0
+
+
+async def _usage_cached(kind: str, key: tuple, fn, fresh: bool = False, ttl: float = 30.0):
+    """One computation per (kind, key) at a time, shared by everyone who asks meanwhile (a request that goes away does not
+    stop it); a hit is answered on the spot. The cache keeps about USAGE_CACHE_WEIGHT KB, least recently used out first."""
+    ck = (kind,) + tuple(key)
+    if not fresh:
+        ent = _usage_cache_get(ck)
+        if ent is not None:
+            return ent[1]
+    task = _USAGE_INFLIGHT.get(ck)
+    if task is None:
+        async def job():
+            try:
+                res = await _usage_run(fn)
+                _usage_cache_put(ck, res, ttl)
+                return res
+            finally:
+                _USAGE_INFLIGHT.pop(ck, None)
+        task = _USAGE_INFLIGHT[ck] = asyncio.ensure_future(job())
+        task.add_done_callback(lambda t: t.cancelled() or t.exception())     # a failure nobody waits for is not logged
+    return await asyncio.shield(task)
+
+
+async def _usage_first_t_async(mem: list, fresh: bool = False) -> float:
+    """The start of "all time": kept 10 min (🔄 Refresh looks again)."""
+    if fresh:
+        _USAGE_FIRST['at'] = 0.0
+    elif _USAGE_FIRST['t'] is not None and ops_now() - _USAGE_FIRST['at'] < 600:
+        return _USAGE_FIRST['t']
+    return await _usage_run(_usage_first_t, mem)
+
+
+async def _usage_resolve_period(q, default: str, ctx: dict) -> dict:
+    per = _usage_period(q, default)
+    if per['all']:
+        per['t0'] = await _usage_first_t_async(ctx['mem'], bool(q.get('fresh')))
+    return per
+
+
+def _usage_pkey(per: dict) -> tuple:
+    return (round(per['t0']), 'now' if per['all'] else round(per['t1']))
+
+
+async def _usage_customers_data(request, ctx: dict) -> tuple:
+    q = request.query
+    per = await _usage_resolve_period(q, 'all', ctx)
+    rights = _usage_rights(request)
+    merge = rights['cust']
+    t0, t1 = per['t0'], per['t1']
+    res = await _usage_cached('customers', _usage_pkey(per) + (merge,), lambda: _usage_customers_compute(t0, t1, ctx, merge),
+                              fresh=bool(q.get('fresh')), ttl=_usage_ttl(per))
+    return per, rights, merge, res
+
+
+def _usage_period_out(per: dict) -> dict:
+    return {'t0': round(per['t0'], 1), 't1': round(per['t1'], 1), 'label': per['label'], 'all': per['all'],
+            'until': round(min(per['t1'], ops_now()), 1)}
+
+
+def _usage_can(rights: dict, merge: bool) -> dict:
+    return {'customers': rights['cust'], 'owners': rights['owner'], 'payments': rights['pay'], 'merged': merge}
+
+
+async def ops_api_usage_customers(request):
+    ctx = _usage_ctx()
+    per, rights, merge, res = await _usage_customers_data(request, ctx)
+    q = request.query
+    text = str(q.get('q') or '').strip()[:80]
+    srt = str(q.get('sort') or 'kwh')[:12]
+    limit = ops_int(q.get('limit'), USAGE_LIST_MAX, 1, USAGE_LIST_MAX)
+    out = await _usage_cached('render', (id(res), res['at'], merge) + _usage_rkey(rights) + (srt, text, limit),
+                              lambda: _usage_render_customers(res, ctx, rights, text, srt, limit), ttl=_usage_ttl(per))
+    tot = res['tot']
+    return ops_json({'period': _usage_period_out(per), 'rows': out['rows'], 'total_rows': out['total_rows'],
+                     'totals': {'customers': out['n_people'], 'sessions': tot['n'], 'kwh': round(tot['kwh'], 3),
+                                'avg': round(tot['kwh'] / tot['n'], 2) if tot['n'] else None, 'hours': round(tot['dur'] / 3600.0, 1),
+                                'known_pct': (round(100.0 * tot['known'] / tot['n'], 1) if tot['n'] else None) if merge else None},
+                     'can': _usage_can(rights, merge), 'partial': res['partial'], 'overflow': res['overflow'],
+                     'generated': round(res['at'], 1)})
+
+
+def _usage_target(q, ctx: dict, res: dict, merge: bool):
+    """The customer a detail / export asks for: ?key= (from the list), ?cid= (Customers tab: roles that see customers),
+    ?card= (RFID Cards tab: the card's owner - for the other roles only the card sessions)."""
+    key = str(q.get('key') or '').strip()
+    if key:
+        return res['by_okey'].get(key[:40])
+    cid = str(q.get('cid') or '').strip()[:40]
+    if cid:
+        return ('app', cid) if merge else None
+    card = str(q.get('card') or '').strip().upper()[:40]
+    if card:
+        ck = card if card in ctx['cards'] else ctx['rev'].get(card, card)
+        f = {'src': 'card', 'cid': '', 'ph': '', 'pl': '', 'card': ck, 'nm': '', 'amt': None, 'cur': '', 'tag': ck}
+        return _usage_key(f, ctx, merge)
+    return None
+
+
+def _usage_session_out(s: dict, f: dict, ctx: dict, rights: dict) -> dict:
+    cp = str(s.get('cp') or '')
+    out = {'start': _usage_num(s, 'start') or None, 'stop': _usage_num(s, 'stop') or _usage_num(s, 't') or None, 'cp': cp,
+           'name': ctx['names'].get(cp, ''), 'c': s.get('c'), 'tx': s.get('tx'), 'tag': f['tag'], 'channel': _usage_channel(f),
+           'card': f['card'], 'dur': round(_usage_num(s, 'dur')), 'kwh': round(_usage_num(s, 'kwh'), 3),
+           'max_kw': round(_usage_num(s, 'max_kw'), 2), 'reason': str(s.get('reason') or '')[:40]}
+    if s.get('suspect'):
+        out['suspect'] = True
+    if rights['pay'] and f['amt'] is not None:
+        out['amt'] = f['amt']
+        out['cur'] = f['cur'] or ctx['sym']
+    return out
+
+
+def _usage_customer_compute(t0: float, t1: float, ctx: dict, merge: bool, target: tuple, rights: dict, cap: int) -> dict:
+    """One customer: every session of the period (also one that the list counts under "other customers")."""
+    free_idx = _UsageFreeIndex(t0, t1, ctx['free_mem'])
+    key_of = _usage_keyer(ctx, merge) if target == ('walkin', 'overflow') else (lambda f: _usage_key(f, ctx, merge))
+    g = _usage_new_group(target)
+    g['okey'] = _usage_okey(target)
+    keep = _usage_coll.deque(maxlen=max(1, cap))
+    months, stations, cards = {}, {}, {}
+    scanned = 0
+    for s in _usage_iter(t0, t1, mem=ctx['mem']):
+        scanned += 1
+        if scanned > USAGE_SCAN_MAX:
+            break
+        f = _usage_facts(s, ctx, free_idx)
+        if key_of(f) != target:
+            continue
+        _usage_add(g, s, f, ctx, not merge)
+        kwh = _usage_num(s, 'kwh')
+        t = _usage_num(s, 'stop') or _usage_num(s, 't')
+        ym = _usage_day_txt(_usage_day(t))[:7]
+        m = months.setdefault(ym, [0, 0.0])
+        m[0] += 1
+        m[1] += kwh
+        cp = str(s.get('cp') or '')
+        st = stations.setdefault(cp, [0, 0.0])
+        st[0] += 1
+        st[1] += kwh
+        if f['card']:
+            cd = cards.setdefault(f['card'], [0, 0.0])
+            cd[0] += 1
+            cd[1] += kwh
+        keep.append(_usage_session_out(s, f, ctx, rights))
+    rows = list(reversed(keep))
+    return {'customer': _usage_row(target, g, ctx, rights), 'sessions': rows, 'more': g['n'] > len(rows),
+            'months': [{'month': k, 'sessions': v[0], 'kwh': round(v[1], 3)} for k, v in sorted(months.items())],
+            'stations': sorted(({'cp': k, 'name': ctx['names'].get(k, ''), 'sessions': v[0], 'kwh': round(v[1], 3)} for k, v in stations.items()),
+                               key=lambda x: -x['kwh'])[:200],
+            'cards': sorted(({'card': k, 'sessions': v[0], 'kwh': round(v[1], 3)} for k, v in cards.items()), key=lambda x: -x['kwh'])[:200]}
+
+
+async def ops_api_usage_customer(request):
+    ctx = _usage_ctx()
+    per, rights, merge, res = await _usage_customers_data(request, ctx)
+    target = _usage_target(request.query, ctx, res, merge)
+    if target is None:
+        return ops_err('Unknown customer - open the list again', 404)
+    t0, t1 = per['t0'], per['t1']
+    d = await _usage_cached('customer', _usage_pkey(per) + (merge, target) + _usage_rkey(rights),
+                            lambda: _usage_customer_compute(t0, t1, ctx, merge, target, rights, USAGE_DETAIL_MAX),
+                            fresh=bool(request.query.get('fresh')), ttl=_usage_ttl(per))
+    return ops_json(dict(d, period=_usage_period_out(per), can=_usage_can(rights, merge)))
+
+
+# ---- stations --------------------------------------------------------------------------------------------------------------
+def _usage_stations_compute(t0: float, t1: float, ctx: dict) -> dict:
+    """Per station and Bhutan day, plus what the console shows (the same for every role: no customer details)."""
+    st = {}
+    n_all, partial = 0, False
+    for s in _usage_iter(t0, t1, mem=ctx['mem']):
+        n_all += 1
+        if n_all > USAGE_SCAN_MAX:
+            partial = True
+            break
+        cp = str(s.get('cp') or '')[:80]
+        a = st.get(cp)
+        if a is None:
+            if len(st) >= 20000:
+                continue
+            a = st[cp] = {'n': 0, 'kwh': 0.0, 'dur': 0.0, 'maxkw': 0.0, 'days': {}, 'last': None, 'tags': set(), 'tags_more': False}
+        kwh, dur = _usage_num(s, 'kwh'), _usage_num(s, 'dur')
+        t = _usage_num(s, 'stop') or _usage_num(s, 't')
+        a['n'] += 1
+        a['kwh'] += kwh
+        a['dur'] += dur
+        a['maxkw'] = max(a['maxkw'], _usage_num(s, 'max_kw'))
+        if a['last'] is None or t > a['last']:
+            a['last'] = t
+        dn = _usage_day(t)
+        d = a['days'].get(dn)
+        if d is None:
+            d = a['days'][dn] = [0, 0.0, 0.0]
+        d[0] += 1
+        d[1] += kwh
+        d[2] += dur
+        tag = str(s.get('tag') or '').strip().upper()
+        if tag:
+            if len(a['tags']) < USAGE_TAGS_MAX:
+                a['tags'].add(tag)
+            elif tag not in a['tags']:
+                a['tags_more'] = True
+    for cp in ctx['known']:
+        st.setdefault(cp, {'n': 0, 'kwh': 0.0, 'dur': 0.0, 'maxkw': 0.0, 'days': {}, 'last': None, 'tags': set(), 'tags_more': False})
+    rows = []
+    for cp, a in st.items():
+        if not cp:
+            continue
+        n = a['n']
+        best = max(a['days'].items(), key=lambda x: (x[1][1], x[1][0])) if a['days'] else None
+        rows.append({'cp': cp, 'name': ctx['names'].get(cp, ''), 'sessions': n, 'kwh': round(a['kwh'], 3),
+                     'avg': round(a['kwh'] / n, 2) if n else None, 'hours': round(a['dur'] / 3600.0, 2), 'active_days': len(a['days']),
+                     'max_kw': round(a['maxkw'], 2), 'users': len(a['tags']), 'users_more': a['tags_more'], 'last': a['last'],
+                     'best': {'day': _usage_day_txt(best[0]), 'sessions': best[1][0], 'kwh': round(best[1][1], 3)} if best else None})
+    rows.sort(key=lambda r: (-r['kwh'], r['cp']))
+    d1 = _usage_day(min(t1, ops_now() + 1) - 1)
+    d0 = max(_usage_day(t0), d1 - USAGE_MATRIX_DAYS + 1)
+    cells = {}
+    for cp, a in st.items():
+        row = {_usage_day_txt(dn): [v[0], round(v[1], 2)] for dn, v in a['days'].items() if d0 <= dn <= d1}
+        if row:
+            cells[cp] = row
+        a['tags'] = None                                    # only the count is kept in the cache
+    n = sum(r['sessions'] for r in rows)
+    kwh = sum(r['kwh'] for r in rows)
+    return {'st': st, 'rows': rows, 'days': [_usage_day_txt(x) for x in range(d0, d1 + 1)], 'cells': cells,
+            'days_cut': _usage_day(t0) < d0, 'partial': partial,
+            'totals': {'stations': len(rows), 'active': sum(1 for r in rows if r['sessions']), 'sessions': n, 'kwh': round(kwh, 3),
+                       'avg': round(kwh / n, 2) if n else None}, 'at': ops_now()}
+
+
+async def _usage_stations_data(request, ctx: dict) -> tuple:
+    q = request.query
+    per = await _usage_resolve_period(q, 'days:30', ctx)
+    t0, t1 = per['t0'], per['t1']
+    res = await _usage_cached('stations', _usage_pkey(per), lambda: _usage_stations_compute(t0, t1, ctx), fresh=bool(q.get('fresh')),
+                              ttl=_usage_ttl(per))
+    return per, res
+
+
+async def ops_api_usage_stations(request):
+    ctx = _usage_ctx()
+    per, res = await _usage_stations_data(request, ctx)
+    return ops_json({'period': _usage_period_out(per), 'rows': res['rows'], 'days': res['days'], 'cells': res['cells'],
+                     'days_cut': res['days_cut'], 'totals': res['totals'], 'partial': res['partial'], 'generated': round(res['at'], 1)})
+
+
+def _usage_station_compute(t0: float, t1: float, cp: str, ctx: dict, merge: bool, rights: dict, cap: int) -> dict:
+    free_idx = _UsageFreeIndex(t0, t1, ctx['free_mem'])
+    key_of = _usage_keyer(ctx, merge)
+    days, groups = {}, {}
+    keep = _usage_coll.deque(maxlen=max(1, cap))
+    tot = {'n': 0, 'kwh': 0.0, 'dur': 0.0, 'maxkw': 0.0, 'tags': set(), 'tags_more': False}
+    conns = {}
+    scanned, partial = 0, False
+    for s in _usage_iter(t0, t1, cp=cp, mem=ctx['mem']):
+        scanned += 1
+        if scanned > USAGE_SCAN_MAX:
+            partial = True
+            break
+        if str(s.get('cp') or '') != cp:
+            continue
+        f = _usage_facts(s, ctx, free_idx)
+        kwh, dur, mk = _usage_num(s, 'kwh'), _usage_num(s, 'dur'), _usage_num(s, 'max_kw')
+        t = _usage_num(s, 'stop') or _usage_num(s, 't')
+        dn = _usage_day(t)
+        d = days.get(dn)
+        if d is None:
+            d = days[dn] = {'n': 0, 'kwh': 0.0, 'dur': 0.0, 'min': None, 'max': None, 'maxkw': 0.0, 'tags': set()}
+        d['n'] += 1
+        d['kwh'] += kwh
+        d['dur'] += dur
+        d['min'] = kwh if d['min'] is None else min(d['min'], kwh)
+        d['max'] = kwh if d['max'] is None else max(d['max'], kwh)
+        d['maxkw'] = max(d['maxkw'], mk)
+        if f['tag']:
+            if len(d['tags']) < USAGE_TAGS_MAX:
+                d['tags'].add(f['tag'])
+            if len(tot['tags']) < USAGE_TAGS_TOTAL:
+                tot['tags'].add(f['tag'])
+            elif f['tag'] not in tot['tags']:
+                tot['tags_more'] = True
+        tot['n'] += 1
+        tot['kwh'] += kwh
+        tot['dur'] += dur
+        tot['maxkw'] = max(tot['maxkw'], mk)
+        c = conns.setdefault(str(s.get('c') if s.get('c') is not None else '')[:10], [0, 0.0])
+        c[0] += 1
+        c[1] += kwh
+        key = key_of(f)
+        g = groups.get(key)
+        if g is None:
+            g = groups[key] = _usage_new_group(key)
+        _usage_note(g, f, ctx, not merge)
+        keep.append((_usage_session_out(s, f, ctx, rights), key))
+    who = {}
+    sessions = []
+    for row, key in reversed(keep):
+        w = who.get(key)
+        if w is None:
+            w = who[key] = _usage_who(key, groups[key], ctx, rights)
+        row['who'] = w
+        sessions.append(row)
+    d_last = _usage_day(min(t1, ops_now() + 1) - 1)
+    d_first = _usage_day(t0)
+    rows = []
+    if d_last - d_first < 400:                              # every day of the period, also those without sessions
+        span = range(d_last, d_first - 1, -1)
+    else:                                                   # a long period: the days with sessions
+        span = sorted(days, reverse=True)[:USAGE_DAILY_MAX]
+    for dn in span:
+        d = days.get(dn)
+        if d is None:
+            rows.append({'day': _usage_day_txt(dn), 'sessions': 0, 'kwh': 0.0})
+            continue
+        rows.append({'day': _usage_day_txt(dn), 'sessions': d['n'], 'kwh': round(d['kwh'], 3), 'avg': round(d['kwh'] / d['n'], 2),
+                     'min': round(d['min'], 3), 'max': round(d['max'], 3), 'hours': round(d['dur'] / 3600.0, 2),
+                     'max_kw': round(d['maxkw'], 2), 'users': len(d['tags'])})
+    return {'days': rows, 'sessions': sessions, 'more': tot['n'] > len(sessions), 'partial': partial,
+            'connectors': [{'c': k, 'sessions': v[0], 'kwh': round(v[1], 3)} for k, v in sorted(conns.items())[:50]],
+            'totals': {'sessions': tot['n'], 'kwh': round(tot['kwh'], 3), 'avg': round(tot['kwh'] / tot['n'], 2) if tot['n'] else None,
+                       'hours': round(tot['dur'] / 3600.0, 2), 'max_kw': round(tot['maxkw'], 2), 'users': len(tot['tags']),
+                       'users_more': tot['tags_more'], 'active_days': len(days)}}
+
+
+async def ops_api_usage_station(request):
+    q = request.query
+    cp = str(q.get('cp') or '').strip()[:80]
+    if not cp:
+        return ops_err('Choose a station', 400)
+    ctx = _usage_ctx()
+    per = await _usage_resolve_period(q, 'days:30', ctx)
+    rights = _usage_rights(request)
+    merge = rights['cust']
+    t0, t1 = per['t0'], per['t1']
+    d = await _usage_cached('station', _usage_pkey(per) + (cp, merge) + _usage_rkey(rights),
+                            lambda: _usage_station_compute(t0, t1, cp, ctx, merge, rights, USAGE_DETAIL_MAX),
+                            fresh=bool(q.get('fresh')), ttl=_usage_ttl(per))
+    return ops_json(dict(d, period=_usage_period_out(per), cp=cp, name=ctx['names'].get(cp, ''), can=_usage_can(rights, merge)))
+
+
+# ---- the KPI tab's session list: every role (the Excel report has the same rows), who charged stays out; the newest
+#      `limit` rows are kept while the period is read (a whole month is never held for a short answer)
+def _usage_sessions_list(t0: float, t1: float, cp: str, limit: int, mem: list) -> dict:
+    keep = _usage_coll.deque(maxlen=max(1, limit))
+    n, partial = 0, False
+    for s in _usage_iter(t0, t1, cp=cp or None, mem=mem):
+        if n >= USAGE_SCAN_MAX:
+            partial = True
+            break
+        n += 1
+        keep.append(s)
+    out = {'items': [{k: v for k, v in s.items() if k not in USAGE_PRIVATE} for s in reversed(keep)], 'total': n}
+    if partial:
+        out['partial'] = True
+    return out
+
+
+async def ops_api_sessions_v115(request):
+    q = request.query
+    t0, t1, _label = ops_period(q)
+    cp = (q.get('cp') or '').strip()[:80]
+    limit = ops_int(q.get('limit'), 2000, 1, USAGE_SESSIONS_LIMIT)
+    return ops_json(await _usage_run(_usage_sessions_list, t0, t1, cp, limit, _usage_mem()))
+
+
+for _i, _r in enumerate(OPS_ROUTES):
+    if _r[0] == 'GET' and _r[1] == '/api/ops/sessions':
+        OPS_ROUTES[_i] = ('GET', '/api/ops/sessions', _usage_guard(ops_api_sessions_v115)) + tuple(_r[3:])
+        break
+
+
+# ---- the KPI report: "Daily by charger" -------------------------------------------------------------------------------------
+USAGE_DAILY_CP_COLS = [('day', 'Day'), ('cp', 'Charger'), ('name', 'Station'), ('sessions', 'Sessions'), ('kwh', 'Energy kWh'),
+                       ('avg_kwh', 'kWh per session'), ('minutes', 'Charging minutes')]
+
+
+def usage_daily_by_charger(sessions) -> list:
+    """One row per day and charger with sessions (the day a session ended, Bhutan Time - as the report's Daily sheet)."""
+    agg = {}
+    for s in sessions or ():
+        if not isinstance(s, dict):
+            continue
+        t = _usage_num(s, 'stop') or _usage_num(s, 't')
+        k = (_usage_day(t), str(s.get('cp') or ''))
+        a = agg.get(k)
+        if a is None:
+            a = agg[k] = [0, 0.0, 0.0]
+        a[0] += 1
+        a[1] += _usage_num(s, 'kwh')
+        a[2] += _usage_num(s, 'dur')
+    return [{'day': _usage_day_txt(dn), 'cp': cp, 'name': ops_cp_name(cp), 'sessions': n, 'kwh': round(kwh, 3),
+             'avg_kwh': round(kwh / n, 2) if n else None, 'minutes': round(dur / 60.0, 1)}
+            for (dn, cp), (n, kwh, dur) in sorted(agg.items())]
+
+
+# ---- exports (built in the worker) -----------------------------------------------------------------------------------------
+def _usage_txt(v):
+    if isinstance(v, str):
+        try:
+            return _rfid_out_text(v)                        # v1.14: no control characters / lone surrogates in a file
+        except Exception:
+            return v
+    return v
+
+
+def _usage_t(t) -> str:
+    return ops_dt(float(t)).strftime('%Y-%m-%d %H:%M') if t else ''
+
+
+_USAGE_WALKIN_TXT = {'pay': 'QR payment (no contact)', 'free': 'Free charging (no contact)', 'none': 'No idTag',
+                     'overflow': 'Other customers (too many to list)', 'r_app': 'BPC EV app customers (added up)',
+                     'r_qr': 'QR / cash payments (added up)', 'r_free': 'Free charging (added up)', 'r_auto': 'Autocharge (added up)',
+                     'r_none': 'No idTag', 'r_other': 'Other idTags (added up)'}
+
+
+def _usage_who_txt(w: dict) -> str:
+    if not w:
+        return ''
+    if w.get('walkin'):
+        return _USAGE_WALKIN_TXT.get(w['walkin'], w['walkin'])
+    base = w.get('name') or w.get('card') or w.get('tag') or ''
+    if w.get('deleted'):
+        base = (base + ' ' if base else '') + '(deleted app account)'
+    return base
+
+
+def _usage_file(fmt: str, sheet: str, cols: list, rows, fname: str) -> tuple:
+    """(bytes, file name) - call in the worker. Excel is written row by row (a long export stays small in memory) and
+    text never becomes a formula; CSV with BOM and the formula guard."""
+    if fmt == 'xlsx':
+        from openpyxl import Workbook
+        from openpyxl.cell import WriteOnlyCell
+        from openpyxl.styles import Font, PatternFill
+        from openpyxl.utils import get_column_letter
+        wb = Workbook(write_only=True)
+        ws = wb.create_sheet(sheet[:31])
+        for j, (_k, label) in enumerate(cols, start=1):
+            ws.column_dimensions[get_column_letter(j)].width = max(10, min(32, len(label) + 4))
+        ws.freeze_panes = 'A2'
+        head_font, head_fill = Font(bold=True, color='FFFFFF'), PatternFill('solid', fgColor='0A7A3C')
+        head = []
+        for _k, label in cols:
+            c = WriteOnlyCell(ws, value=label)
+            c.font, c.fill = head_font, head_fill
+            head.append(c)
+        ws.append(head)
+        for r in rows:
+            _usage_yield()
+            out = []
+            for k, _l in cols:
+                v = _usage_txt(r.get(k, ''))
+                if v is None:
+                    v = ''
+                if isinstance(v, str) and v[:1] in ('=', '+', '-', '@'):
+                    c = WriteOnlyCell(ws, value=v)
+                    c.data_type = 's'
+                    v = c
+                out.append(v)
+            ws.append(out)
+        buf = _ops_io.BytesIO()
+        wb.save(buf)
+        return buf.getvalue(), fname + '.xlsx'
+    buf = _ops_io.StringIO()
+    w = _ops_csv.writer(buf)
+    w.writerow([label for _k, label in cols])
+    for r in rows:
+        _usage_yield()
+        w.writerow([ops_csv_safe(_usage_txt(r.get(k, ''))) for k, _l in cols])
+    return ('﻿' + buf.getvalue()).encode('utf-8'), fname + '.csv'
+
+
+_USAGE_CUST_COLS = [('who', 'Customer'), ('kind', 'Type'), ('phone', 'Mobile'), ('plates', 'Vehicle plates'), ('orgs', 'Organisation'),
+                    ('cards', 'RFID cards'), ('sessions', 'Sessions'), ('kwh', 'Energy kWh'), ('avg', 'kWh per session'),
+                    ('hours', 'Charging hours'), ('stations', 'Stations'), ('first', 'First charge (BTT)'), ('last', 'Last charge (BTT)'),
+                    ('last_cp', 'Last station')]
+_USAGE_SESS_COLS = [('start', 'Start (BTT)'), ('stop', 'End (BTT)'), ('cp', 'Charger'), ('name', 'Station'), ('c', 'Connector'),
+                    ('who', 'Customer'), ('tag', 'idTag'), ('channel', 'How'), ('minutes', 'Minutes'), ('kwh', 'Energy kWh'),
+                    ('max_kw', 'Peak kW'), ('reason', 'Stop reason')]
+_USAGE_DAY_COLS = [('day', 'Day'), ('sessions', 'Sessions'), ('kwh', 'Energy kWh'), ('avg', 'kWh per session'), ('min', 'Smallest kWh'),
+                   ('max', 'Largest kWh'), ('hours', 'Charging hours'), ('max_kw', 'Peak kW'), ('users', 'Cards / payers')]
+_USAGE_KIND_TXT = {'app': 'App account', 'person': 'Customer (mobile)', 'card': 'RFID card', 'vehicle': 'Vehicle',
+                   'tag': 'idTag', 'walkin': 'Walk-in'}
+_USAGE_CH_TXT = {'app': 'BPC EV app', 'qr': 'QR payment', 'card': 'RFID card', 'free': 'Free charging', 'auto': 'Autocharge',
+                 'other': 'Other idTag', 'none': 'No idTag'}
+_USAGE_PAY_COLS = [('amt', 'Amount'), ('cur', 'Currency')]
+
+
+def _usage_cust_export_row(r: dict) -> dict:
+    n_more = r.get('n_cards', 0) - len(r.get('cards') or [])
+    return {'who': _usage_who_txt(r), 'kind': _USAGE_KIND_TXT.get(r['kind'], r['kind']), 'phone': r.get('phone') or '',
+            'plates': ', '.join(r.get('plates') or []), 'orgs': ', '.join(r.get('orgs') or []),
+            'cards': ', '.join(r.get('cards') or []) + (' +%d' % n_more if n_more > 0 else ''),
+            'sessions': r['sessions'], 'kwh': r['kwh'], 'avg': r['avg'], 'hours': r['hours'], 'stations': r['stations'],
+            'first': _usage_t(r['first']), 'last': _usage_t(r['last']), 'last_cp': r['last_cp'], 'amt': r.get('amt'), 'cur': r.get('cur')}
+
+
+def _usage_sess_export_row(s: dict, who: dict = None) -> dict:
+    return {'start': _usage_t(s['start']), 'stop': _usage_t(s['stop']), 'cp': s['cp'], 'name': s['name'], 'c': s['c'],
+            'who': _usage_who_txt(who or s.get('who')), 'tag': s['tag'], 'channel': _USAGE_CH_TXT.get(s['channel'], s['channel']),
+            'minutes': round(s['dur'] / 60.0, 1), 'kwh': s['kwh'], 'max_kw': s['max_kw'], 'reason': s['reason'],
+            'amt': s.get('amt'), 'cur': s.get('cur')}
+
+
+def _usage_fname(what: str, per: dict, extra: str = '') -> str:
+    span = 'all' if per['all'] else '%s_%s' % (ops_dt(per['t0']).strftime('%Y%m%d'), ops_dt(min(per['t1'], ops_now()) - 1).strftime('%Y%m%d'))
+    safe = ''.join(ch for ch in extra if ch.isalnum() or ch in '-_')[:40]
+    return 'BPC_charging_history_%s%s_%s' % (what, ('_' + safe) if safe else '', span)
+
+
+def _usage_export_customers(res, ctx, rights, text, fmt, fname):
+    out = _usage_render_customers(res, ctx, rights, text, 'kwh', USAGE_EXPORT_MAX)
+    rows = (_usage_cust_export_row(r) for r in out['rows'])
+    return _usage_file(fmt, 'Customers', _USAGE_CUST_COLS + (_USAGE_PAY_COLS if rights['pay'] else []), rows, fname)
+
+
+def _usage_export_customer(t0, t1, ctx, merge, target, rights, fmt, per):
+    d = _usage_customer_compute(t0, t1, ctx, merge, target, rights, USAGE_EXPORT_MAX)
+    who = d['customer']
+    rows = (_usage_sess_export_row(s, who) for s in d['sessions'])
+    return _usage_file(fmt, 'Sessions', _USAGE_SESS_COLS + (_USAGE_PAY_COLS if rights['pay'] else []), rows,
+                       _usage_fname('customer', per, who.get('card') or who.get('key')))
+
+
+def _usage_export_stations(res, ctx, fmt, fname):
+    def rows():
+        n = 0
+        for dn, cp, v in sorted((dn, cp, v) for cp, a in res['st'].items() for dn, v in a['days'].items()):
+            n += 1
+            if n > USAGE_EXPORT_MAX:
+                break
+            yield {'day': _usage_day_txt(dn), 'cp': cp, 'name': ctx['names'].get(cp, ''), 'sessions': v[0], 'kwh': round(v[1], 3),
+                   'avg_kwh': round(v[1] / v[0], 2) if v[0] else None, 'minutes': round(v[2] / 60.0, 1)}
+    return _usage_file(fmt, 'Daily by charger', USAGE_DAILY_CP_COLS, rows(), fname)
+
+
+def _usage_export_station(t0, t1, cp, ctx, merge, rights, fmt, part, per):
+    d = _usage_station_compute(t0, t1, cp, ctx, merge, rights, USAGE_EXPORT_MAX)
+    if part == 'days':
+        return _usage_file(fmt, 'Days', _USAGE_DAY_COLS, d['days'], _usage_fname('station_days', per, cp))
+    rows = (_usage_sess_export_row(s) for s in d['sessions'])
+    return _usage_file(fmt, 'Sessions', _USAGE_SESS_COLS + (_USAGE_PAY_COLS if rights['pay'] else []), rows,
+                       _usage_fname('station', per, cp))
+
+
+async def ops_api_usage_export(request):
+    q = request.query
+    what = str(q.get('what') or 'customers')
+    fmt = 'xlsx' if q.get('fmt') == 'xlsx' else 'csv'
+    if fmt == 'xlsx':
+        try:
+            import openpyxl  # noqa: F401
+        except Exception:
+            return ops_err('Excel export needs the openpyxl package (pip install openpyxl) - use CSV instead', 501)
+    ctx = _usage_ctx()
+    if what in ('customers', 'customer'):
+        per, rights, merge, res = await _usage_customers_data(request, ctx)
+        if what == 'customers':
+            text = str(q.get('q') or '').strip()[:80]
+            body, fname = await _usage_run(_usage_export_customers, res, ctx, rights, text, fmt, _usage_fname('customers', per))
+        else:
+            target = _usage_target(q, ctx, res, merge)
+            if target is None:
+                return ops_err('Unknown customer - open the list again', 404)
+            body, fname = await _usage_run(_usage_export_customer, per['t0'], per['t1'], ctx, merge, target, rights, fmt, per)
+    elif what == 'stations':
+        per, res = await _usage_stations_data(request, ctx)
+        body, fname = await _usage_run(_usage_export_stations, res, ctx, fmt, _usage_fname('daily_by_charger', per))
+    elif what == 'station':
+        cp = str(q.get('cp') or '').strip()[:80]
+        if not cp:
+            return ops_err('Choose a station', 400)
+        per = await _usage_resolve_period(q, 'days:30', ctx)
+        rights = _usage_rights(request)
+        body, fname = await _usage_run(_usage_export_station, per['t0'], per['t1'], cp, ctx, rights['cust'], rights, fmt,
+                                       q.get('part'), per)
+    else:
+        return ops_err('Unknown export', 400)
+    ctype = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' if fname.endswith('.xlsx') else 'text/csv'
+    return web.Response(body=body, content_type=ctype, headers={'Content-Disposition': 'attachment; filename="%s"' % fname})
+
+
+for _p in ('/api/ops/usage/customers', '/api/ops/usage/customer', '/api/ops/usage/stations', '/api/ops/usage/station',
+           '/api/ops/usage/export'):
+    ops_perm_rule('GET', _p, 'view')
+
+OPS_ROUTES += [
+    ('GET', '/api/ops/usage/customers', _usage_guard(ops_api_usage_customers)),
+    ('GET', '/api/ops/usage/customer', _usage_guard(ops_api_usage_customer)),
+    ('GET', '/api/ops/usage/stations', _usage_guard(ops_api_usage_stations)),
+    ('GET', '/api/ops/usage/station', _usage_guard(ops_api_usage_station)),
+    ('GET', '/api/ops/usage/export', _usage_guard(ops_api_usage_export)),
+]
+
+OPS_CSS_PARTS.append(r'''/* [OPS] v1.15 📜 Charging history (customers, stations day by day) */
+#usMain { min-height: 120px; transition: opacity 0.15s; }
+#usMain.ops-us-busy { opacity: 0.55; }
+.ops-us-bar .ops-filters label { white-space: nowrap; }
+.ops-us-bar input[type=date] { width: 150px; }
+#usQ { width: 300px; max-width: 100%; }
+.ops-us-cnt { font-size: 0.75rem; margin: 0.2rem 0 0.4rem; }
+.ops-us-row { cursor: pointer; }
+.ops-us-row:hover td { background: var(--bg-hover); }
+.ops-us-sub { font-size: 0.74rem; color: var(--text-dim); margin-top: 0.15rem; word-break: break-word; }
+.ops-us-chs { margin-top: 0.25rem; display: flex; flex-wrap: wrap; gap: 0.25rem; }
+.ops-us-ch { display: inline-block; padding: 0.05rem 0.5rem; border-radius: 50px; font-size: 0.68rem; font-weight: 600; background: var(--bg-hover);
+    border: 1px solid var(--border); color: var(--text); white-space: nowrap; }
+.ops-us-kind { display: inline-block; padding: 0.05rem 0.45rem; border-radius: 50px; font-size: 0.66rem; font-weight: 700; vertical-align: middle;
+    background: #e2e8f0; color: #334155; white-space: nowrap; }
+.ops-us-k-app { background: #dbeafe; color: #1d4ed8; }
+.ops-us-k-person { background: #d1fae5; color: #047857; }
+.ops-us-k-card { background: #ede9fe; color: #6d28d9; }
+.ops-us-k-vehicle { background: #fef3c7; color: #92400e; }
+.ops-us-title { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; }
+.ops-us-title h3 { margin: 0; }
+.ops-us-charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 0.8rem; margin: 0.6rem 0; }
+.ops-us-charts .ops-chartbox { border: 1px solid var(--border); border-radius: 10px; padding: 0.5rem 0.7rem; background: var(--bg-input); min-width: 0; }
+.ops-us-charts h4 { margin: 0.1rem 0 0.4rem; font-size: 0.82rem; }
+.ops-us-days tr.ops-us-day.has { cursor: pointer; }
+.ops-us-days tr.ops-us-day.none td { color: var(--text-dim); }
+.ops-us-days tr.ops-us-day.open td { background: var(--bg-hover); }
+.ops-us-days tr.ops-us-dayx > td { padding: 0.2rem 0.4rem 0.8rem 1.2rem; background: var(--bg-input); }
+.ops-us-mwrap { max-height: 66vh; overflow: auto; border: 1px solid var(--border); border-radius: 10px; }
+.ops-us-matrix { border-collapse: separate; border-spacing: 2px; font-size: 0.72rem; }
+.ops-us-matrix th { position: sticky; top: 0; background: var(--bg-card, #fff); font-weight: 600; color: var(--text-dim); text-align: center;
+    padding: 0.15rem 0.2rem; z-index: 1; line-height: 1.1; }
+.ops-us-matrix th span { font-size: 0.6rem; font-weight: 400; }
+.ops-us-matrix th.ops-us-we { color: #b45309; }
+.ops-us-matrix th.ops-us-sticky, .ops-us-matrix tbody th.ops-us-sticky { position: sticky; left: 0; text-align: left; z-index: 2; min-width: 150px;
+    max-width: 200px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; background: var(--bg-card, #fff); }
+.ops-us-matrix thead th.ops-us-sticky { z-index: 3; }
+.ops-us-matrix tbody th.ops-us-sticky { top: auto; font-weight: 600; color: var(--text); }
+.ops-us-matrix tbody th .muted { display: block; font-weight: 400; font-size: 0.62rem; }
+.ops-us-matrix td { min-width: 24px; height: 26px; text-align: center; border-radius: 4px; background: var(--bg-input); }
+.ops-us-matrix td.ops-us-cell { cursor: pointer; font-weight: 700; }
+.ops-us-matrix td.ops-us-cell:hover { outline: 2px solid #0f172a; }
+.ops-us-matrix td.ops-us-tot { background: transparent; min-width: 56px; white-space: nowrap; }
+.ops-us-legend { font-size: 0.72rem; color: var(--text-dim); margin-top: 0.4rem; display: flex; align-items: center; gap: 0.25rem; flex-wrap: wrap; }
+.ops-us-legend i { display: inline-block; width: 18px; height: 12px; border-radius: 3px; }
+@media (max-width: 700px) {
+    #usQ { width: 100%; }
+    .ops-us-bar input[type=date] { width: 100%; }
+    .ops-us-charts { grid-template-columns: 1fr; }
+    .ops-us-days tr.ops-us-dayx > td { padding-left: 0.3rem; }
+    .ops-us-matrix th.ops-us-sticky, .ops-us-matrix tbody th.ops-us-sticky { min-width: 110px; max-width: 130px; }
+}
+#view-usage a.tb-btn { text-decoration: none; }
+.ops-us-k-sum { background: #f1f5f9; color: #475569; border: 1px dashed #94a3b8; }
+''')
+OPS_JS_PARTS.append(r'''/* [OPS] 📜 Charging history tab (v1.15): per customer (app account + RFID cards + free charging + QR payments of the same
+   mobile number) and per station (day by day), every session, CSV / Excel exports */
+(function () {
+    'use strict';
+    const OPS = window.OPS;
+    if (!OPS) return;
+    const U = {view: 'customers', per: 'all', from: '', to: '', sort: 'kwh', q: '', svMode: 'summary', open: null, data: null, det: null, day: null, seq: 0};
+    const KIND = {app: '📱 App account', person: '👤 Customer (mobile)', card: '🎴 RFID card', vehicle: '🚗 Vehicle', tag: '🏷️ idTag', walkin: '🚶 Walk-in'};
+    const CH = {app: '📱 App', qr: '📷 QR payment', card: '🎴 Card', free: '🎟️ Free', auto: '🚗 Autocharge', other: '🏷️ Other idTag', none: '— No idTag'};
+    const WALKIN = {pay: 'QR payments without contact details', free: 'Free charging without contact details', none: 'Sessions without an idTag',
+        overflow: 'Other customers (too many to list one by one)', r_app: 'BPC EV app customers (added up)', r_qr: 'QR / cash payments (added up)',
+        r_free: 'Free charging (added up)', r_auto: 'Autocharge (added up)', r_none: 'Sessions without an idTag', r_other: 'Other idTags (added up)'};
+    const RAMP = ['#cde2fb', '#9ec5f4', '#6da7ec', '#2a78d6', '#184f95'];
+    const td = (l, h, c) => OPS.td(l, h, c);
+    const esc = OPS.esc;
+    const n1 = v => (v == null ? '—' : OPS.num(v, 1));
+    const n2 = v => (v == null ? '—' : OPS.num(v, 2));
+    const hrs = v => (v == null ? '—' : OPS.num(v, v >= 100 ? 0 : 1) + ' h');
+    const money = (v, cur) => (v == null ? '—' : esc(cur || '') + ' ' + OPS.num(v, 2));
+
+    function today() { return OPS.day(); }
+    function perQuery() {
+        if (U.per === 'all') return {all: 1};
+        if (U.per === 'd30') return {days: 30};
+        if (U.per === 'd90') return {days: 90};
+        if (U.per === 'year') return {from: today().slice(0, 4) + '-01-01', to: today()};
+        return {from: U.from || today(), to: U.to || today()};
+    }
+
+    function build(v) {
+        v.dataset.built = '1';
+        const pers = [['d30', '30 days'], ['d90', '90 days'], ['year', 'This year'], ['all', 'All time']];
+        v.innerHTML =
+            '<section class="pay-panel ops-panel ops-us-bar"><div class="ops-head"><h3>' + OPS.t('📜 Charging history') + '</h3>' +
+            '<div class="ops-actions ops-filters"><span class="ops-seg" id="usView"><button class="chip" data-v="customers">' + OPS.t('👥 Customers') +
+            '</button><button class="chip" data-v="stations">' + OPS.t('🏪 Stations') + '</button></span>' +
+            '<span class="ops-seg" id="usPer">' + pers.map(p => '<button class="chip" data-p="' + p[0] + '">' + OPS.t(p[1]) + '</button>').join('') + '</span>' +
+            '<label>' + OPS.t('From') + ' <input class="tb-inp" type="date" id="usFrom"></label><label>' + OPS.t('To') + ' <input class="tb-inp" type="date" id="usTo"></label>' +
+            '<button class="tb-btn" id="usFresh" title="' + esc(OPS.tx('Read the sessions again')) + '">' + OPS.t('🔄 Refresh') + '</button>' +
+            '</div></div><div class="muted" id="usPeriod"></div></section>' +
+            '<section class="kpis ops-kpis" id="usTiles"></section>' +
+            '<section class="pay-panel ops-panel" id="usMain"></section>';
+        OPS.$('usView').onclick = e => { const b = e.target.closest('[data-v]'); if (b) { U.view = b.dataset.v; U.open = null; U.day = null; load(); } };
+        OPS.$('usPer').onclick = e => { const b = e.target.closest('[data-p]'); if (b) { U.per = b.dataset.p; load(); } };
+        const onDate = () => { U.per = 'custom'; U.from = OPS.$('usFrom').value; U.to = OPS.$('usTo').value; if (U.from && U.to) load(); };
+        OPS.$('usFrom').onchange = onDate;
+        OPS.$('usTo').onchange = onDate;
+        OPS.$('usFresh').onclick = () => load(false, true);
+        OPS.$('usMain').addEventListener('click', onClick);
+    }
+
+    // the list head (search, sort, exports) stays while its rows are drawn again - typing keeps the focus
+    function frame(mode, headHtml) {
+        const main = OPS.$('usMain');
+        if (main.dataset.mode !== mode || !OPS.$('usHead')) {
+            main.dataset.mode = mode;
+            main.innerHTML = '<div id="usHead"></div><div id="usBody"></div>';
+            OPS.$('usHead').innerHTML = headHtml;
+            return true;
+        }
+        return false;
+    }
+
+    function setBar() {
+        document.querySelectorAll('#usView [data-v]').forEach(b => b.classList.toggle('active', b.dataset.v === U.view));
+        document.querySelectorAll('#usPer [data-p]').forEach(b => b.classList.toggle('active', b.dataset.p === U.per));
+        const q = perQuery();
+        if (q.from) { OPS.$('usFrom').value = q.from; OPS.$('usTo').value = q.to; }
+    }
+
+    function periodText(p) {
+        if (!p) return '';
+        const span = p.all ? OPS.tx('All time (since {d})', {d: OPS.fmt(p.t0).slice(0, 10)}) :
+            OPS.tx('{a} – {b}', {a: OPS.fmt(p.t0).slice(0, 10), b: OPS.fmt(Math.min(p.t1, Date.now() / 1000) - 1).slice(0, 10)});
+        return OPS.t('Period: {p} · until {u} (Bhutan Time)', {p: span, u: OPS.fmt(p.until)}) + ' · ' +
+            OPS.t('a session counts on the day it ended');
+    }
+
+    async function load(quiet, fresh) {
+        if (!OPS.$('usMain')) return;
+        setBar();
+        const seq = ++U.seq;
+        const q = Object.assign(perQuery(), fresh ? {fresh: 1} : {});
+        let url;
+        if (U.open && U.open.type === 'customer') url = OPS.csvLink('/api/ops/usage/customer', Object.assign({}, q, U.open.q));
+        else if (U.open && U.open.type === 'station') url = OPS.csvLink('/api/ops/usage/station', Object.assign({}, q, {cp: U.open.cp}));
+        else if (U.view === 'stations') url = OPS.csvLink('/api/ops/usage/stations', q);
+        else url = OPS.csvLink('/api/ops/usage/customers', Object.assign({}, q, {sort: U.sort}, U.q ? {q: U.q} : {}));
+        if (!quiet) OPS.$('usMain').classList.add('ops-us-busy');
+        let d;
+        try { d = await OPS.api(url); } catch (e) {
+            OPS.$('usMain').classList.remove('ops-us-busy');
+            if (U.open && e.status === 404) { U.open = null; return load(); }
+            return OPS.fail(e);
+        }
+        if (seq !== U.seq) return;                       // an older answer never replaces a newer one
+        OPS.$('usMain').classList.remove('ops-us-busy');
+        OPS.$('usPeriod').innerHTML = periodText(d.period);
+        if (U.open && U.open.type === 'customer') renderCustomer(d);
+        else if (U.open && U.open.type === 'station') renderStation(d);
+        else if (U.view === 'stations') renderStations(d);
+        else renderCustomers(d);
+    }
+
+    function tile(cls, label, value, sub) {
+        return '<div class="kpi ' + cls + ' static"><span class="kpi-label">' + OPS.t(label) + '</span><span class="kpi-value">' + value +
+            '</span><span class="kpi-sub">' + (sub || '') + '</span></div>';
+    }
+
+    function exportLink(what, fmt, extra) {
+        return OPS.csvLink('/api/ops/usage/export', Object.assign({what: what, fmt: fmt}, perQuery(), extra || {}));
+    }
+    function exportBtns(what, extra, label) {
+        return '<a class="tb-btn" href="' + esc(exportLink(what, 'xlsx', extra)) + '">' + OPS.t(label ? label + ' Excel' : '📥 Excel') + '</a>' +
+            '<a class="tb-btn" href="' + esc(exportLink(what, 'csv', extra)) + '">' + OPS.t(label ? label + ' CSV' : '📥 CSV') + '</a>';
+    }
+
+    // ---- who a customer is
+    function whoName(w) {
+        if (!w) return '—';
+        if (w.walkin) return OPS.t(WALKIN[w.walkin] || w.walkin);
+        if (w.name) return esc(w.name) + (w.deleted ? ' <span class="muted">' + OPS.t('(deleted app account)') + '</span>' : '');
+        if (w.deleted) return OPS.t('Deleted app account');
+        if (w.card) return OPS.t('Card {c}', {c: w.card});
+        if (w.tag) return esc(w.tag);
+        if (w.kind === 'vehicle' && w.plates && w.plates.length) return esc(w.plates[0]);
+        if (w.kind === 'person' && w.phone) return esc(w.phone);
+        return '—';
+    }
+    function kindChip(k, w) {
+        if (k === 'walkin' && w && w.walkin && (w.walkin === 'overflow' || w.walkin.slice(0, 2) === 'r_')) return '<span class="ops-us-kind ops-us-k-sum">' + OPS.t('∑ Added up') + '</span>';
+        return '<span class="ops-us-kind ops-us-k-' + esc(k) + '">' + OPS.t(KIND[k] || k) + '</span>';
+    }
+    const plus = (n, more) => OPS.num(n, 0) + (more ? '+' : '');
+    function whoLine(w) {
+        const bits = [];
+        if (w.phone && !(w.kind === 'person' && !w.name)) bits.push('📞 ' + esc(w.phone));
+        (w.plates || []).slice(0, 2).forEach(p => bits.push('🚗 ' + esc(p)));
+        (w.orgs || []).slice(0, 1).forEach(o => bits.push('🏢 ' + esc(o)));
+        const cards = w.cards || [];
+        if (cards.length) bits.push('🎴 ' + cards.slice(0, 2).map(esc).join(', ') + (w.n_cards > 2 ? ' ' + OPS.t('+{n} more', {n: w.n_cards - 2}) : ''));
+        return bits.length ? '<div class="ops-us-sub">' + bits.join(' · ') + '</div>' : '';
+    }
+    function chans(ch) {
+        return Object.keys(ch || {}).sort((a, b) => ch[b] - ch[a]).map(k => '<span class="ops-us-ch">' + OPS.t(CH[k] || k) + ' ' + ch[k] + '</span>').join(' ');
+    }
+
+    // ---- customers list
+    function renderCustomers(d) {
+        U.data = d;
+        const t = d.totals || {}, can = d.can || {};
+        OPS.$('usTiles').innerHTML =
+            tile('info', 'Customers', OPS.num(t.customers, 0), can.merged ? OPS.t('{p}% of sessions with a known customer', {p: t.known_pct == null ? '—' : OPS.num(t.known_pct, 0)}) :
+                OPS.t('RFID card holders')) +
+            tile('info', 'Charging sessions', OPS.num(t.sessions, 0), OPS.t('{h} charging hours', {h: OPS.num(t.hours, 0)})) +
+            tile('good', 'Energy delivered', n1(t.kwh) + ' <small>kWh</small>', OPS.t('{n} kWh per session', {n: n1(t.avg)}));
+        const rows = d.rows || [];
+        const masked = rows.some(r => r.masked);
+        const fresh = frame('customers', '<div class="ops-head"><h3>' + OPS.t('👥 Customers') + '</h3><div class="ops-actions ops-filters">' +
+            '<input class="tb-inp" type="search" id="usQ" autocomplete="off" placeholder="' + esc(OPS.tx('Name, mobile, plate, card, organisation…')) + '" value="' + esc(U.q) + '">' +
+            '<label>' + OPS.t('Sort') + ' <select class="tb-sel" id="usSort">' + [['kwh', 'Energy'], ['sessions', 'Sessions'], ['last', 'Last charge'], ['hours', 'Charging hours'],
+                ['name', 'Name']].concat(can.payments ? [['amt', 'Spent']] : []).map(o => OPS.opt(o[0], o[1], U.sort === o[0])).join('') + '</select></label>' +
+            '<span id="usExp"></span></div></div>');
+        if (fresh) {
+            let qt = null;
+            OPS.$('usQ').addEventListener('input', () => { clearTimeout(qt); qt = setTimeout(() => { U.q = OPS.$('usQ').value.trim(); load(true); }, 400); });
+            OPS.$('usSort').onchange = () => { U.sort = OPS.$('usSort').value; load(); };
+        }
+        OPS.$('usExp').innerHTML = exportBtns('customers', U.q ? {q: U.q} : {});
+        OPS.$('usBody').innerHTML =
+            '<div class="pay-help">' + OPS.t(can.merged ? 'One row per customer: the BPC EV app account together with the RFID cards whose owner has the same mobile number, free charging and QR payments with that number.'
+                : 'Your role sees RFID card holders one by one; app, QR / cash and free-charging customers are added up in one row each.') +
+            (masked ? ' ' + OPS.t('🔒 names and numbers shortened for your role') : '') + '</div>' +
+            '<div class="muted ops-us-cnt">' + (d.total_rows > rows.length ? OPS.t('Showing {n} of {t} - refine the search or use the export', {n: rows.length, t: d.total_rows}) : OPS.t('{n} rows', {n: d.total_rows})) +
+            (d.partial ? ' · ' + OPS.t('⚠️ too many sessions - the oldest are not counted') : '') + '</div>' +
+            '<div class="ops-table-wrap ops-tall"><table class="fleet-table ops-table ops-cards ops-us-list" id="usList"><thead><tr><th>' + OPS.t('Customer') + '</th><th>' + OPS.t('Sessions') +
+            '</th><th>' + OPS.t('Energy kWh') + '</th><th>' + OPS.t('kWh per session') + '</th><th>' + OPS.t('Charging hours') + '</th>' +
+            (can.payments ? '<th>' + OPS.t('Spent') + '</th>' : '') + '<th>' + OPS.t('Stations') + '</th><th>' + OPS.t('Last charge') + '</th></tr></thead><tbody>' +
+            (rows.map(r => '<tr class="ops-us-row" data-key="' + esc(r.key) + '">' +
+                td('Customer', '<b>' + whoName(r) + '</b> ' + kindChip(r.kind, r) + whoLine(r) + '<div class="ops-us-chs">' + chans(r.channels) + '</div>') +
+                td('Sessions', OPS.num(r.sessions, 0)) + td('Energy kWh', '<b>' + n1(r.kwh) + '</b>') + td('kWh per session', n1(r.avg)) + td('Charging hours', hrs(r.hours)) +
+                (can.payments ? td('Spent', r.amt == null ? '<span class="muted">—</span>' : money(r.amt, r.cur)) : '') +
+                td('Stations', r.stations) + td('Last charge', r.last ? OPS.fmt(r.last) + '<br><span class="muted">' + esc(r.last_name || r.last_cp) + '</span>' : '—') + '</tr>').join('') ||
+                '<tr><td colspan="8" class="muted">' + OPS.t(U.q ? 'Nothing found' : 'No charging sessions in this period') + '</td></tr>') + '</tbody></table></div>';
+    }
+
+    function monthsSeries(months) {
+        if (!months || !months.length) return [];
+        const out = [], have = {};
+        months.forEach(m => { have[m.month] = m; });
+        let [y, mo] = months[0].month.split('-').map(Number);
+        const [y1, m1] = months[months.length - 1].month.split('-').map(Number);
+        while ((y < y1 || (y === y1 && mo <= m1)) && out.length < 120) {
+            const k = y + '-' + OPS.pad(mo);
+            const m = have[k] || {month: k, sessions: 0, kwh: 0};
+            out.push(m);
+            mo += 1; if (mo > 12) { mo = 1; y += 1; }
+        }
+        return out.slice(-36);
+    }
+
+    function sessRows(list, can, withWho) {
+        return list.map(s => '<tr>' +
+            td('Start (BTT)', '<span class="ops-nowrap">' + OPS.fmt(s.start) + '</span><br><span class="muted">' + OPS.t('until {t}', {t: OPS.fmt(s.stop).slice(11)}) + '</span>') +
+            (withWho ? td('Customer', s.who ? '<a href="#" class="ops-us-who" data-key="' + esc(s.who.key) + '">' + whoName(s.who) + '</a> ' + kindChip(s.who.kind, s.who) : '—') :
+                td('Station', esc(s.name || s.cp) + (s.name ? '<br><span class="muted">' + esc(s.cp) + '</span>' : ''))) +
+            td('Connector', esc(s.c)) + td('How', OPS.t(CH[s.channel] || s.channel) + (s.card ? '<br><span class="ops-rf-tag">' + esc(s.card) + '</span>' : (s.tag && s.channel !== 'none' ? '<br><span class="muted">' + esc(s.tag) + '</span>' : ''))) +
+            td('Duration', OPS.dur(s.dur)) + td('Energy kWh', '<b>' + n2(s.kwh) + '</b>' + (s.suspect ? ' ⚠️' : '')) + td('Peak kW', n1(s.max_kw)) +
+            (can.payments ? td('Amount', s.amt == null ? '<span class="muted">—</span>' : money(s.amt, s.cur)) : '') +
+            td('Stop reason', esc(s.reason) || '<span class="muted">—</span>') + '</tr>').join('');
+    }
+    function sessHead(can, withWho) {
+        return '<thead><tr><th>' + OPS.t('Start (BTT)') + '</th><th>' + OPS.t(withWho ? 'Customer' : 'Station') + '</th><th>#</th><th>' + OPS.t('How') + '</th><th>' +
+            OPS.t('Duration') + '</th><th>' + OPS.t('Energy kWh') + '</th><th>' + OPS.t('Peak kW') + '</th>' + (can.payments ? '<th>' + OPS.t('Amount') + '</th>' : '') +
+            '<th>' + OPS.t('Stop reason') + '</th></tr></thead>';
+    }
+    const wOf = id => { const el = OPS.$(id); return el && el.clientWidth ? el.clientWidth : 640; };
+
+    // ---- one customer
+    function renderCustomer(d) {
+        U.det = d;
+        OPS.$('usMain').dataset.mode = '';
+        const c = d.customer || {}, can = d.can || {};
+        OPS.$('usTiles').innerHTML =
+            tile('info', 'Charging sessions', OPS.num(c.sessions, 0), OPS.t('{h} charging hours', {h: OPS.num(c.hours, 1)})) +
+            tile('good', 'Energy delivered', n1(c.kwh) + ' <small>kWh</small>', OPS.t('{n} kWh per session', {n: n1(c.avg)})) +
+            (can.payments ? tile('info', 'Spent', c.amt == null ? '—' : money(c.amt, c.cur), OPS.t('payments in this period')) : '') +
+            tile('info', 'Stations', OPS.num(c.stations, 0), c.last ? OPS.t('last: {t}', {t: OPS.fmt(c.last)}) : '') +
+            tile('info', 'First charge', c.first ? OPS.fmt(c.first).slice(0, 10) : '—', c.last ? OPS.t('last: {t}', {t: OPS.fmt(c.last).slice(0, 10)}) : '');
+        const ms = monthsSeries(d.months);
+        const extra = U.open.q;
+        OPS.$('usMain').innerHTML = '<div class="ops-head"><div class="ops-us-title"><button class="tb-btn" data-act="back">' + OPS.t('⬅️ All customers') + '</button>' +
+            '<h3>' + whoName(c) + ' ' + kindChip(c.kind, c) + '</h3></div><div class="ops-actions">' + exportBtns('customer', extra, '📥 Sessions') + '</div></div>' +
+            whoLine(c) + '<div class="ops-us-chs">' + chans(c.channels) + '</div>' + (c.masked ? '<div class="pay-help">' + OPS.t('🔒 names and numbers shortened for your role') + '</div>' : '') +
+            (c.sessions ? '' : '<div class="pay-help">' + OPS.t('No charging sessions in this period') + '</div>') +
+            '<div class="ops-charts ops-us-charts"><section class="ops-chartbox"><h4>' + OPS.t('Energy per month (kWh)') + '</h4><div id="usMon"></div></section>' +
+            '<section class="ops-chartbox"><h4>' + OPS.t('Stations used') + '</h4><div class="ops-table-wrap"><table class="fleet-table ops-table"><thead><tr><th>' + OPS.t('Station') +
+            '</th><th>' + OPS.t('Sessions') + '</th><th>' + OPS.t('Energy kWh') + '</th></tr></thead><tbody>' + (d.stations || []).slice(0, 12).map(s => '<tr><td>' +
+                '<a href="#" class="ops-us-st" data-cp="' + esc(s.cp) + '">' + esc(s.name || s.cp) + '</a>' + (s.name ? ' <span class="muted">' + esc(s.cp) + '</span>' : '') + '</td><td>' + s.sessions +
+                '</td><td>' + n1(s.kwh) + '</td></tr>').join('') + '</tbody></table></div>' +
+            ((d.cards || []).length ? '<h4>' + OPS.t('RFID cards') + '</h4><div class="ops-table-wrap"><table class="fleet-table ops-table"><thead><tr><th>' + OPS.t('Card') +
+                '</th><th>' + OPS.t('Sessions') + '</th><th>' + OPS.t('Energy kWh') + '</th></tr></thead><tbody>' + d.cards.slice(0, 12).map(x => '<tr><td class="ops-rf-tag">' + esc(x.card) +
+                '</td><td>' + x.sessions + '</td><td>' + n1(x.kwh) + '</td></tr>').join('') + '</tbody></table></div>' : '') + '</section></div>' +
+            '<h4>' + OPS.t('Sessions') + '</h4>' + (d.more ? '<div class="muted">' + OPS.t('Showing the newest {n} of {t} sessions - the export has them all', {n: (d.sessions || []).length, t: c.sessions}) + '</div>' : '') +
+            '<div class="ops-table-wrap ops-tall"><table class="fleet-table ops-table ops-cards">' + sessHead(can, false) + '<tbody>' +
+            (sessRows(d.sessions || [], can, false) || '<tr><td colspan="9" class="muted">' + OPS.t('No charging sessions in this period') + '</td></tr>') + '</tbody></table></div>';
+        OPS.$('usMon').innerHTML = ms.length ? OPS.vbars(ms.map(m => ({label: m.month.slice(2).replace('-', '/'), value: m.kwh,
+            tip: m.month + ' · ' + OPS.num(m.kwh, 1) + ' kWh · ' + OPS.tx('{n} sessions', {n: m.sessions})})), {aria: OPS.tx('Energy per month (kWh)'), w: wOf('usMon')}) :
+            '<div class="muted">' + OPS.t('No data yet') + '</div>';
+    }
+
+    // ---- stations
+    function cellColor(kwh, max) {
+        if (!(kwh > 0) || !(max > 0)) return null;
+        const i = Math.min(RAMP.length - 1, Math.floor(Math.sqrt(kwh / max) * RAMP.length - 1e-9));
+        return [RAMP[Math.max(0, i)], i >= 3 ? '#fff' : '#0f172a'];
+    }
+    function renderStations(d) {
+        U.data = d;
+        OPS.$('usMain').dataset.mode = '';
+        const t = d.totals || {};
+        OPS.$('usTiles').innerHTML =
+            tile('info', 'Stations', OPS.num(t.active, 0) + ' <small>/ ' + OPS.num(t.stations, 0) + '</small>', OPS.t('with sessions in this period')) +
+            tile('info', 'Charging sessions', OPS.num(t.sessions, 0), '') +
+            tile('good', 'Energy delivered', n1(t.kwh) + ' <small>kWh</small>', OPS.t('{n} kWh per session', {n: n1(t.avg)}));
+        const modes = [['summary', '📋 Summary'], ['days', '📅 Day by day']];
+        let body;
+        if (U.svMode === 'days') {
+            const days = d.days || [];
+            let max = 0;
+            Object.values(d.cells || {}).forEach(r => Object.values(r).forEach(v => { if (v[1] > max) max = v[1]; }));
+            body = (d.days_cut ? '<div class="muted">' + OPS.t('Showing the last {n} days of the period - the export has every day', {n: days.length}) + '</div>' : '') +
+                '<div class="ops-table-wrap ops-us-mwrap"><table class="ops-us-matrix"><thead><tr><th class="ops-us-sticky">' + OPS.t('Station') + '</th>' +
+                days.map(x => '<th class="' + (new Date(x + 'T00:00:00Z').getUTCDay() % 6 === 0 ? 'ops-us-we' : '') + '" title="' + esc(x) + '">' + esc(x.slice(8)) +
+                    (x.slice(8) === '01' || x === days[0] ? '<br><span>' + esc(x.slice(5, 7)) + '</span>' : '<br><span>&nbsp;</span>') + '</th>').join('') +
+                '<th>' + OPS.t('Total') + '</th></tr></thead><tbody>' +
+                (d.rows || []).map(r => {
+                    const row = (d.cells || {})[r.cp] || {};
+                    return '<tr><th class="ops-us-sticky"><a href="#" class="ops-us-st" data-cp="' + esc(r.cp) + '">' + esc(r.name || r.cp) + '</a>' +
+                        (r.name ? '<span class="muted">' + esc(r.cp) + '</span>' : '') + '</th>' + days.map(x => {
+                            const v = row[x];
+                            if (!v) return '<td></td>';
+                            const col = cellColor(v[1], max);
+                            return '<td class="ops-us-cell" data-cp="' + esc(r.cp) + '" data-day="' + esc(x) + '" style="background:' + col[0] + ';color:' + col[1] + '" title="' +
+                                esc(OPS.tx('{st} · {d}: {n} sessions · {k} kWh · {a} kWh per session', {st: r.name || r.cp, d: x, n: v[0], k: OPS.num(v[1], 1), a: OPS.num(v[1] / v[0], 1)})) +
+                                '">' + v[0] + '</td>';
+                        }).join('') + '<td class="ops-us-tot"><b>' + r.sessions + '</b><br><span class="muted">' + n1(r.kwh) + '</span></td></tr>';
+                }).join('') + '</tbody></table></div>' +
+                '<div class="ops-us-legend">' + OPS.t('Number = sessions; colour = energy (kWh) of that day, darker = more') + ' ' +
+                RAMP.map(c => '<i style="background:' + c + '"></i>').join('') + '</div>';
+        } else {
+            body = '<div class="ops-table-wrap ops-tall"><table class="fleet-table ops-table ops-cards"><thead><tr><th>' + OPS.t('Station') + '</th><th>' + OPS.t('Sessions') + '</th><th>' +
+                OPS.t('Energy kWh') + '</th><th>' + OPS.t('kWh per session') + '</th><th>' + OPS.t('Charging hours') + '</th><th>' + OPS.t('Active days') + '</th><th>' +
+                OPS.t('Busiest day') + '</th><th>' + OPS.t('Cards / payers') + '</th><th>' + OPS.t('Last session') + '</th></tr></thead><tbody>' +
+                ((d.rows || []).map(r => '<tr class="ops-us-row" data-cp="' + esc(r.cp) + '">' +
+                    td('Station', '<b>' + esc(r.name || r.cp) + '</b>' + (r.name ? '<br><span class="muted">' + esc(r.cp) + '</span>' : '')) + td('Sessions', OPS.num(r.sessions, 0)) +
+                    td('Energy kWh', '<b>' + n1(r.kwh) + '</b>') + td('kWh per session', n1(r.avg)) + td('Charging hours', hrs(r.hours)) + td('Active days', r.active_days) +
+                    td('Busiest day', r.best ? esc(r.best.day) + '<br><span class="muted">' + OPS.t('{n} sessions · {k} kWh', {n: r.best.sessions, k: OPS.num(r.best.kwh, 1)}) + '</span>' : '—') +
+                    td('Cards / payers', plus(r.users, r.users_more)) + td('Last session', r.last ? OPS.fmt(r.last) : '—') + '</tr>').join('') ||
+                    '<tr><td colspan="9" class="muted">' + OPS.t('No stations yet') + '</td></tr>') + '</tbody></table></div>';
+        }
+        OPS.$('usMain').innerHTML = '<div class="ops-head"><h3>' + OPS.t('🏪 Stations') + '</h3><div class="ops-actions"><span class="ops-seg" id="usSv">' +
+            modes.map(m => '<button class="chip' + (U.svMode === m[0] ? ' active' : '') + '" data-sv="' + m[0] + '">' + OPS.t(m[1]) + '</button>').join('') + '</span>' +
+            exportBtns('stations', {}, '📥 Daily by charger') + '</div></div>' + body;
+    }
+
+    function renderStation(d) {
+        U.det = d;
+        OPS.$('usMain').dataset.mode = '';
+        const t = d.totals || {}, can = d.can || {};
+        OPS.$('usTiles').innerHTML =
+            tile('info', 'Charging sessions', OPS.num(t.sessions, 0), OPS.t('{n} active days', {n: t.active_days})) +
+            tile('good', 'Energy delivered', n1(t.kwh) + ' <small>kWh</small>', OPS.t('{n} kWh per session', {n: n1(t.avg)})) +
+            tile('info', 'Charging hours', hrs(t.hours), OPS.t('peak {k} kW', {k: n1(t.max_kw)})) +
+            tile('info', 'Cards / payers', plus(t.users, t.users_more), '');
+        const days = d.days || [];
+        const byDay = {};
+        (d.sessions || []).forEach(s => { const k = OPS.fmt(s.stop).slice(0, 10); (byDay[k] = byDay[k] || []).push(s); });
+        const chart = days.slice(0, 92).slice().reverse();
+        OPS.$('usMain').innerHTML = '<div class="ops-head"><div class="ops-us-title"><button class="tb-btn" data-act="back">' + OPS.t('⬅️ All stations') + '</button>' +
+            '<h3>' + esc(d.name || d.cp) + (d.name ? ' <span class="muted">' + esc(d.cp) + '</span>' : '') + '</h3></div><div class="ops-actions">' +
+            exportBtns('station', {cp: d.cp, part: 'days'}, '📥 Days') + exportBtns('station', {cp: d.cp}, '📥 Sessions') + '</div></div>' +
+            ((d.connectors || []).length ? '<div class="ops-us-chs">' + d.connectors.map(c => '<span class="ops-us-ch">' + OPS.t('Connector {c}: {n} sessions · {k} kWh', {c: c.c, n: c.sessions, k: OPS.num(c.kwh, 1)}) + '</span>').join(' ') + '</div>' : '') +
+            '<div class="ops-charts ops-us-charts"><section class="ops-chartbox"><h4>' + OPS.t('Energy per day (kWh)') + '</h4><div id="usDayE"></div></section>' +
+            '<section class="ops-chartbox"><h4>' + OPS.t('Sessions per day') + '</h4><div id="usDayN"></div></section></div>' +
+            (d.more ? '<div class="muted">' + OPS.t('Sessions of the newest {n} are listed - the export has them all', {n: (d.sessions || []).length}) + '</div>' : '') +
+            '<div class="ops-table-wrap ops-tall"><table class="fleet-table ops-table ops-cards ops-us-days"><thead><tr><th>' + OPS.t('Day') + '</th><th>' + OPS.t('Sessions') + '</th><th>' +
+            OPS.t('Energy kWh') + '</th><th>' + OPS.t('kWh per session') + '</th><th>' + OPS.t('Smallest / largest') + '</th><th>' + OPS.t('Charging hours') + '</th><th>' +
+            OPS.t('Peak kW') + '</th><th>' + OPS.t('Cards / payers') + '</th></tr></thead><tbody>' +
+            (days.map(x => {
+                const open = U.day === x.day && x.sessions;
+                const head = '<tr class="ops-us-day' + (x.sessions ? ' has' : ' none') + (open ? ' open' : '') + '" data-day="' + esc(x.day) + '">' +
+                    td('Day', (x.sessions ? (open ? '▾ ' : '▸ ') : '') + '<b>' + esc(x.day) + '</b>') + td('Sessions', x.sessions) + td('Energy kWh', x.sessions ? '<b>' + n1(x.kwh) + '</b>' : '—') +
+                    td('kWh per session', x.sessions ? n1(x.avg) : '—') + td('Smallest / largest', x.sessions ? n1(x.min) + ' / ' + n1(x.max) : '—') +
+                    td('Charging hours', x.sessions ? hrs(x.hours) : '—') + td('Peak kW', x.sessions ? n1(x.max_kw) : '—') + td('Cards / payers', x.sessions ? x.users : '—') + '</tr>';
+                if (!open) return head;
+                const list = byDay[x.day] || [];
+                return head + '<tr class="ops-us-dayx"><td colspan="8"><div class="ops-table-wrap"><table class="fleet-table ops-table ops-cards">' + sessHead(can, true) + '<tbody>' +
+                    (sessRows(list, can, true) || '<tr><td colspan="9" class="muted">' + OPS.t('Not in the listed sessions - use the export') + '</td></tr>') + '</tbody></table></div></td></tr>';
+            }).join('') || '<tr><td colspan="8" class="muted">' + OPS.t('No charging sessions in this period') + '</td></tr>') + '</tbody></table></div>';
+        const lab = s => s.slice(5).replace('-', '/');
+        OPS.$('usDayE').innerHTML = chart.length ? OPS.vbars(chart.map(x => ({label: lab(x.day), value: x.kwh, tip: x.day + ' · ' + OPS.num(x.kwh, 1) + ' kWh'})),
+            {aria: OPS.tx('Energy per day (kWh)'), w: wOf('usDayE')}) : '<div class="muted">' + OPS.t('No data yet') + '</div>';
+        OPS.$('usDayN').innerHTML = chart.length ? OPS.vbars(chart.map(x => ({label: lab(x.day), value: x.sessions, tip: x.day + ' · ' + OPS.tx('{n} sessions', {n: x.sessions})})),
+            {aria: OPS.tx('Sessions per day'), w: wOf('usDayN')}) : '';
+        if (U.day) { const el = OPS.$('usMain').querySelector('tr.ops-us-day.open'); if (el && el.scrollIntoView) el.scrollIntoView({block: 'nearest'}); }
+    }
+
+    function onClick(e) {
+        const back = e.target.closest('[data-act="back"]');
+        if (back) { U.open = null; U.day = null; return load(); }
+        const sv = e.target.closest('[data-sv]');
+        if (sv) { U.svMode = sv.dataset.sv; return renderStations(U.data); }
+        const who = e.target.closest('a.ops-us-who');
+        if (who) { e.preventDefault(); U.view = 'customers'; U.open = {type: 'customer', q: {key: who.dataset.key}}; return load(); }
+        const st = e.target.closest('a.ops-us-st');
+        if (st) { e.preventDefault(); U.view = 'stations'; U.day = null; U.open = {type: 'station', cp: st.dataset.cp}; return load(); }
+        const cell = e.target.closest('td.ops-us-cell');
+        if (cell) { U.open = {type: 'station', cp: cell.dataset.cp}; U.day = cell.dataset.day; return load(); }
+        const day = e.target.closest('tr.ops-us-day.has');
+        if (day && U.det) { U.day = U.day === day.dataset.day ? null : day.dataset.day; return renderStation(U.det); }
+        if (e.target.closest('a, button, input, select')) return;
+        const row = e.target.closest('tr.ops-us-row');
+        if (!row) return;
+        if (row.dataset.key) { U.open = {type: 'customer', q: {key: row.dataset.key}}; return load(); }
+        if (row.dataset.cp) { U.day = null; U.open = {type: 'station', cp: row.dataset.cp}; return load(); }
+    }
+
+    // ---- links from the other tabs: Customers (app account), RFID Cards (card), the station drawer
+    function openTab() {
+        try { if (typeof closeDrawer === 'function') closeDrawer(); } catch (e) {}
+        if (typeof showTab === 'function') showTab('usage');
+    }
+    OPS.usageCustomer = function (o) {
+        U.view = 'customers';
+        U.open = {type: 'customer', q: o.cid ? {cid: o.cid} : {card: o.card}};
+        if (OPS.active === 'usage') load(); else openTab();
+    };
+    OPS.usageStation = function (cp) {
+        if (!cp) return;
+        U.view = 'stations';
+        U.day = null;
+        U.open = {type: 'station', cp: cp};
+        if (OPS.active === 'usage') load(); else openTab();
+    };
+
+    OPS.register({tab: 'usage', perm: 'view',
+        show: () => { const v = OPS.$('view-usage'); if (v && !v.dataset.built) build(v); load(); },
+        refresh: () => load(true),
+        relang: () => { const v = OPS.$('view-usage'); if (v) { v.dataset.built = ''; build(v); load(true); } }});
+
+    OPS.addI18n({
+        '📜 Charging history': ['📜 གློག་བསྒར་གྱི་ལོ་རྒྱུས་', '📜 ประวัติการชาร์จ'],
+        '👥 Customers': ['👥 ཉོ་མཁན་ཚུ་', '👥 ลูกค้า'], '🏪 Stations': ['🏪 ས་ཚིགས་ཚུ་', '🏪 สถานี'],
+        '30 days': ['ཉིན་ ༣༠', '30 วัน'], '90 days': ['ཉིན་ ༩༠', '90 วัน'], 'This year': ['ལོ་འདི་', 'ปีนี้'], 'All time': ['ག་ར་', 'ทั้งหมด'],
+        'From': ['ལས་', 'จาก'], 'To': ['ཚུན་', 'ถึง'],
+        'All time (since {d})': ['ག་ར་ ({d} ལས་)', 'ทั้งหมด (ตั้งแต่ {d})'], '{a} – {b}': ['{a} – {b}', '{a} – {b}'],
+        'Period: {p} · until {u} (Bhutan Time)': ['དུས་ཡུན་: {p} · {u} ཚུན་ (འབྲུག་གི་ཆུ་ཚོད་)', 'ช่วงเวลา: {p} · ถึง {u} (เวลาภูฏาน)'],
+        'a session counts on the day it ended': ['ལཱ་ཡུན་རེ་ མཇུག་བསྡུ་མི་ཉིན་མ་ལུ་ བརྩི་', 'นับเซสชันในวันที่ชาร์จเสร็จ'],
+        'Customers': ['ཉོ་མཁན་', 'ลูกค้า'], '{p}% of sessions with a known customer': ['ཉོ་མཁན་ངོ་ཤེས་པའི་ལཱ་ཡུན་ {p}%', 'เซสชันที่รู้ว่าเป็นลูกค้าคนไหน {p}%'],
+        'Charging sessions': ['གློག་བསྒར་གྱི་ལཱ་ཡུན་', 'จำนวนเซสชัน'], '{h} charging hours': ['གློག་བསྒར་ཆུ་ཚོད་ {h}', 'ชาร์จรวม {h} ชั่วโมง'],
+        'Energy delivered': ['གློག་ཤུགས་སྤྲོད་ཡོདཔ་', 'พลังงานที่จ่าย'], '{n} kWh per session': ['ལཱ་ཡུན་རེ་ལུ་ kWh {n}', '{n} kWh ต่อเซสชัน'],
+        'Name, mobile, plate, card, organisation…': ['མིང་ ཁ་པར་ ཨང་རྟགས་ ཤོག་བྱང་ ལས་སྡེ་…', 'ชื่อ เบอร์โทร ทะเบียนรถ บัตร หน่วยงาน…'],
+        'Sort': ['རིམ་སྒྲིག་', 'เรียงตาม'], 'Energy': ['གློག་ཤུགས་', 'พลังงาน'], 'Sessions': ['ལཱ་ཡུན་', 'เซสชัน'], 'Last charge': ['མཇུག་གི་གློག་བསྒར་', 'ชาร์จครั้งล่าสุด'],
+        'Charging hours': ['གློག་བསྒར་ཆུ་ཚོད་', 'ชั่วโมงชาร์จ'], 'Name': ['མིང་', 'ชื่อ'], 'Spent': ['སོང་ཟད་', 'ยอดจ่าย'],
+        'One row per customer: the BPC EV app account together with the RFID cards whose owner has the same mobile number, free charging and QR payments with that number.':
+            ['ཉོ་མཁན་རེ་ལུ་ གྲལ་ཐིག་གཅིག་: BPC EV app གི་རྩིས་ཐོ་དང་ ཁ་པར་ཨང་གཅིག་པའི་ RFID ཤོག་བྱང་ཚུ་ རིན་མེད་གློག་བསྒར་ དེ་ལས་ QR དངུལ་སྤྲོད་ཚུ་ མཉམ་སྡེབ་',
+                'ลูกค้าหนึ่งคนต่อหนึ่งแถว: บัญชีแอป BPC EV รวมกับบัตร RFID ที่เจ้าของใช้เบอร์โทรเดียวกัน การชาร์จฟรีและการจ่ายด้วย QR ที่ใช้เบอร์นั้น'],
+        '🔒 names and numbers shortened for your role': ['🔒 ཁྱོད་ཀྱི་འགན་ཁུར་ལུ་ མིང་དང་ཨང་ཚུ་ ཐུང་ཀུ་བཟོ་ཡོད་', '🔒 ชื่อและหมายเลขแสดงแบบย่อตามบทบาทของคุณ'],
+        'Showing {n} of {t} - refine the search or use the export': ['{t} ལས་ {n} སྟོན་དོ་ - འཚོལ་ཞིབ་ཁ་གསལ་བཟོ་ ཡང་ན་ ཕྱིར་འདྲེན་ལག་ལེན་འཐབ་', 'แสดง {n} จาก {t} - ค้นหาให้แคบลงหรือใช้ไฟล์ส่งออก'],
+        '{n} rows': ['གྲལ་ཐིག་ {n}', '{n} แถว'], '⚠️ too many sessions - the oldest are not counted': ['⚠️ ལཱ་ཡུན་མང་དྲགས་ - རྙིངམ་ཚུ་ མ་བརྩི་', '⚠️ เซสชันมากเกินไป - ไม่ได้นับรายการที่เก่าที่สุด'],
+        'Customer': ['ཉོ་མཁན་', 'ลูกค้า'], 'Energy kWh': ['གློག་ཤུགས་ kWh', 'พลังงาน kWh'], 'kWh per session': ['ལཱ་ཡུན་རེ་ལུ་ kWh', 'kWh ต่อเซสชัน'], 'Stations': ['ས་ཚིགས་', 'สถานี'],
+        'Nothing found': ['ག་ནི་ཡང་མ་ཐོབ་', 'ไม่พบข้อมูล'], 'No charging sessions in this period': ['དུས་ཡུན་འདི་ནང་ གློག་བསྒར་གྱི་ལཱ་ཡུན་མེད་', 'ไม่มีการชาร์จในช่วงเวลานี้'],
+        '📱 App account': ['📱 App རྩིས་ཐོ་', '📱 บัญชีแอป'], '👤 Customer (mobile)': ['👤 ཉོ་མཁན་ (ཁ་པར་)', '👤 ลูกค้า (เบอร์โทร)'], '🎴 RFID card': ['🎴 RFID ཤོག་བྱང་', '🎴 บัตร RFID'],
+        '🚗 Vehicle': ['🚗 འཁོར་ལོ་', '🚗 รถ'], '🏷️ idTag': ['🏷️ idTag', '🏷️ idTag'], '🚶 Walk-in': ['🚶 ཐད་ཀར་འོང་མི་', '🚶 ลูกค้าทั่วไป'],
+        '📱 App': ['📱 App', '📱 แอป'], '📷 QR payment': ['📷 QR དངུལ་སྤྲོད་', '📷 จ่ายด้วย QR'], '🎴 Card': ['🎴 ཤོག་བྱང་', '🎴 บัตร'], '🎟️ Free': ['🎟️ རིན་མེད་', '🎟️ ฟรี'],
+        '🚗 Autocharge': ['🚗 Autocharge', '🚗 Autocharge'], '🏷️ Other idTag': ['🏷️ idTag གཞན་', '🏷️ idTag อื่น'], '— No idTag': ['— idTag མེད་', '— ไม่มี idTag'],
+        'QR payments without contact details': ['འབྲེལ་བ་འཐབ་སའི་ཁ་གསལ་མེད་པའི་ QR དངུལ་སྤྲོད་', 'การจ่ายด้วย QR ที่ไม่มีข้อมูลติดต่อ'],
+        'Free charging without contact details': ['འབྲེལ་བ་འཐབ་སའི་ཁ་གསལ་མེད་པའི་ རིན་མེད་གློག་བསྒར་', 'การชาร์จฟรีที่ไม่มีข้อมูลติดต่อ'],
+        'Sessions without an idTag': ['idTag མེད་པའི་ལཱ་ཡུན་', 'เซสชันที่ไม่มี idTag'], '(deleted app account)': ['(བཏོན་བཏང་ཡོད་པའི་ app རྩིས་ཐོ་)', '(บัญชีแอปที่ลบแล้ว)'],
+        'Deleted app account': ['བཏོན་བཏང་ཡོད་པའི་ app རྩིས་ཐོ་', 'บัญชีแอปที่ลบแล้ว'], 'Card {c}': ['ཤོག་བྱང་ {c}', 'บัตร {c}'], '+{n} more': ['+{n} ཡང་', '+อีก {n}'],
+        '⬅️ All customers': ['⬅️ ཉོ་མཁན་ག་ར་', '⬅️ ลูกค้าทั้งหมด'], '⬅️ All stations': ['⬅️ ས་ཚིགས་ག་ར་', '⬅️ สถานีทั้งหมด'],
+        '📥 Sessions Excel': ['📥 ལཱ་ཡུན་ Excel', '📥 เซสชัน Excel'], '📥 Sessions CSV': ['📥 ལཱ་ཡུན་ CSV', '📥 เซสชัน CSV'],
+        '📥 Days Excel': ['📥 ཉིན་ Excel', '📥 รายวัน Excel'], '📥 Days CSV': ['📥 ཉིན་ CSV', '📥 รายวัน CSV'],
+        '📥 Daily by charger Excel': ['📥 གློག་བསྒར་འཕྲུལ་ཆས་རེ་རེའི་ཉིན་བསྟར་ Excel', '📥 รายวันแยกตู้ Excel'],
+        '📥 Daily by charger CSV': ['📥 གློག་བསྒར་འཕྲུལ་ཆས་རེ་རེའི་ཉིན་བསྟར་ CSV', '📥 รายวันแยกตู้ CSV'],
+        'payments in this period': ['དུས་ཡུན་འདི་ནང་གི་ དངུལ་སྤྲོད་', 'การจ่ายเงินในช่วงเวลานี้'], 'last: {t}': ['མཇུག་: {t}', 'ล่าสุด: {t}'], 'First charge': ['དང་པོའི་གློག་བསྒར་', 'ชาร์จครั้งแรก'],
+        'Energy per month (kWh)': ['ཟླ་རེའི་གློག་ཤུགས་ (kWh)', 'พลังงานรายเดือน (kWh)'], 'Stations used': ['ལག་ལེན་འཐབ་མི་ས་ཚིགས་', 'สถานีที่ใช้'],
+        'RFID cards': ['RFID ཤོག་བྱང་ཚུ་', 'บัตร RFID'], 'Card': ['ཤོག་བྱང་', 'บัตร'], 'Station': ['ས་ཚིགས་', 'สถานี'],
+        'Showing the newest {n} of {t} sessions - the export has them all': ['ལཱ་ཡུན་ {t} ལས་ གསརཔ་ {n} སྟོན་དོ་ - ཕྱིར་འདྲེན་ནང་ ག་ར་ཡོད་', 'แสดง {n} เซสชันล่าสุดจาก {t} - ไฟล์ส่งออกมีครบทุกรายการ'],
+        'until {t}': ['{t} ཚུན་', 'ถึง {t}'], 'How': ['ག་དེ་སྦེ་', 'ช่องทาง'], 'Amount': ['དངུལ་འབོར་', 'จำนวนเงิน'], 'Connector': ['མཐུད་བྱེད་', 'หัวชาร์จ'],
+        'Start (BTT)': ['འགོ་བཙུགས་ (BTT)', 'เริ่ม (BTT)'], 'Duration': ['ཡུན་ཚད་', 'ระยะเวลา'], 'Peak kW': ['མཐོ་ཤོས་ kW', 'kW สูงสุด'], 'Stop reason': ['བཀག་པའི་རྒྱུ་མཚན་', 'เหตุผลที่หยุด'],
+        'No data yet': ['ད་ལྟོ་ཚུན་ གནད་སྡུད་མེད་', 'ยังไม่มีข้อมูล'],
+        'with sessions in this period': ['དུས་ཡུན་འདི་ནང་ ལཱ་ཡུན་ཡོད་མི་', 'ที่มีการชาร์จในช่วงเวลานี้'],
+        '📋 Summary': ['📋 བཅུད་བསྡུས་', '📋 สรุป'], '📅 Day by day': ['📅 ཉིན་རེ་བཞིན་', '📅 รายวัน'],
+        'Showing the last {n} days of the period - the export has every day': ['དུས་ཡུན་གྱི་ མཇུག་གི་ཉིན་ {n} སྟོན་དོ་ - ཕྱིར་འདྲེན་ནང་ ཉིན་ག་ར་ཡོད་', 'แสดง {n} วันสุดท้ายของช่วงเวลา - ไฟล์ส่งออกมีครบทุกวัน'],
+        'Total': ['བསྡོམས་', 'รวม'], '{st} · {d}: {n} sessions · {k} kWh · {a} kWh per session': ['{st} · {d}: ལཱ་ཡུན་ {n} · kWh {k} · ལཱ་ཡུན་རེ་ལུ་ kWh {a}', '{st} · {d}: {n} เซสชัน · {k} kWh · {a} kWh ต่อเซสชัน'],
+        'Number = sessions; colour = energy (kWh) of that day, darker = more': ['ཨང་ = ལཱ་ཡུན་; ཚོས་གཞི་ = ཉིན་དེའི་གློག་ཤུགས་ (kWh), ནག་ཐོམ་ = མང་བ་', 'ตัวเลข = จำนวนเซสชัน; สี = พลังงาน (kWh) ของวันนั้น ยิ่งเข้มยิ่งมาก'],
+        'Active days': ['ལཱ་འབད་ཉིན་', 'วันที่มีการชาร์จ'], 'Busiest day': ['ལཱ་མང་ཤོས་ཉིན་', 'วันที่ชาร์จมากที่สุด'], 'Cards / payers': ['ཤོག་བྱང་ / དངུལ་སྤྲོད་མི་', 'บัตร / ผู้จ่าย'],
+        'Last session': ['མཇུག་གི་ལཱ་ཡུན་', 'เซสชันล่าสุด'], '{n} sessions · {k} kWh': ['ལཱ་ཡུན་ {n} · kWh {k}', '{n} เซสชัน · {k} kWh'], 'No stations yet': ['ད་ལྟོ་ཚུན་ ས་ཚིགས་མེད་', 'ยังไม่มีสถานี'],
+        '{n} active days': ['ལཱ་འབད་ཉིན་ {n}', 'ชาร์จ {n} วัน'], 'peak {k} kW': ['མཐོ་ཤོས་ kW {k}', 'สูงสุด {k} kW'],
+        'Connector {c}: {n} sessions · {k} kWh': ['མཐུད་བྱེད་ {c}: ལཱ་ཡུན་ {n} · kWh {k}', 'หัวชาร์จ {c}: {n} เซสชัน · {k} kWh'],
+        'Energy per day (kWh)': ['ཉིན་རེའི་གློག་ཤུགས་ (kWh)', 'พลังงานรายวัน (kWh)'], 'Sessions per day': ['ཉིན་རེའི་ལཱ་ཡུན་', 'เซสชันรายวัน'],
+        'Sessions of the newest {n} are listed - the export has them all': ['གསརཔ་ {n} གི་ ལཱ་ཡུན་ཚུ་ སྟོན་ཡོད་ - ཕྱིར་འདྲེན་ནང་ ག་ར་ཡོད་', 'แสดงเซสชันล่าสุด {n} รายการ - ไฟล์ส่งออกมีครบทุกรายการ'],
+        'Day': ['ཉིན་', 'วัน'], 'Smallest / largest': ['ཆུང་ཤོས་ / ཆེ་ཤོས་', 'น้อยสุด / มากสุด'],
+        'Not in the listed sessions - use the export': ['སྟོན་ཡོད་པའི་ལཱ་ཡུན་ནང་ མེད་ - ཕྱིར་འདྲེན་ལག་ལེན་འཐབ་', 'ไม่อยู่ในรายการที่แสดง - ใช้ไฟล์ส่งออก'],
+        '📜 History': ['📜 ལོ་རྒྱུས་', '📜 ประวัติ'],
+        '{n} sessions': ['ལཱ་ཡུན་ {n}', '{n} เซสชัน'], '🔄 Refresh': ['🔄 ལོག་སྟེ་ཀློག་', '🔄 โหลดใหม่'],
+        'Read the sessions again': ['ལཱ་ཡུན་ཚུ་ ལོག་སྟེ་ཀློག་', 'อ่านข้อมูลเซสชันใหม่'],
+        'The charging history is busy - try again in a moment': ['གློག་བསྒར་གྱི་ལོ་རྒྱུས་ ལཱ་ཡོད་ - ཕྱིར་ལོག་ ཅུང་ཞིག་ཤུལ་ལས་ འབད་', 'ประวัติการชาร์จกำลังทำงานอยู่ - ลองใหม่อีกครู่'],
+        'Unknown customer - open the list again': ['ཉོ་མཁན་ མ་ཤེས་ - ཐོ་ཡིག་ ལོག་སྟེ་ཁ་ཕྱེ་', 'ไม่พบลูกค้า - เปิดรายการใหม่อีกครั้ง'],
+        'Choose a station': ['ས་ཚིགས་ གདམ་ཁ་རྐྱབ་', 'เลือกสถานี'],
+        '∑ Added up': ['∑ བསྡོམས་', '∑ รวม'], 'RFID card holders': ['RFID ཤོག་བྱང་འཆང་མི་', 'ผู้ถือบัตร RFID'],
+        'Your role sees RFID card holders one by one; app, QR / cash and free-charging customers are added up in one row each.':
+            ['ཁྱོད་ཀྱི་འགན་ཁུར་ལུ་ RFID ཤོག་བྱང་འཆང་མི་ རེ་རེ་བཞིན་ མཐོང་ app དང་ QR / ཊི་རམ་ རིན་མེད་གློག་བསྒར་གྱི་ ཉོ་མཁན་ཚུ་ རིགས་རེ་ལུ་ གྲལ་ཐིག་གཅིག་ནང་ བསྡོམས་ཏེ་སྟོནམ་ཨིན་',
+                'บทบาทของคุณเห็นผู้ถือบัตร RFID ทีละราย ส่วนลูกค้าแอป การจ่ายด้วย QR / เงินสด และการชาร์จฟรี รวมเป็นแถวเดียวต่อประเภท'],
+        'Other customers (too many to list one by one)': ['ཉོ་མཁན་གཞན་ (རེ་རེ་བཞིན་སྟོན་ནི་ལུ་ མང་དྲགས་)', 'ลูกค้าอื่น ๆ (มากเกินกว่าจะแสดงทีละราย)'],
+        'BPC EV app customers (added up)': ['BPC EV app གི་ཉོ་མཁན་ (བསྡོམས་)', 'ลูกค้าแอป BPC EV (รวม)'],
+        'QR / cash payments (added up)': ['QR / ཊི་རམ་ དངུལ་སྤྲོད་ (བསྡོམས་)', 'การจ่ายด้วย QR / เงินสด (รวม)'],
+        'Free charging (added up)': ['རིན་མེད་གློག་བསྒར་ (བསྡོམས་)', 'การชาร์จฟรี (รวม)'], 'Autocharge (added up)': ['Autocharge (བསྡོམས་)', 'Autocharge (รวม)'],
+        'Other idTags (added up)': ['idTag གཞན་ (བསྡོམས་)', 'idTag อื่น (รวม)']
     });
 })();
 ''')
