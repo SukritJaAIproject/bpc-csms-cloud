@@ -1,0 +1,39 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  python-check:
+    name: Install dependencies and byte-compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Byte-compile every Python source file
+        run: python -m compileall -q .
+
+      - name: Import check for the main modules
+        run: |
+          python - <<'EOF'
+          import ast, pathlib
+          for path in pathlib.Path(".").glob("*.py"):
+              ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+              print("parsed", path)
+          EOF
