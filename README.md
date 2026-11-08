@@ -12,12 +12,16 @@ OCPP 1.6-J central system · operator console · operations platform · BPC EV a
 [![Render](https://img.shields.io/badge/Render-ready-46e3b7?logo=render&logoColor=white)](#deploy-on-render)
 [![MongoDB Atlas](https://img.shields.io/badge/MongoDB-Atlas-47a248?logo=mongodb&logoColor=white)](#configuration)
 [![English · Dzongkha · Thai](https://img.shields.io/badge/UI-English%20%C2%B7%20Dzongkha%20%C2%B7%20Thai-5b6b62)](#screenshots)
+[![Windows installer](https://img.shields.io/badge/Windows-installer-0a7a3c)](https://github.com/SukritJaAIproject/bpc-csms-cloud/releases/latest)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue)](LICENSE)
 
 <br>
 
 <img src="docs/screenshots/hero.jpg" alt="Operator console with ten chargers in western Bhutan, and the BPC EV app on a phone" width="100%">
 
 <sub>All screenshots: CSMS v1.15 with demonstration data — no real customers or chargers.</sub>
+
+**[⬇ Download for Windows](https://github.com/SukritJaAIproject/bpc-csms-cloud/releases/latest)** · [Windows program](#windows-program) · [Deploy on Render](#deploy-on-render) · [Screenshots](#screenshots)
 
 </div>
 
@@ -129,6 +133,34 @@ bookings, charger IDs, charging sessions, settings and the OCPP log — lives in
 or redeploy without losing anything. Three simulated chargers (BPC-THIMPHU, BPC-PARO, BPC-PUNAKHA) run inside the
 container for demonstrations; set `CSMS_SIMULATORS` to an empty value to switch them off.
 
+## Windows program
+
+The same CSMS runs on one Windows PC, without Python or Docker. Download **`FlexxfastCSMS_Setup_1.15.0.exe`** (installer) or
+the portable zip from the **[latest release](https://github.com/SukritJaAIproject/bpc-csms-cloud/releases/latest)**.
+
+1. Run the setup: it installs for the current user, without administrator rights. The programs are not code-signed yet,
+   so Windows SmartScreen may say "Windows protected your PC": choose **More info → Run anyway**.
+2. Start **Flexxfast CSMS**. The first time, its console window asks for the console username and password (kept in
+   `csms_config.json` next to the program).
+3. The browser opens the console (normally http://localhost:8080). Allow the program through Windows Firewall when asked,
+   so that chargers on your network can reach it.
+4. No charger at hand? Start **Virtual Charger** (one simulated charger) or **BPC Demo fleet** (12 stations) and accept
+   them in the Stations tab.
+
+### Use your own MongoDB
+
+The program starts with local JSON files next to it. To keep the data in MongoDB (Atlas or your own server):
+
+1. Open the **Database** tab, choose **MongoDB**, paste your connection string
+   (`mongodb+srv://<user>:<password>@<cluster>/`) and choose a database name.
+2. Press **Test connection**, then **Save & apply**: everything is copied into the database, and every change goes
+   there from then on.
+3. To point the program at another database later, do the same with the new connection string or database name — or
+   set `CSMS_MONGODB_URI` and `CSMS_MONGODB_DB` before starting the program.
+
+The connection string is kept in `database.json` next to the program: keep that folder private. Give each CSMS its own
+database name.
+
 ## Deploy on Render
 
 1. **New → Web Service → Public Git Repository**: paste the URL of this repository.
@@ -219,6 +251,12 @@ Then open http://localhost:8080 and point a charger or the Virtual Charger at `w
 | 1.3 | Uptime and energy reports, KPI dashboard, the report for DoST |
 | 1.2 | Status history and network health |
 | 1.1 | Users, roles and audit log |
+
+## License
+
+[Apache License 2.0](LICENSE) — see also [NOTICE](NOTICE). The name and logo of Bhutan Power Corporation Limited are not
+covered by the license. The Windows programs contain third-party software under its own licenses:
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ---
 

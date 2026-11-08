@@ -1,0 +1,13 @@
+BPC EV Charging Platform - CSMS
+Copyright 2026 Sukrit Jaidee
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+The program and its screenshots show the name and logo of Bhutan Power
+Corporation Limited, for which this platform is prepared. That name and logo
+are not covered by the Apache License and may not be used to suggest that
+Bhutan Power Corporation Limited endorses a product or service.
+
+The Windows programs (FlexxfastCSMS.exe, VirtualCharger.exe) contain Python and
+third-party libraries under their own licenses; see THIRD_PARTY_NOTICES.md.
+The map uses Leaflet and map data from OpenStreetMap contributors.
