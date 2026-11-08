@@ -23,14 +23,32 @@ OCPP 1.6-J central system · operator console · operations platform · BPC EV a
 
 ## What it does
 
-| | |
-|---|---|
-| ⚡ **Chargers** | OCPP 1.6-J (plus an OCPP 2.0.1 mode): live connector status, remote start and stop, reset, unlock, power limits, firmware updates and diagnostics files. Charger IDs issued by the CSMS, a password per charger and an identity check at every start-up. |
-| 🩺 **Operations** | Health checks every 30 seconds with fault codes explained, alerts with escalation by e-mail, Telegram, SMS or webhook, work orders with SLA timers and a technician page for phones, load management per site. |
-| 📈 **KPIs and reports** | Uptime per charger and site, energy, sessions and outages, the monthly report for DoST, charging history per customer and per station — with CSV and Excel exports. |
-| 📱 **Drivers** | The BPC EV app (installable web app): map, booking of connectors, wallet, live session and receipts. A scan-to-pay QR sticker on every connector, and a free-charging mode with fair-use limits. |
-| 💳 **Payments** | Bhutan QR, RMA Payment Gateway (sandbox), wallet and cash; refunds, tariffs, tiers and promo codes. |
-| 🔐 **Accounts and data** | Personal logins with roles and an audit log, all data in MongoDB Atlas, backups with a checked restore, Bhutan Time in every report. |
+<table>
+<tr>
+<td width="190">⚡ <b>Chargers</b></td>
+<td>OCPP 1.6-J (plus an OCPP 2.0.1 mode): live connector status, remote start and stop, reset, unlock, power limits, firmware updates and diagnostics files. Charger IDs issued by the CSMS, a password per charger and an identity check at every start-up.</td>
+</tr>
+<tr>
+<td>🩺 <b>Operations</b></td>
+<td>Health checks every 30 seconds with fault codes explained, alerts with escalation by e-mail, Telegram, SMS or webhook, work orders with SLA timers and a technician page for phones, load management per site.</td>
+</tr>
+<tr>
+<td>📈 <b>KPIs and reports</b></td>
+<td>Uptime per charger and site, energy, sessions and outages, the monthly report for DoST, charging history per customer and per station — with CSV and Excel exports.</td>
+</tr>
+<tr>
+<td>📱 <b>Drivers</b></td>
+<td>The BPC EV app (installable web app): map, booking of connectors, wallet, live session and receipts. A scan-to-pay QR sticker on every connector, and a free-charging mode with fair-use limits.</td>
+</tr>
+<tr>
+<td>💳 <b>Payments</b></td>
+<td>Bhutan QR, RMA Payment Gateway (sandbox), wallet and cash; refunds, tariffs, tiers and promo codes.</td>
+</tr>
+<tr>
+<td>🔐 <b>Accounts and data</b></td>
+<td>Personal logins with roles and an audit log, all data in MongoDB Atlas, backups with a checked restore, Bhutan Time in every report.</td>
+</tr>
+</table>
 
 <details>
 <summary><b>All 21 console tabs</b></summary>
@@ -79,33 +97,20 @@ OCPP 1.6-J central system · operator console · operations platform · BPC EV a
 <tr>
 <td align="center" width="25%"><img src="docs/screenshots/app-home.jpg" alt="App home"><br><sub><b>Home</b> — wallet and bookings</sub></td>
 <td align="center" width="25%"><img src="docs/screenshots/app-map.jpg" alt="App map"><br><sub><b>Map</b> — chargers nearby</sub></td>
+<td align="center" width="25%"><img src="docs/screenshots/app-station.jpg" alt="Station page"><br><sub><b>Station</b> — connectors and price</sub></td>
 <td align="center" width="25%"><img src="docs/screenshots/app-booking.jpg" alt="Book a connector"><br><sub><b>Booking</b> — reserve now or later</sub></td>
-<td align="center" width="25%"><img src="docs/screenshots/app-charging.jpg" alt="Live charging session"><br><sub><b>Charging</b> — live energy and cost</sub></td>
 </tr>
 <tr>
-<td align="center"><img src="docs/screenshots/app-station.jpg" alt="Station page"><br><sub><b>Station</b> — connectors and price</sub></td>
+<td align="center"><img src="docs/screenshots/app-charging.jpg" alt="Live charging session"><br><sub><b>Charging</b> — live energy and cost</sub></td>
+<td align="center"><img src="docs/screenshots/app-wallet.jpg" alt="Wallet"><br><sub><b>Wallet</b> — top-ups, refunds and bonuses</sub></td>
 <td align="center"><img src="docs/screenshots/scan-to-pay.jpg" alt="Scan-to-pay page"><br><sub><b>Scan-to-pay</b> — the page behind the QR sticker</sub></td>
 <td align="center"><img src="docs/screenshots/technician.jpg" alt="Technician page"><br><sub><b>Technician</b> — field jobs on the phone</sub></td>
-<td></td>
 </tr>
 </table>
 
 ## How it fits together
 
-```mermaid
-flowchart TB
-    CH["Chargers<br/>Setec · Blue Sky · Flexxfast"]
-    OPS["Operators and technicians<br/>browser · phone"]
-    DRV["Drivers<br/>BPC EV app · QR sticker"]
-    CSMS["<b>CSMS v1.15</b><br/>one Docker container<br/>console · operations<br/>app · pay page · OCPP"]
-    DB[("MongoDB Atlas")]
-    PAY["Bhutan QR<br/>RMA Payment Gateway"]
-    CH -- "OCPP 1.6-J over wss" --> CSMS
-    OPS -- "HTTPS" --> CSMS
-    DRV -- "HTTPS" --> CSMS
-    CSMS <--> DB
-    CSMS <--> PAY
-```
+<img src="docs/architecture.png" alt="Chargers connect over OCPP, operators, technicians and drivers over HTTPS, to one CSMS container; it keeps its data in MongoDB Atlas, sends alerts and takes payments through Bhutan QR / RMA Payment Gateway" width="100%">
 
 One HTTPS address serves everything:
 
@@ -187,9 +192,10 @@ setting, on by default).
 
 ## Run locally
 
-```
+```bash
 pip install -r requirements.txt
-CSMS_USER=admin CSMS_PASS=change-me python csms_web_ui_flexxfast1.py --csms-child 1.6 --port 9000 --web-port 8080
+export CSMS_USER=admin CSMS_PASS=change-me
+python csms_web_ui_flexxfast1.py --csms-child 1.6 --port 9000 --web-port 8080
 ```
 
 Then open http://localhost:8080 and point a charger or the Virtual Charger at `ws://localhost:9000/<charge point id>`.
