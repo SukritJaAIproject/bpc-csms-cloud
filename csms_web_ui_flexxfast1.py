@@ -2397,12 +2397,14 @@ class CentralSystem(cp):
     # Commands to send to CP
     # ========================================================================
     async def cmd_remote_start(self, id_tag: str, connector_id: int = None):
+        connector_id, _rs_why = ops_rs_connector(self.id, id_tag, connector_id)   # [OPS] v1.15.1 always name the connector
+        if connector_id is None:
+            app_state.add_log('➡️ OUT', self.id, 'RemoteStartTransaction not sent', {'idTag': id_tag, 'reason': _rs_why})
+            return {'status': 'Rejected', 'reason': _rs_why}
         _bk = await ops_bk_before_remote_start(self, id_tag, connector_id)   # [OPS] v1.12 a connector kept for a booking
         if _bk is not None:
             return _bk
-        kwargs = {'id_tag': id_tag}
-        if connector_id:
-            kwargs['connector_id'] = connector_id
+        kwargs = {'id_tag': id_tag, 'connector_id': connector_id}
         app_state.add_log('➡️ OUT', self.id, 'RemoteStartTransaction', kwargs)
         response = await self.call(call.RemoteStartTransaction(**kwargs))
         status_str = str(response.status)
@@ -18602,7 +18604,7 @@ import re as _ops_re
 import csv as _ops_csv
 import io as _ops_io
 
-OPS_VERSION = '1.15.0'
+OPS_VERSION = '1.15.1'
 OPS_FEATURES: List[str] = ['users']
 OPS_DIR = str(APP_DIR / 'ops_data')
 OPS_TZ = timezone(timedelta(hours=6))           # Bhutan Time (BTT, UTC+06:00): ops views, monthly files, reports
@@ -37626,6 +37628,77 @@ OPS_JS_PARTS.append(r'''/* [OPS] 📜 Charging history tab (v1.15): per customer
     });
 })();
 ''')
+
+
+# ===========================================================================
+# [OPS] v1.15.1 RemoteStartTransaction always names its connector
+# ===========================================================================
+# OCPP 1.6 section 5.11: "A Charge Point MAY reject a RemoteStartTransaction.req without a connector id" - the BPC chargers
+# (CP.py R3) do. A RemoteStart asked for without a connector (the console API without connector_id or with 0, a payment
+# record without a connector) now gets one from the CSMS: the driver's own booking at this charger, else the only free
+# connector with a vehicle plugged in (Preparing), else the only free connector. When that is not clear the RemoteStart is
+# not sent and the answer says why (status Rejected + reason). A connector that was asked for is used as it is.
+OPS_RS_PLUGGED = ('Preparing',)
+
+
+def ops_rs_pick_connector(cp_id: str, id_tag, now: float = None):
+    """(connector, None), or (None, reason) when the CSMS cannot tell which connector a RemoteStart is for."""
+    now = ops_now() if now is None else now
+    try:
+        own = [b for b in _bk_active_for(cp_id) if b.get('cp') == cp_id and b.get('state') in OPS_BK_ACTIVE
+               and _bk_tag_permitted(b, id_tag)
+               and float(b.get('hold_from') or 0) - 1800 <= now
+               < float(b.get('hold_until') or 0) + (120 if b.get('state') == 'starting' else 0)]
+    except Exception:                                   # bookings unreadable: decide from the connectors alone
+        own = []
+    if own:                                             # the same window ops_bk_before_remote_start lets the driver in
+        b = sorted(own, key=lambda x: x.get('start') or 0)[0]
+        return int(b['conn']), None
+    free = []
+    for c in _pay_station_public_raw(cp_id)['connectors']:
+        if c.get('busy'):
+            continue                                    # charging / finishing / faulted / unavailable / paid for
+        b = ops_bk_holding(cp_id, c['id'], now)
+        if b is not None and not _bk_tag_permitted(b, id_tag):
+            continue                                    # kept for another driver's booking
+        free.append(c)
+    plugged = [c['id'] for c in free if c.get('status') in OPS_RS_PLUGGED]
+    if len(plugged) == 1:
+        return plugged[0], None
+    if len(plugged) > 1:
+        return None, 'vehicles are plugged in at connectors %s - say which connector' % ', '.join(map(str, plugged))
+    if len(free) == 1:
+        return free[0]['id'], None
+    if not free:
+        return None, 'no free connector at this charger'
+    return None, 'connectors %s are free - say which connector' % ', '.join(str(c['id']) for c in free)
+
+
+def ops_rs_connector(cp_id: str, id_tag, connector_id):
+    """The connector a RemoteStartTransaction goes to: (connector, None) or (None, reason).
+    A connector > 0 is used as asked; None / '' / 0 lets the CSMS pick one (ops_rs_pick_connector)."""
+    raw = connector_id
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        raw = 0
+    try:
+        if isinstance(raw, bool):
+            raise ValueError('bool')
+        conn = int(str(raw).strip()) if isinstance(raw, str) else int(raw)
+        if not isinstance(raw, str) and conn != raw:
+            raise ValueError('not a whole number')
+    except (TypeError, ValueError):
+        return None, 'invalid connector %r' % (connector_id,)
+    if conn < 0:
+        return None, 'invalid connector %d' % conn
+    if conn > 0:
+        return conn, None
+    conn, why = ops_rs_pick_connector(cp_id, id_tag)
+    if conn is not None:
+        logger.info(f"🔌 RemoteStart to {cp_id} without a connector: connector {conn} chosen by the CSMS")
+    return conn, why
+
+
+OPS_FEATURES.append('remote_start_connector')
 
 
 # [OPS] end of ops modules

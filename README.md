@@ -6,7 +6,7 @@
 
 OCPP 1.6-J central system · operator console · operations platform · BPC EV app · scan-to-pay
 
-[![CSMS v1.15.0](https://img.shields.io/badge/CSMS-v1.15.0-0a7a3c)](#versions)
+[![CSMS v1.15.1](https://img.shields.io/badge/CSMS-v1.15.1-0a7a3c)](#versions)
 [![OCPP 1.6-J](https://img.shields.io/badge/OCPP-1.6--J-1f6feb)](#connect-a-charger)
 [![Docker](https://img.shields.io/badge/Docker-one%20container-2496ed?logo=docker&logoColor=white)](Dockerfile)
 [![Render](https://img.shields.io/badge/Render-ready-46e3b7?logo=render&logoColor=white)](#deploy-on-render)
@@ -236,7 +236,8 @@ Then open http://localhost:8080 and point a charger or the Virtual Charger at `w
 
 | Version | What it added |
 |---|---|
-| **1.15** | Charging history per customer and per station; the KPI sheet "Daily by charger" |
+| **1.15.1** | A remote start always names its connector, so chargers that refuse one without it (OCPP 1.6 §5.11) start normally |
+| 1.15 | Charging history per customer and per station; the KPI sheet "Daily by charger" |
 | 1.14 | RFID card owners (name, mobile, vehicle plate, organisation); CSV / Excel import and export |
 | 1.13 | Charger IDs issued by the CSMS, a password and setup sheet per charger, identity check at start-up |
 | 1.12 | Pre-booking of connectors (OCPP ReserveNow, or kept by the CSMS) |
