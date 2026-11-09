@@ -135,7 +135,7 @@ container for demonstrations; set `CSMS_SIMULATORS` to an empty value to switch 
 
 ## Windows program
 
-The same CSMS runs on one Windows PC, without Python or Docker. Download **`FlexxfastCSMS_Setup_1.15.0.exe`** (installer) or
+The same CSMS runs on one Windows PC, without Python or Docker. Download **`FlexxfastCSMS_Setup_1.15.1.exe`** (installer) or
 the portable zip from the **[latest release](https://github.com/SukritJaAIproject/bpc-csms-cloud/releases/latest)**.
 
 1. Run the setup: it installs for the current user, without administrator rights. The programs are not code-signed yet,
